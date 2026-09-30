@@ -41,7 +41,9 @@ ros2 launch cash_sim sim.launch.py
 ```
 
 Opens Gazebo (hallway world + robot) and RViz (robot model + LiDAR scan).
-Options: `rviz:=false`, and spawn pose `x:=… y:=… yaw:=…`.
+**Lighter mode (recommended on the laptop):** `ros2 launch cash_sim sim.launch.py gui:=false` runs Gazebo headless and shows everything in RViz.
+
+Options: `gui:=false`, `rviz:=false`, and spawn pose `x:=… y:=… yaw:=…`.
 
 **Drive it** (in a second terminal):
 ```bash
