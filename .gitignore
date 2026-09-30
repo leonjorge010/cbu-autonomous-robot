@@ -8,9 +8,5 @@ __pycache__/
 *.mcap
 rosbag2_*/
 
-# SLAM Toolbox map output (regenerate by mapping; not committed)
-maps/*.pgm
-maps/*.yaml
-maps/*.posegraph
-maps/*.data
-!maps/.gitkeep
+# SLAM Toolbox scratch maps (commit final maps, not throwaway attempts)
+maps/scratch_*

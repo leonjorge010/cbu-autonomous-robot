@@ -29,7 +29,7 @@ CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts studen
 - `launch/slam.launch.py`: starts `async_slam_toolbox_node`; run in a second terminal after `sim.launch.py` is up
 - `rviz/cash_sim.rviz`: fixed frame `odom`; includes a `/map` display for use while SLAM is running
 - TF: odom → base_footprint → base_link → wheels/casters/lidar_link; SLAM Toolbox adds map → odom on top
-- `maps/`: SLAM Toolbox output (`.pgm`/`.yaml` via `/slam_toolbox/save_map`, `.posegraph`/`.data` via `/slam_toolbox/serialize_map`). Gitignored — regenerate by mapping, don't commit.
+- `maps/`: SLAM Toolbox output (`.pgm`/`.yaml` via `/slam_toolbox/save_map`, `.posegraph`/`.data` via `/slam_toolbox/serialize_map`). Final maps are committed; name throwaway attempts `maps/scratch_*` (gitignored).
 
 ## Conventions
 - Jazzy + Gazebo Harmonic only: `ros_gz` and `gz-sim-*` system plugins, never Gazebo Classic / `gazebo_ros`

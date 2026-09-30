@@ -86,16 +86,16 @@ so slam_toolbox can close the loop and correct drift.
 
 **Save the map** (terminal 4, once you're happy with the coverage):
 ```bash
-ros2 service call /slam_toolbox/save_map slam_toolbox_msgs/srv/SaveMap "{name: {data: '/home/jorge_leon/ros2_ws/maps/hallway'}}"
+ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data: '/home/jorge_leon/ros2_ws/maps/hallway'}}"
 ```
-Writes `maps/hallway.pgm` + `maps/hallway.yaml` (used later by Nav2). Map files aren't
-committed to git (regenerate by re-mapping); re-run with a different name to keep multiple
-attempts.
+Writes `maps/hallway.pgm` + `maps/hallway.yaml` (used later by Nav2). Commit good maps —
+they're checked in. Use a `maps/scratch_*` name for throwaway test runs; those are
+gitignored.
 
 To keep mapping *state* itself (not just the raster) so you can resume later instead of
 re-driving from scratch:
 ```bash
-ros2 service call /slam_toolbox/serialize_map slam_toolbox_msgs/srv/SerializePoseGraph "{filename: '/home/jorge_leon/ros2_ws/maps/hallway'}"
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '/home/jorge_leon/ros2_ws/maps/hallway'}"
 ```
 
 ## Save and push work
