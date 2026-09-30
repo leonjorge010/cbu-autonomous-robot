@@ -24,9 +24,12 @@ CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts studen
 - `urdf/cash_bot.urdf.xacro`: diff-drive robot (0.50×0.40 m base, wheels at center, front/rear casters, 360° gpu_lidar 12 m @10 Hz). Dimensions are placeholders for the real chassis.
 - `worlds/hallway.sdf`: 30 m × 2.4 m corridor with a +y branch at x=14, doors, bench, fountain, trash can. Shadows off for performance.
 - `config/bridge.yaml`: /clock, /cmd_vel, /odom, /tf, /joint_states, /scan
+- `config/slam_toolbox.yaml`: online async SLAM params (odom_frame odom, base_frame base_footprint, scan_topic /scan)
 - `launch/sim.launch.py`: args `gui`, `rviz`, `x`, `y`, `yaw`
-- `rviz/cash_sim.rviz`: fixed frame `odom`
-- TF: odom → base_footprint → base_link → wheels/casters/lidar_link
+- `launch/slam.launch.py`: starts `async_slam_toolbox_node`; run in a second terminal after `sim.launch.py` is up
+- `rviz/cash_sim.rviz`: fixed frame `odom`; includes a `/map` display for use while SLAM is running
+- TF: odom → base_footprint → base_link → wheels/casters/lidar_link; SLAM Toolbox adds map → odom on top
+- `maps/`: SLAM Toolbox output (`.pgm`/`.yaml` via `/slam_toolbox/save_map`, `.posegraph`/`.data` via `/slam_toolbox/serialize_map`). Gitignored — regenerate by mapping, don't commit.
 
 ## Conventions
 - Jazzy + Gazebo Harmonic only: `ros_gz` and `gz-sim-*` system plugins, never Gazebo Classic / `gazebo_ros`
@@ -40,6 +43,8 @@ CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts studen
 - RViz "Message Filter dropping message ... earlier than all the data in the transform cache" right after sim start
 
 ## Next milestones
-1. SLAM Toolbox: map the hallway
-2. Nav2: navigate to goals on the map
-3. DRL navigation policy trained headless in this sim
+1. ~~SLAM Toolbox: map the hallway~~ — wired up (`slam.launch.py`); still need to actually drive a full mapping pass and save `maps/hallway.*`
+2. Nav2: load the saved map with `nav2_map_server`, localize against it (AMCL or slam_toolbox in localization mode), and use Nav2's planner/controller to drive to goal poses set in RViz
+3. DRL navigation policy: train a hallway-navigation policy headless in this sim (CSCI 4220 project) — LiDAR scan as observation, `/cmd_vel` as the action space; an alternative/complement to the classic Nav2 stack for the escort behavior
+4. Escort behavior: turn the doors already in `hallway.sdf` into named waypoints so the robot can be given "escort to classroom X" goals
+5. Port whatever works in sim to the real Jetson + 2D LiDAR hardware — the sim was built with no depth/RGB camera specifically to keep sim and real perception matched

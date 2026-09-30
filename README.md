@@ -71,6 +71,33 @@ The robot spawns at the origin facing +x.
 - `launch/sim.launch.py`: starts everything.
 - `rviz/cash_sim.rviz`: RViz layout.
 
+## Map the hallway with SLAM Toolbox
+
+One-time setup: `sudo apt update && sudo apt install -y ros-jazzy-slam-toolbox`, then rebuild
+(`colcon build --symlink-install && source install/setup.bash`).
+
+1. Start the sim (terminal 1): `ros2 launch cash_sim sim.launch.py gui:=false`
+2. Start SLAM (terminal 2): `ros2 launch cash_sim slam.launch.py`
+3. Drive around (terminal 3): `ros2 run teleop_twist_keyboard teleop_twist_keyboard`
+
+The growing occupancy grid shows up in RViz (`Map` display, topic `/map`). Drive the full
+length of the corridor and the +y branch, and loop back past somewhere you've already been
+so slam_toolbox can close the loop and correct drift.
+
+**Save the map** (terminal 4, once you're happy with the coverage):
+```bash
+ros2 service call /slam_toolbox/save_map slam_toolbox_msgs/srv/SaveMap "{name: {data: '/home/jorge_leon/ros2_ws/maps/hallway'}}"
+```
+Writes `maps/hallway.pgm` + `maps/hallway.yaml` (used later by Nav2). Map files aren't
+committed to git (regenerate by re-mapping); re-run with a different name to keep multiple
+attempts.
+
+To keep mapping *state* itself (not just the raster) so you can resume later instead of
+re-driving from scratch:
+```bash
+ros2 service call /slam_toolbox/serialize_map slam_toolbox_msgs/srv/SerializePoseGraph "{filename: '/home/jorge_leon/ros2_ws/maps/hallway'}"
+```
+
 ## Save and push work
 
 ```bash

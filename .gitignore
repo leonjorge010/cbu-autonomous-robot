@@ -7,3 +7,10 @@ __pycache__/
 *.bag
 *.mcap
 rosbag2_*/
+
+# SLAM Toolbox map output (regenerate by mapping; not committed)
+maps/*.pgm
+maps/*.yaml
+maps/*.posegraph
+maps/*.data
+!maps/.gitkeep
