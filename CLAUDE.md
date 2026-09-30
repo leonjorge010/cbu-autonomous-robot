@@ -31,7 +31,15 @@ CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts studen
 - TF: odom → base_footprint → base_link → wheels/casters/lidar_link; SLAM Toolbox adds map → odom on top
 - `maps/`: SLAM Toolbox output (`.pgm`/`.yaml` via `/slam_toolbox/save_map`, `.posegraph`/`.data` via `/slam_toolbox/serialize_map`). Final maps are committed; name throwaway attempts `maps/scratch_*` (gitignored).
 
+## Package: src/cash_rl (ament_python)
+- `cash_rl/hallway_env.py`: `HallwayEnv`, a Gymnasium env wrapping `/scan` (downsampled to 36 beams) and `/cmd_vel` over rclpy; reset() calls the `/world/hallway/control` service (ControlWorld, model_only reset) to snap the robot back to spawn. Reward is a placeholder (forward progress minus collision penalty) — replace once escort waypoints exist.
+- `cash_rl/random_agent.py` (console script `random_agent`): drives `HallwayEnv` with random actions for a few episodes — smoke test for reset/step/service-bridge before wiring up real training.
+- `launch/train_env.launch.py`: includes `cash_sim`'s `sim.launch.py` headless plus the `ros_gz_bridge` service bridge for `/world/hallway/control` and `/world/hallway/set_pose` (neither is in `cash_sim/config/bridge.yaml`, which only bridges topics).
+- Runtime deps `gymnasium`/`numpy` are pip, not rosdep-resolvable here — installed via `pip install --user --break-system-packages gymnasium` (numpy stayed at the system 1.26.4).
+- Episode reset calls `ControlWorld` (world reset, clears sim time/physics state) *and* `SetEntityPose` targeting the `cash_bot` entity by name — `ControlWorld`'s `model_only` reset alone does not restore pose for entities spawned dynamically after world load (confirmed by smoke test: episodes collapsed to 1-4 steps because the robot never left the wall it crashed into), so the explicit teleport is required, not just a nice-to-have.
+
 ## Conventions
+- Install Python packages with `pip install --user --break-system-packages`; when installing `torch` or `stable-baselines3`, always pin `"numpy<2"` alongside them so they don't upgrade the system numpy (1.26.4) that ROS 2 Jazzy's Python packages expect
 - Jazzy + Gazebo Harmonic only: `ros_gz` and `gz-sim-*` system plugins, never Gazebo Classic / `gazebo_ros`
 - Absolute topic names; `use_sim_time: true` on all sim nodes
 - Never commit `build/`, `install/`, `log/`, rosbags, or trained model weights
@@ -45,6 +53,6 @@ CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts studen
 ## Next milestones
 1. ~~SLAM Toolbox: map the hallway~~ — wired up (`slam.launch.py`); still need to actually drive a full mapping pass and save `maps/hallway.*`
 2. Nav2: load the saved map with `nav2_map_server`, localize against it (AMCL or slam_toolbox in localization mode), and use Nav2's planner/controller to drive to goal poses set in RViz
-3. DRL navigation policy: train a hallway-navigation policy headless in this sim (CSCI 4220 project) — LiDAR scan as observation, `/cmd_vel` as the action space; an alternative/complement to the classic Nav2 stack for the escort behavior
+3. DRL navigation policy: train a hallway-navigation policy headless in this sim (CSCI 4220 project) — LiDAR scan as observation, `/cmd_vel` as the action space; an alternative/complement to the classic Nav2 stack for the escort behavior. `cash_rl` package scaffolded and smoke-tested (`HallwayEnv` + service-bridge launch file, `random_agent` runs clean episodes against a live sim); still need: a real reward function and an actual training script (e.g. Stable-Baselines3 PPO/SAC)
 4. Escort behavior: turn the doors already in `hallway.sdf` into named waypoints so the robot can be given "escort to classroom X" goals
 5. Port whatever works in sim to the real Jetson + 2D LiDAR hardware — the sim was built with no depth/RGB camera specifically to keep sim and real perception matched
