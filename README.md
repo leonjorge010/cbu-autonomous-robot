@@ -126,3 +126,8 @@ git push
 - **Package not found after building**: run `source install/setup.bash` in that terminal.
 - **Robot doesn't move with teleop**: the teleop terminal must be focused, and the sim must be playing (not paused).
 - **Slow builds**: make sure you're in `~/ros2_ws`, not under `/mnt/c/...`.
+- **`code .` opens the wrong folder, or `cd ~/ros2_ws` says "path not found"**: you're in Windows
+  PowerShell, not WSL Ubuntu — this project only exists inside WSL. Run `wsl -d Ubuntu-24.04` to switch
+  (plain `wsl` can land you in Docker Desktop's internal distro instead if that's your current default —
+  check with `wsl -l -v`, and fix it with `wsl --set-default Ubuntu-24.04`). Then `cd ~/ros2_ws && code .`
+  from that shell. VS Code should show "WSL: Ubuntu-24.04" in the bottom-left corner.
