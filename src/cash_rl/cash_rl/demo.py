@@ -4,12 +4,14 @@
     ros2 run cash_rl demo --policy ~/ros2_ws/runs/<run>/best_model.zip
 
 In the window:
-  left-click            place the robot, then left-click again to aim it
+  left-click            place the robot (facing +x, down the corridor)
+  left-drag             place it and aim it: press at the spot, release toward
+                        the direction it should face
+  right-click           drive to the clicked point
   1-7                   drive to that door (numbers are shown on the map)
-  right-click           drive to the clicked point instead
-  Esc                   clear and place the robot again
-After an episode ends, pick another destination to continue from where the
-robot stopped (an escort with several legs), or left-click to start over.
+  Esc                   clear the robot
+After an episode ends, right-click (or 1-7) again to continue from where the
+robot stopped (an escort with several legs), or left-click to place it anew.
 Runs HallwayRaycastEnv (the 2D simulator); no ROS or Gazebo needed.
 """
 import argparse
@@ -23,8 +25,10 @@ from cash_rl.view_env import load_trained_policy, Scene
 import numpy as np
 
 DOOR_KEYS = {str(i + 1): name for i, name in enumerate(sorted(spec.DOOR_GOALS))}
-HELP = ('left-click: place robot, click again to aim  ·  1-7: door  ·  '
-        'right-click: drive to point  ·  Esc: start over')
+HELP = ('left-click: place robot (drag to aim)  ·  right-click: destination  ·  '
+        '1-7: door  ·  Esc: clear')
+# A left-drag shorter than this (m) counts as a plain click: keep the default heading.
+MIN_AIM_DRAG = 0.2
 
 
 def newest_best_model():
@@ -54,10 +58,10 @@ def main():
                                         for key, name in DOOR_KEYS.items()})
     fig.text(0.04, 0.015, HELP, fontsize=9, color='0.35')
 
-    # mode: 'place' -> 'aim' -> 'ready' -> 'driving' -> 'done' (-> 'driving' again)
+    # mode: 'place' -> 'aim' (left button held) -> 'ready' -> 'driving' -> 'done'
     st = {'mode': 'place', 'pose': None, 'ranges': None, 'goal': None, 'trail': [],
           'goal_name': '', 'step': 0, 'return': 0.0, 'episode': 0,
-          'text': 'Left-click to place the robot'}
+          'text': 'Left-click to place the robot (drag to aim it)'}
 
     def redraw():
         scene.draw(st['pose'], st['ranges'], st['goal'], st['trail'], st['text'])
@@ -67,7 +71,7 @@ def main():
         st['pose'] = np.asarray(pose, dtype=float)
         st['ranges'] = spec.sanitize_ranges(env.raycast(st['pose']))
 
-    def start_over(text='Left-click to place the robot'):
+    def start_over(text='Left-click to place the robot (drag to aim it)'):
         st.update(mode='place', pose=None, ranges=None, goal=None, trail=[], text=text)
 
     def drive_to(goal, name):
@@ -75,6 +79,7 @@ def main():
             return
         if env.collides(st['pose']):
             start_over('The robot is touching a wall — left-click to place it again')
+            return
             return
         st['episode'] += 1
         try:
@@ -87,46 +92,56 @@ def main():
                   trail=[env.pose[:2].copy()], ranges=env._ranges.copy())
         st['return'] = 0.0
 
-    def on_click(event):
+    def axes_point(event):
         if event.inaxes is not ax or event.xdata is None:
-            return
+            return None
         if fig.canvas.toolbar is not None and str(fig.canvas.toolbar.mode):
-            return  # zoom/pan tool active
-        xy = np.array([event.xdata, event.ydata])
+            return None  # zoom/pan tool active
+        return np.array([event.xdata, event.ydata])
+
+    def aim_at(xy):
+        dx, dy = xy - st['pose'][:2]
+        if np.hypot(dx, dy) >= MIN_AIM_DRAG:
+            preview((*st['pose'][:2], np.arctan2(dy, dx)))
+
+    def on_press(event):
+        xy = axes_point(event)
+        if xy is None:
+            return
         if event.button == 3:
-            if not env.map.is_free(*xy):
+            if st['mode'] not in ('ready', 'done'):
+                st['text'] = 'Left-click to place the robot first'
+            elif not env.map.is_free(*xy):
                 st['text'] = 'That spot is inside a wall — right-click open floor'
             else:
                 drive_to(xy, f'point ({xy[0]:.1f}, {xy[1]:.1f})')
-            redraw()
-            return
-        if event.button != 1:
-            return
-        if st['mode'] in ('place', 'ready', 'done'):
+        elif event.button == 1 and st['mode'] != 'driving':
             if not env.map.is_free(*xy):
-                st['text'] = 'That spot is inside a wall — click open floor'
+                st['text'] = 'That spot is inside a wall — left-click open floor'
             else:
                 start_over()
                 preview((*xy, 0.0))
-                st.update(mode='aim', text='Left-click again to set which way it faces')
-        elif st['mode'] == 'aim':
-            dx, dy = xy - st['pose'][:2]
-            if np.hypot(dx, dy) > 1e-3:
-                preview((*st['pose'][:2], np.arctan2(dy, dx)))
-            if env.collides(st['pose']):
-                start_over('Too close to a wall at that angle — left-click to place again')
-            else:
-                st.update(mode='ready', trail=[],
-                          text='Press 1-7 for a door, or right-click a destination')
+                st.update(mode='aim', text='Release to place; drag first to aim it')
         redraw()
 
     def on_move(event):
-        if st['mode'] != 'aim' or event.inaxes is not ax or event.xdata is None:
-            return
-        dx, dy = np.array([event.xdata, event.ydata]) - st['pose'][:2]
-        if np.hypot(dx, dy) > 1e-3:
-            preview((*st['pose'][:2], np.arctan2(dy, dx)))
+        xy = axes_point(event)
+        if st['mode'] == 'aim' and xy is not None:
+            aim_at(xy)
             redraw()
+
+    def on_release(event):
+        if event.button != 1 or st['mode'] != 'aim':
+            return
+        xy = axes_point(event)
+        if xy is not None:
+            aim_at(xy)
+        if env.collides(st['pose']):
+            start_over('Too close to a wall there — left-click to place it again')
+        else:
+            st.update(mode='ready', trail=[],
+                      text='Right-click a destination, or press 1-7 for a door')
+        redraw()
 
     def on_key(event):
         if event.key == 'escape':
@@ -153,11 +168,12 @@ def main():
                       f'{st["step"] * spec.CONTROL_PERIOD:.1f} s   '
                       f'{info["goal_distance"]:.1f} m to go   {outcome}')
         if outcome:
-            st['text'] += '  — pick another destination, or left-click to start over'
+            st['text'] += '  — right-click to continue, or left-click to place anew'
         redraw()
 
-    fig.canvas.mpl_connect('button_press_event', on_click)
+    fig.canvas.mpl_connect('button_press_event', on_press)
     fig.canvas.mpl_connect('motion_notify_event', on_move)
+    fig.canvas.mpl_connect('button_release_event', on_release)
     fig.canvas.mpl_connect('key_press_event', on_key)
     timer = fig.canvas.new_timer(interval=int(1000 * spec.CONTROL_PERIOD / args.speed))
     timer.add_callback(tick)
