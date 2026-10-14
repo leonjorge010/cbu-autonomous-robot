@@ -5,10 +5,11 @@ Requires `sim.launch.py` (cash_sim) plus this package's service bridge for
 """
 import time
 
+from cash_rl import spec
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist
 import gymnasium as gym
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Point, Pose, Quaternion, Twist
 from rclpy.qos import qos_profile_sensor_data
 from ros_gz_interfaces.msg import Entity, WorldControl, WorldReset
 from ros_gz_interfaces.srv import ControlWorld, SetEntityPose
@@ -18,26 +19,14 @@ WORLD_NAME = 'hallway'
 ROBOT_NAME = 'cash_bot'
 # Must match sim.launch.py's x/y/yaw defaults (0.0) and its hardcoded spawn z (0.02).
 SPAWN_POSE = Pose(position=Point(x=0.0, y=0.0, z=0.02), orientation=Quaternion(w=1.0))
-N_SCAN_BEAMS = 360
-N_OBS_BEAMS = 36
-MAX_RANGE = 12.0
-COLLISION_RANGE = 0.25
-MAX_LINEAR_VEL = 0.5
-MAX_ANGULAR_VEL = 1.0
-CONTROL_PERIOD = 0.1
-MAX_EPISODE_STEPS = 500
 SCAN_WAIT_TIMEOUT = 5.0
 
 
 class HallwayEnv(gym.Env):
     """Scan-in / cmd_vel-out environment for a single cash_bot in hallway.sdf.
 
-    Observation: N_OBS_BEAMS downsampled LiDAR ranges (meters, NaN/inf clipped to
-    MAX_RANGE), normalized to [0, 1].
-    Action: [linear_x, angular_z] cmd_vel, each in [-1, 1] and scaled to the
-    MAX_LINEAR_VEL / MAX_ANGULAR_VEL limits.
-    Reward is a placeholder (forward progress minus a collision penalty) —
-    replace once escort waypoints/goals exist.
+    Observation, action, collision and reward definitions live in cash_rl.spec,
+    shared with HallwayRaycastEnv.
     """
 
     metadata = {'render_modes': []}
@@ -58,10 +47,8 @@ class HallwayEnv(gym.Env):
         self._set_pose_client = self._node.create_client(
             SetEntityPose, f'/world/{WORLD_NAME}/set_pose')
 
-        self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=(N_OBS_BEAMS,), dtype=np.float32)
-        self.action_space = gym.spaces.Box(
-            low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        self.observation_space = spec.observation_space()
+        self.action_space = spec.action_space()
 
         self._step_count = 0
 
@@ -83,15 +70,14 @@ class HallwayEnv(gym.Env):
             rclpy.spin_once(self._node, timeout_sec=0.1)
 
     def _sanitized_ranges(self):
-        ranges = np.array(self._latest_scan.ranges, dtype=np.float32)
-        ranges = np.nan_to_num(ranges, nan=MAX_RANGE, posinf=MAX_RANGE, neginf=0.0)
-        return np.clip(ranges, 0.0, MAX_RANGE)
+        return spec.sanitize_ranges(self._latest_scan.ranges)
+
+    def _scan_angles(self):
+        scan = self._latest_scan
+        return scan.angle_min + np.arange(len(scan.ranges)) * scan.angle_increment
 
     def _observation(self):
-        ranges = self._sanitized_ranges()
-        stride = N_SCAN_BEAMS // N_OBS_BEAMS
-        downsampled = ranges[::stride][:N_OBS_BEAMS]
-        return (downsampled / MAX_RANGE).astype(np.float32)
+        return spec.observation_from_ranges(self._sanitized_ranges()[spec.OBS_BEAM_INDICES])
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -123,24 +109,23 @@ class HallwayEnv(gym.Env):
         return self._observation(), {}
 
     def step(self, action):
-        action = np.clip(action, -1.0, 1.0)
+        linear, angular = spec.action_to_cmd(action)
         twist = Twist()
-        twist.linear.x = float(action[0]) * MAX_LINEAR_VEL
-        twist.angular.z = float(action[1]) * MAX_ANGULAR_VEL
+        twist.linear.x = linear
+        twist.angular.z = angular
         self._cmd_pub.publish(twist)
 
-        self._spin_for(CONTROL_PERIOD)
+        self._spin_for(spec.CONTROL_PERIOD)
         self._step_count += 1
 
         obs = self._observation()
-        min_range = float(np.min(self._sanitized_ranges()))
-        collided = min_range < COLLISION_RANGE
+        ranges = self._sanitized_ranges()
+        min_range = float(np.min(ranges))
+        collided = spec.scan_hits_footprint(ranges, self._scan_angles())
         terminated = collided
-        truncated = self._step_count >= MAX_EPISODE_STEPS
+        truncated = self._step_count >= spec.MAX_EPISODE_STEPS
 
-        reward = twist.linear.x * CONTROL_PERIOD
-        if collided:
-            reward -= 10.0
+        reward = spec.placeholder_reward(linear, collided)
 
         return obs, reward, terminated, truncated, {'min_range': min_range}
 
