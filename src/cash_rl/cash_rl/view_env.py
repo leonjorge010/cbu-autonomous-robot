@@ -3,6 +3,7 @@
     ros2 run cash_rl view_env                        # downhill controller, random goals
     ros2 run cash_rl view_env --policy random --goal door_201
     ros2 run cash_rl view_env --goal all --save doors.gif
+    ros2 run cash_rl view_env --policy ~/ros2_ws/runs/<run>/best_model.zip --goal all
 
 Shows the SLAM map to scale with the robot footprint (collision margin
 included), the 36 observed lidar beams, the goal tolerance circle, the path so
@@ -10,6 +11,8 @@ far, and episode step/return/outcome. Episodes are simulated up front (the 2D
 env is fast), then played back at real time × --speed.
 """
 import argparse
+import json
+import os
 
 from cash_rl import spec
 from cash_rl.raycast_env import HallwayRaycastEnv
@@ -21,6 +24,27 @@ POLICIES = {
     'downhill': downhill,
     'random': lambda env: env.action_space.sample(),
 }
+
+
+def load_trained_policy(path):
+    """Policy from a train.py model zip (algo read from the run's config.json)."""
+    from cash_rl.train import ALGOS
+    path = os.path.expanduser(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
+        config = os.path.join(candidate, 'config.json')
+        if os.path.isfile(config):
+            with open(config) as f:
+                algo = json.load(f)['args']['algo']
+            break
+    else:
+        raise FileNotFoundError(f'No config.json next to or above {path}')
+    model = ALGOS[algo].load(path, device='cpu')
+
+    def policy(env):
+        obs = spec.build_observation(env._ranges, env.pose, env.goal, env._prev_action)
+        return model.predict(obs, deterministic=True)[0]
+    return policy
 
 
 def run_episodes(env, policy, goals, seed):
@@ -60,7 +84,8 @@ def footprint_corners(pose):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('--policy', choices=sorted(POLICIES), default='downhill')
+    parser.add_argument('--policy', default='downhill',
+                        help=f"{' or '.join(sorted(POLICIES))}, or a trained model .zip")
     parser.add_argument('--goal', default='random',
                         help="'random', 'all' (every door from spawn), or a door name: "
                              + ', '.join(sorted(spec.DOOR_GOALS)))
@@ -89,7 +114,8 @@ def main():
     import matplotlib.pyplot as plt
 
     env = HallwayRaycastEnv()
-    frames = run_episodes(env, POLICIES[args.policy], goals, args.seed)
+    policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
+    frames = run_episodes(env, policy, goals, args.seed)
 
     m = env.map
     fig, ax = plt.subplots(figsize=(14, 6.4))

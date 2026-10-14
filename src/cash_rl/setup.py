@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'random_agent = cash_rl.random_agent:main',
             'view_env = cash_rl.view_env:main',
+            'train = cash_rl.train:main',
         ],
     },
 )

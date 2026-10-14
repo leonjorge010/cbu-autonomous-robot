@@ -8,5 +8,8 @@ __pycache__/
 *.mcap
 rosbag2_*/
 
+# Training runs: TensorBoard logs and model weights (never committed)
+runs/
+
 # SLAM Toolbox scratch maps (commit final maps, not throwaway attempts)
 maps/scratch_*
