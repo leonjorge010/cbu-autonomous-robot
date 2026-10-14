@@ -165,6 +165,9 @@ def main():
     parser.add_argument('--goal-distance-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
                         default=DEFAULT_GOAL_DISTANCE_RANGE,
                         help='geodesic distance range (m) of random training goals')
+    parser.add_argument('--junction-prob', type=float, default=0.0,
+                        help='share of training episodes that start and end on opposite '
+                             'sides of the junction')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
@@ -182,7 +185,8 @@ def main():
                   f, indent=2, default=str)
 
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
-    env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range)}
+    env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range),
+                  'junction_prob': args.junction_prob}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,

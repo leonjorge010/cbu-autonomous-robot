@@ -21,6 +21,9 @@ SPAWN_CLEARANCE = 0.15
 # Random goals sit on cells at least this far from any obstacle.
 GOAL_CLEARANCE = 0.5
 DEFAULT_GOAL_DISTANCE_RANGE = (1.0, 15.0)
+# hallway.sdf: the main corridor spans |y| <= 1.2 m; the side branch rises in +y
+# from the junction at x = 14 m. Cells above this line count as the branch.
+BRANCH_MIN_Y = 1.5
 MAX_SAMPLE_TRIES = 1000
 
 
@@ -44,7 +47,9 @@ class HallwayRaycastEnv(gym.Env):
     reset(options=...) accepts 'spawn' (x, y, yaw) and 'goal' (x, y); either one
     left out is sampled: a collision-free spawn (with SPAWN_CLEARANCE) anywhere in
     free space, and a goal whose geodesic distance from the spawn is within
-    goal_distance_range. For evaluation matching HallwayEnv, pass
+    goal_distance_range. With probability junction_prob, a sampled spawn and goal
+    are put on opposite sides of the junction (main corridor vs. side branch), so
+    the episode needs the turn. For evaluation matching HallwayEnv, pass
     spec.SPAWN_POSE and one of spec.DOOR_GOALS. map_yaml defaults to
     occupancy_map.default_map_yaml(); range_noise adds the URDF's Gaussian range
     noise; render_mode is None or 'rgb_array'.
@@ -53,12 +58,13 @@ class HallwayRaycastEnv(gym.Env):
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
 
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
-                 range_noise=True, render_mode=None):
+                 range_noise=True, render_mode=None, junction_prob=0.0):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
         self.map = OccupancyMap(map_yaml)
         self.goal_distance_range = goal_distance_range
+        self.junction_prob = junction_prob
         self.range_noise = range_noise
         self.render_mode = render_mode
 
@@ -79,6 +85,10 @@ class HallwayRaycastEnv(gym.Env):
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             self._ray_step)
         self._goal_cells = np.argwhere(self.map.clearance >= GOAL_CLEARANCE)
+        self._in_branch = {
+            'spawn': self._cell_y(self.map.free_cells[:, 0]) >= BRANCH_MIN_Y,
+            'goal': self._cell_y(self._goal_cells[:, 0]) >= BRANCH_MIN_Y,
+        }
 
         self.pose = np.array(spec.SPAWN_POSE, dtype=np.float64)
         self.goal = np.zeros(2)
@@ -124,25 +134,34 @@ class HallwayRaycastEnv(gym.Env):
         ranges = np.where(hit, self._ray_ts[first] - self._ray_step / 2, np.inf)
         return np.where(ranges < spec.MIN_RANGE, -np.inf, ranges)
 
+    def _cell_y(self, rows):
+        return self.map.origin[1] + (rows + 0.5) * self.map.resolution
+
     def _random_point_in_cell(self, row, col):
         return (self.map.origin[0] + (col + self.np_random.random()) * self.map.resolution,
                 self.map.origin[1] + (row + self.np_random.random()) * self.map.resolution)
 
-    def _sample_spawn_pose(self):
+    def _sample_spawn_pose(self, in_branch=None):
+        """Collision-free pose; in_branch True/False limits it to the branch/corridor."""
+        cells = self.map.free_cells if in_branch is None \
+            else self.map.free_cells[self._in_branch['spawn'] == in_branch]
         for _ in range(MAX_SAMPLE_TRIES):
-            row, col = self.map.free_cells[self.np_random.integers(len(self.map.free_cells))]
+            row, col = cells[self.np_random.integers(len(cells))]
             pose = np.array([*self._random_point_in_cell(row, col),
                              self.np_random.uniform(-np.pi, np.pi)])
             if not self._outline_hits(self._spawn_outline, pose):
                 return pose
         raise RuntimeError(f'No collision-free spawn pose found in {MAX_SAMPLE_TRIES} tries')
 
-    def _sample_goal(self, spawn):
+    def _sample_goal(self, spawn, in_branch=None):
         """Goal cell within goal_distance_range of spawn (geodesic), or None."""
         from_spawn = self.map.distance_field(spawn[0], spawn[1]).grid
         lo, hi = self.goal_distance_range
         distances = from_spawn[self._goal_cells[:, 0], self._goal_cells[:, 1]]
-        candidates = self._goal_cells[(distances >= lo) & (distances <= hi)]
+        ok = (distances >= lo) & (distances <= hi)
+        if in_branch is not None:
+            ok &= self._in_branch['goal'] == in_branch
+        candidates = self._goal_cells[ok]
         if len(candidates) == 0:
             return None
         return np.array(self._random_point_in_cell(
@@ -167,11 +186,17 @@ class HallwayRaycastEnv(gym.Env):
         super().reset(seed=seed)
         options = options or {}
         spawn, goal = options.get('spawn'), options.get('goal')
+        # Draw only when enabled, so junction_prob=0 keeps seeded episodes unchanged.
+        spawn_in_branch = None
+        if spawn is None and goal is None and self.junction_prob > 0 \
+                and self.np_random.random() < self.junction_prob:
+            spawn_in_branch = bool(self.np_random.random() < 0.5)
+        goal_in_branch = None if spawn_in_branch is None else not spawn_in_branch
         for _ in range(MAX_SAMPLE_TRIES):
-            pose = np.array(spawn if spawn is not None else self._sample_spawn_pose(),
-                            dtype=np.float64)
+            pose = np.array(spawn if spawn is not None
+                            else self._sample_spawn_pose(spawn_in_branch), dtype=np.float64)
             goal_xy = np.array(goal, dtype=np.float64) if goal is not None \
-                else self._sample_goal(pose)
+                else self._sample_goal(pose, goal_in_branch)
             if goal_xy is not None:
                 break
             if spawn is not None:

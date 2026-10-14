@@ -104,6 +104,21 @@ def test_random_spawns_and_goals_are_seeded_and_valid():
         assert lo - 0.1 < info_a['goal_distance'] < hi + 0.1
 
 
+def test_junction_episodes_cross_the_junction():
+    from cash_rl.raycast_env import BRANCH_MIN_Y
+    env = HallwayRaycastEnv(goal_distance_range=(1.0, 25.0), junction_prob=1.0)
+    for seed in range(10):
+        _, info = env.reset(seed=seed)
+        assert (info['pose'][1] >= BRANCH_MIN_Y) != (info['goal'][1] >= BRANCH_MIN_Y)
+
+
+def test_junction_prob_zero_keeps_seeded_episodes():
+    plain, zero = HallwayRaycastEnv(), HallwayRaycastEnv(junction_prob=0.0)
+    for seed in range(5):
+        np.testing.assert_array_equal(plain.reset(seed=seed)[1]['goal'],
+                                      zero.reset(seed=seed)[1]['goal'])
+
+
 def test_scan_collision_covers_rear_of_footprint():
     # A return just behind the rear bumper is a collision, even though it is
     # farther from the (forward-mounted) lidar than one just off the side.
