@@ -8,6 +8,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 WORLD_NAME = 'hallway'
+ROBOT_NAME = 'cash_bot'
 
 
 def generate_launch_description():
@@ -20,13 +21,16 @@ def generate_launch_description():
     )
 
     # Bridges the Gazebo world-control and set-pose services so HallwayEnv.reset()
-    # can clear physics state and teleport the robot back to its spawn pose.
+    # can clear physics state and teleport the robot to its spawn pose, plus the
+    # robot's ground-truth pose (from the URDF's PosePublisher) for goal-relative
+    # observations and reward.
     service_bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
         arguments=[
             f'/world/{WORLD_NAME}/control@ros_gz_interfaces/srv/ControlWorld',
             f'/world/{WORLD_NAME}/set_pose@ros_gz_interfaces/srv/SetEntityPose',
+            f'/model/{ROBOT_NAME}/pose@geometry_msgs/msg/PoseStamped[gz.msgs.Pose',
         ],
         parameters=[{'use_sim_time': True}],
         output='screen',
