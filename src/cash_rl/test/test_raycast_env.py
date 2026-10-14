@@ -1,5 +1,6 @@
 from cash_rl import spec
 from cash_rl.raycast_env import HallwayRaycastEnv
+from cash_rl.scripted import downhill
 from gymnasium.utils.env_checker import check_env
 import numpy as np
 import pytest
@@ -22,25 +23,6 @@ def drive(env, policy, max_steps=2000):
         if terminated or truncated:
             return total, info
     raise AssertionError('episode never ended')
-
-
-def downhill(env, lookahead=0.6):
-    """Follow the geodesic goal distance downhill, keeping clear of walls."""
-    x, y, yaw = env.pose
-    to_goal = env.goal - env.pose[:2]
-    if np.hypot(*to_goal) < lookahead:
-        heading = np.arctan2(to_goal[1], to_goal[0])
-    else:
-        dirs = np.linspace(-np.pi, np.pi, 48, endpoint=False)
-        px, py = x + lookahead * np.cos(dirs), y + lookahead * np.sin(dirs)
-        cost = np.array([env._goal_field(a, b) for a, b in zip(px, py)])
-        cost = np.where(np.isfinite(cost), cost, np.inf)
-        row, col = env.map.to_cell(px, py)
-        clearance = env.map.clearance[np.clip(row, 0, env.map.height - 1),
-                                      np.clip(col, 0, env.map.width - 1)]
-        heading = dirs[np.argmin(cost + 3.0 * np.maximum(0.0, 0.7 - clearance))]
-    error = (heading - yaw + np.pi) % (2 * np.pi) - np.pi
-    return np.array([1.0 if abs(error) < 0.4 else 0.1, np.clip(2 * error, -1, 1)])
 
 
 def test_gymnasium_api():
