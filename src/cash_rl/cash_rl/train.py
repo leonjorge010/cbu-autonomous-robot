@@ -65,21 +65,31 @@ def algo_kwargs(algo, n_envs):
 
 
 def evaluate(model, env, episodes):
-    """Run (name, options) episodes deterministically; return a list of outcome dicts."""
+    """Run (name, seed, options) episodes deterministically; return outcome dicts.
+
+    Besides outcome and return: 'path' = distance driven (m), 'start_distance' =
+    geodesic start distance (m), 'reverse' = share of steps commanding reverse.
+    """
     results = []
     for name, seed, options in episodes:
-        obs, _ = env.reset(seed=seed, options=options)
-        total, steps = 0.0, 0
+        obs, info = env.reset(seed=seed, options=options)
+        start_distance, prev = info['goal_distance'], info['pose'][:2].copy()
+        total, steps, path, reversing = 0.0, 0, 0.0, 0
         while True:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             total += reward
             steps += 1
+            reversing += action[0] < 0
+            path += float(np.hypot(*(info['pose'][:2] - prev)))
+            prev = info['pose'][:2].copy()
             if terminated or truncated:
                 break
         results.append({'name': name, 'success': bool(info['is_success']),
                         'collision': bool(info['collided']),
-                        'timeout': not terminated, 'return': total, 'steps': steps})
+                        'timeout': not terminated, 'return': total, 'steps': steps,
+                        'path': path, 'start_distance': start_distance,
+                        'reverse': reversing / steps})
     return results
 
 
