@@ -22,7 +22,7 @@ import os
 
 from cash_rl import spec
 from cash_rl.occupancy_map import default_map_yaml
-from cash_rl.raycast_env import HallwayRaycastEnv
+from cash_rl.raycast_env import DEFAULT_GOAL_DISTANCE_RANGE, HallwayRaycastEnv
 import numpy as np
 from stable_baselines3 import PPO, SAC, TD3
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
@@ -37,6 +37,18 @@ EVAL_SEED_BASE = 1_000_000
 def runs_dir():
     """Return <workspace>/runs (the workspace holding maps/)."""
     return os.path.join(os.path.dirname(os.path.dirname(default_map_yaml())), 'runs')
+
+
+def load_model(path):
+    """Load a train.py model zip; the algo is read from the run's config.json."""
+    path = os.path.expanduser(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
+        config = os.path.join(candidate, 'config.json')
+        if os.path.isfile(config):
+            with open(config) as f:
+                return ALGOS[json.load(f)['args']['algo']].load(path, device='cpu')
+    raise FileNotFoundError(f'No config.json next to or above {path}')
 
 
 def algo_kwargs(algo, n_envs):
@@ -150,6 +162,9 @@ def main():
     parser.add_argument('--eval-freq', type=int, default=100_000, help='timesteps between evals')
     parser.add_argument('--eval-random', type=int, default=20,
                         help='fixed random spawn/goal pairs in each eval, besides the doors')
+    parser.add_argument('--goal-distance-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
+                        default=DEFAULT_GOAL_DISTANCE_RANGE,
+                        help='geodesic distance range (m) of random training goals')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
@@ -167,9 +182,13 @@ def main():
                   f, indent=2, default=str)
 
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+    env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range)}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
+                             env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
                              monitor_kwargs={'info_keywords': ('is_success',)})
+    # Eval always uses the default goal range, so every run is scored on the same
+    # random spawn/goal pairs regardless of its training goal range.
     eval_env = HallwayRaycastEnv()
 
     model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,

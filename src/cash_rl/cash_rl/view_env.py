@@ -11,8 +11,6 @@ far, and episode step/return/outcome. Episodes are simulated up front (the 2D
 env is fast), then played back at real time × --speed.
 """
 import argparse
-import json
-import os
 
 from cash_rl import spec
 from cash_rl.raycast_env import HallwayRaycastEnv
@@ -27,19 +25,9 @@ POLICIES = {
 
 
 def load_trained_policy(path):
-    """Policy from a train.py model zip (algo read from the run's config.json)."""
-    from cash_rl.train import ALGOS
-    path = os.path.expanduser(path)
-    directory = os.path.dirname(os.path.abspath(path))
-    for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
-        config = os.path.join(candidate, 'config.json')
-        if os.path.isfile(config):
-            with open(config) as f:
-                algo = json.load(f)['args']['algo']
-            break
-    else:
-        raise FileNotFoundError(f'No config.json next to or above {path}')
-    model = ALGOS[algo].load(path, device='cpu')
+    """Policy from a train.py model zip."""
+    from cash_rl.train import load_model
+    model = load_model(path)
 
     def policy(env):
         obs = spec.build_observation(env._ranges, env.pose, env.goal, env._prev_action)
