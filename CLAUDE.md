@@ -53,6 +53,7 @@ CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts studen
 - Absolute topic names; `use_sim_time: true` on all sim nodes
 - Never commit `build/`, `install/`, `log/`, rosbags, or trained model weights
 - Small commits with clear messages
+- Add a dated section to `WORKLOG.md` (newest first) at the end of each work session
 
 ## Known harmless output
 - `gz_frame_id ... not defined in SDF` warning at spawn

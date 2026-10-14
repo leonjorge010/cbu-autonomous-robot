@@ -114,13 +114,28 @@ pip install --user --break-system-packages --index-url https://download.pytorch.
 pip install --user --break-system-packages stable-baselines3 tensorboard gymnasium "numpy<2"
 ```
 
-**Train** (PPO, 3M steps, ~40 min on the laptop; results go to `runs/<name>/`, which is gitignored):
+**Train** (results go to `runs/<name>/`, which is gitignored; ~1,300 steps/s on the laptop CPU):
 ```bash
-ros2 run cash_rl train --name my_run
+# recommended settings (best so far, ~19 min):
+ros2 run cash_rl train --name my_run --timesteps 1500000 --goal-distance-range 1 25 --junction-prob 0.3
+ros2 run cash_rl train --help           # all options (algo, seed, eval frequency, ...)
 tensorboard --logdir ~/ros2_ws/runs     # then open http://localhost:6006, look at the eval/ charts
 ```
 Every 100k steps the policy is evaluated on all 7 doors from spawn plus 20 fixed random goals;
-`runs/<name>/eval.csv` has success, collision and timeout rates for plotting.
+`runs/<name>/eval.csv` has success, collision and timeout rates for plotting, and
+`runs/<name>/config.json` records every setting the run used. `--junction-prob` is the share of
+training episodes that start on one side of the junction with the goal on the other.
+
+Where to change things: training-run settings are `train` flags; PPO hyperparameters are in
+`algo_kwargs` in `src/cash_rl/cash_rl/train.py`; the task itself (reward weights, goal tolerance,
+robot and LiDAR limits) is in `src/cash_rl/cash_rl/spec.py`, shared by the 2D sim and Gazebo.
+
+**Demo** a trained model interactively (2D, no Gazebo needed):
+```bash
+ros2 run cash_rl demo                   # uses the newest runs/*/best_model.zip
+```
+Left-click places the robot (drag to aim it), right-click sets the destination, keys 1–7 send it to
+a door, Esc clears. After it arrives, right-click again to continue from where it stopped.
 
 **Watch** episodes in a window (or add `--save out.gif`):
 ```bash
@@ -128,17 +143,26 @@ ros2 run cash_rl view_env --policy ~/ros2_ws/runs/my_run/best_model.zip --goal a
 ros2 run cash_rl view_env                  # hand-written reference controller, random goals
 ```
 
-**Evaluate** on the door goals, in 2D or in Gazebo:
+**Evaluate** on the door goals, in 2D or in Gazebo, and compare models on held-out goals:
 ```bash
 ros2 run cash_rl evaluate ~/ros2_ws/runs/my_run/best_model.zip
+ros2 run cash_rl evaluate runs/run_a/best_model.zip runs/run_b/best_model.zip --random 200
 ros2 launch cash_rl train_env.launch.py                                    # terminal 1, for Gazebo
 ros2 run cash_rl evaluate ~/ros2_ws/runs/my_run/best_model.zip --env gazebo # terminal 2
 ```
 Run Gazebo evaluations with training stopped: Gazebo steps on wall-clock time, and training load
 slows the simulation. To watch, run `gz sim -g` in another terminal (not together with RViz).
 
-**Results so far** (`ppo_baseline`, Oct 14 2026): eval success rose from 0% to 89% within 1M steps and
-peaked at 93%. The best model reached all 7 doors in both the 2D sim and Gazebo, with no collisions.
+**Results so far** (Oct 14 2026; details in [WORKLOG.md](WORKLOG.md)):
+
+| Run | Settings | Best model | Held-out goals reached (200) | Collisions |
+|---|---|---|---|---|
+| `ppo_baseline` | 3M steps, goals 1–15 m | 2.8M steps | 93.0% | 6.0% |
+| `ppo_junction` | 1.5M steps, goals 1–25 m, `--junction-prob 0.3` | 1.1M steps | 96.0% | 3.0% |
+
+Both best models reach all 7 doors from spawn; `ppo_baseline`'s also did in Gazebo. Known
+weaknesses: from random headings both models drive in reverse about half the time instead of turning
+around, and the policy can clip the water fountain when it hugs the north wall heading for the branch.
 
 ## Save and push work
 
