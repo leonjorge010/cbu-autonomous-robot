@@ -51,7 +51,7 @@ CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts studen
 - RViz "Message Filter dropping message ... earlier than all the data in the transform cache" right after sim start
 
 ## Next milestones
-1. ~~SLAM Toolbox: map the hallway~~ — wired up (`slam.launch.py`); still need to actually drive a full mapping pass and save `maps/hallway.*`
+1. ~~SLAM Toolbox: map the hallway~~ — done: `maps/hallway.{pgm,yaml,posegraph,data}` (0.05 m/px, map frame aligned with Gazebo world frame since SLAM started at spawn). If a Ctrl+C leaves an orphan `gz sim` server running, a relaunch silently reuses its stale robot state — check `pgrep -af "gz sim"` before mapping
 2. Nav2: load the saved map with `nav2_map_server`, localize against it (AMCL or slam_toolbox in localization mode), and use Nav2's planner/controller to drive to goal poses set in RViz
 3. DRL navigation policy: train a hallway-navigation policy headless in this sim (CSCI 4220 project) — LiDAR scan as observation, `/cmd_vel` as the action space; an alternative/complement to the classic Nav2 stack for the escort behavior. `cash_rl` package scaffolded and smoke-tested (`HallwayEnv` + service-bridge launch file, `random_agent` runs clean episodes against a live sim); still need: a real reward function and an actual training script (e.g. Stable-Baselines3 PPO/SAC)
 4. Escort behavior: turn the doors already in `hallway.sdf` into named waypoints so the robot can be given "escort to classroom X" goals
