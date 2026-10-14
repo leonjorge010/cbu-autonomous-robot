@@ -98,6 +98,48 @@ re-driving from scratch:
 ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '/home/jorge_leon/ros2_ws/maps/hallway'}"
 ```
 
+The committed map (`maps/hallway.*`) is aligned with the Gazebo world frame, because SLAM was started
+at the spawn pose, so map coordinates equal world coordinates from `hallway.sdf`.
+
+## Train the navigation policy (DRL)
+
+The `cash_rl` package trains a policy that drives from a start pose to a goal point (for example a
+classroom door) using only the LiDAR scan and the goal's relative position. Training runs in a fast
+2D simulator built on the SLAM map (~2,300 steps/s vs ~10 in Gazebo); the trained policy then runs
+unchanged in Gazebo.
+
+One-time setup (CPU-only PyTorch; `numpy<2` keeps ROS 2 Jazzy's numpy working):
+```bash
+pip install --user --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch "numpy<2"
+pip install --user --break-system-packages stable-baselines3 tensorboard gymnasium "numpy<2"
+```
+
+**Train** (PPO, 3M steps, ~40 min on the laptop; results go to `runs/<name>/`, which is gitignored):
+```bash
+ros2 run cash_rl train --name my_run
+tensorboard --logdir ~/ros2_ws/runs     # then open http://localhost:6006, look at the eval/ charts
+```
+Every 100k steps the policy is evaluated on all 7 doors from spawn plus 20 fixed random goals;
+`runs/<name>/eval.csv` has success, collision and timeout rates for plotting.
+
+**Watch** episodes in a window (or add `--save out.gif`):
+```bash
+ros2 run cash_rl view_env --policy ~/ros2_ws/runs/my_run/best_model.zip --goal all
+ros2 run cash_rl view_env                  # hand-written reference controller, random goals
+```
+
+**Evaluate** on the door goals, in 2D or in Gazebo:
+```bash
+ros2 run cash_rl evaluate ~/ros2_ws/runs/my_run/best_model.zip
+ros2 launch cash_rl train_env.launch.py                                    # terminal 1, for Gazebo
+ros2 run cash_rl evaluate ~/ros2_ws/runs/my_run/best_model.zip --env gazebo # terminal 2
+```
+Run Gazebo evaluations with training stopped: Gazebo steps on wall-clock time, and training load
+slows the simulation. To watch, run `gz sim -g` in another terminal (not together with RViz).
+
+**Results so far** (`ppo_baseline`, Oct 14 2026): eval success rose from 0% to 89% within 1M steps and
+peaked at 93%. The best model reached all 7 doors in both the 2D sim and Gazebo, with no collisions.
+
 ## Save and push work
 
 ```bash
@@ -124,6 +166,10 @@ git push
 - **`git push` / `gh` asks to log in**: the access token may have expired. Generate a new classic token
   (scopes: repo, workflow, read:org, admin:public_key) and run `gh auth login` → Paste an authentication token.
 - **Package not found after building**: run `source install/setup.bash` in that terminal.
+- **Robot starts in a weird place / odom is wrong after relaunching**: Ctrl+C sometimes leaves an old
+  Gazebo server running, and the relaunch silently reuses it. Check with `pgrep -af "gz sim"`; if more
+  than one shows up (or any after stopping the sim), `kill -9 <pid>` the extras and relaunch. Always check
+  this before a SLAM mapping pass.
 - **Robot doesn't move with teleop**: the teleop terminal must be focused, and the sim must be playing (not paused).
 - **Slow builds**: make sure you're in `~/ros2_ws`, not under `/mnt/c/...`.
 - **`code .` opens the wrong folder, or `cd ~/ros2_ws` says "path not found"**: you're in Windows
