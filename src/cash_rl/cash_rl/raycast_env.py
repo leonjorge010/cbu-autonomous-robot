@@ -9,77 +9,19 @@ trained policies against HallwayEnv in Gazebo afterwards.
 The map frame is aligned with the Gazebo world frame (SLAM was started at the
 spawn pose), so poses here are world coordinates from hallway.sdf.
 """
-import os
-
 from cash_rl import spec
+from cash_rl.occupancy_map import OccupancyMap
 import gymnasium as gym
 import numpy as np
-from PIL import Image
-import yaml
 
-DEFAULT_MAP_ENV_VAR = 'CASH_MAP_YAML'
-DEFAULT_MAP_RELPATH = os.path.join('maps', 'hallway.yaml')
 # Integrate the DiffDrive acceleration limits at this many substeps per control step.
 N_SUBSTEPS = 10
 # Extra clearance (beyond COLLISION_MARGIN) required around a random spawn pose.
 SPAWN_CLEARANCE = 0.15
-MAX_SPAWN_TRIES = 1000
-
-
-def default_map_yaml():
-    """$CASH_MAP_YAML, else maps/hallway.yaml found by walking up from this source file.
-
-    Works with `colcon build --symlink-install` (the module resolves back into
-    src/, under the workspace that holds maps/).
-    """
-    if os.environ.get(DEFAULT_MAP_ENV_VAR):
-        return os.environ[DEFAULT_MAP_ENV_VAR]
-    directory = os.path.dirname(os.path.realpath(__file__))
-    while True:
-        candidate = os.path.join(directory, DEFAULT_MAP_RELPATH)
-        if os.path.isfile(candidate):
-            return candidate
-        parent = os.path.dirname(directory)
-        if parent == directory:
-            raise FileNotFoundError(
-                f'Could not find {DEFAULT_MAP_RELPATH} above {__file__}; pass map_yaml '
-                f'or set ${DEFAULT_MAP_ENV_VAR}')
-        directory = parent
-
-
-class OccupancyMap:
-    """map_server-format map (.yaml + image); anything not free blocks rays."""
-
-    def __init__(self, yaml_path):
-        with open(yaml_path) as f:
-            meta = yaml.safe_load(f)
-        image_path = os.path.join(os.path.dirname(yaml_path), meta['image'])
-        pixels = np.array(Image.open(image_path).convert('L'), dtype=np.float32)
-        occupancy = pixels / 255.0 if meta.get('negate', 0) else (255.0 - pixels) / 255.0
-
-        origin_x, origin_y, origin_yaw = meta['origin']
-        if origin_yaw != 0:
-            raise ValueError(f'{yaml_path}: rotated map origins are not supported')
-        self.resolution = float(meta['resolution'])
-        self.origin = np.array([origin_x, origin_y], dtype=np.float64)
-        # Flip so row 0 is the bottom (y = origin_y) row, matching world +y up.
-        self.free = (occupancy < meta['free_thresh'])[::-1].copy()
-        self.pixels = pixels[::-1].astype(np.uint8)
-        self.height, self.width = self.free.shape
-        self.free_cells = np.argwhere(self.free)
-
-    def to_cell(self, x, y):
-        col = np.floor((x - self.origin[0]) / self.resolution).astype(np.int64)
-        row = np.floor((y - self.origin[1]) / self.resolution).astype(np.int64)
-        return row, col
-
-    def is_free(self, x, y):
-        """Vectorized: True where (x, y) is a free cell; off-map counts as blocked."""
-        row, col = self.to_cell(np.asarray(x), np.asarray(y))
-        inside = (row >= 0) & (row < self.height) & (col >= 0) & (col < self.width)
-        free = np.zeros(row.shape, dtype=bool)
-        free[inside] = self.free[row[inside], col[inside]]
-        return free
+# Random goals sit on cells at least this far from any obstacle.
+GOAL_CLEARANCE = 0.5
+DEFAULT_GOAL_DISTANCE_RANGE = (1.0, 15.0)
+MAX_SAMPLE_TRIES = 1000
 
 
 def _rectangle_perimeter(half_length, half_width, spacing):
@@ -99,23 +41,24 @@ def _rectangle_perimeter(half_length, half_width, spacing):
 class HallwayRaycastEnv(gym.Env):
     """2D stand-in for HallwayEnv, for fast training.
 
-    map_yaml defaults to default_map_yaml(). With random_spawn, reset() samples a
-    collision-free pose (with SPAWN_CLEARANCE) anywhere in the map's free space;
-    without it, reset() uses spawn_pose (x, y, yaw) every time, like HallwayEnv —
-    the default matches sim.launch.py's spawn. range_noise adds the URDF's
-    Gaussian range noise to observations. render_mode is None or 'rgb_array'.
+    reset(options=...) accepts 'spawn' (x, y, yaw) and 'goal' (x, y); either one
+    left out is sampled: a collision-free spawn (with SPAWN_CLEARANCE) anywhere in
+    free space, and a goal whose geodesic distance from the spawn is within
+    goal_distance_range. For evaluation matching HallwayEnv, pass
+    spec.SPAWN_POSE and one of spec.DOOR_GOALS. map_yaml defaults to
+    occupancy_map.default_map_yaml(); range_noise adds the URDF's Gaussian range
+    noise; render_mode is None or 'rgb_array'.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
 
-    def __init__(self, map_yaml=None, random_spawn=True, spawn_pose=(0.0, 0.0, 0.0),
+    def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
                  range_noise=True, render_mode=None):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
-        self.map = OccupancyMap(map_yaml or default_map_yaml())
-        self.random_spawn = random_spawn
-        self.spawn_pose = np.array(spawn_pose, dtype=np.float64)
+        self.map = OccupancyMap(map_yaml)
+        self.goal_distance_range = goal_distance_range
         self.range_noise = range_noise
         self.render_mode = render_mode
 
@@ -135,11 +78,17 @@ class HallwayRaycastEnv(gym.Env):
             spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             self._ray_step)
+        self._goal_cells = np.argwhere(self.map.clearance >= GOAL_CLEARANCE)
 
-        self.pose = self.spawn_pose.copy()
+        self.pose = np.array(spec.SPAWN_POSE, dtype=np.float64)
+        self.goal = np.zeros(2)
+        self._goal_field = None
+        self._goal_distance = 0.0
         self._velocity = np.zeros(2)
+        self._prev_action = np.zeros(2, dtype=np.float32)
         self._ranges = np.full(spec.N_OBS_BEAMS, spec.MAX_RANGE, dtype=np.float32)
         self._step_count = 0
+        self._max_steps = 0
 
     # -- geometry ---------------------------------------------------------
 
@@ -175,17 +124,29 @@ class HallwayRaycastEnv(gym.Env):
         ranges = np.where(hit, self._ray_ts[first] - self._ray_step / 2, np.inf)
         return np.where(ranges < spec.MIN_RANGE, -np.inf, ranges)
 
+    def _random_point_in_cell(self, row, col):
+        return (self.map.origin[0] + (col + self.np_random.random()) * self.map.resolution,
+                self.map.origin[1] + (row + self.np_random.random()) * self.map.resolution)
+
     def _sample_spawn_pose(self):
-        for _ in range(MAX_SPAWN_TRIES):
+        for _ in range(MAX_SAMPLE_TRIES):
             row, col = self.map.free_cells[self.np_random.integers(len(self.map.free_cells))]
-            pose = np.array([
-                self.map.origin[0] + (col + self.np_random.random()) * self.map.resolution,
-                self.map.origin[1] + (row + self.np_random.random()) * self.map.resolution,
-                self.np_random.uniform(-np.pi, np.pi),
-            ])
+            pose = np.array([*self._random_point_in_cell(row, col),
+                             self.np_random.uniform(-np.pi, np.pi)])
             if not self._outline_hits(self._spawn_outline, pose):
                 return pose
-        raise RuntimeError(f'No collision-free spawn pose found in {MAX_SPAWN_TRIES} tries')
+        raise RuntimeError(f'No collision-free spawn pose found in {MAX_SAMPLE_TRIES} tries')
+
+    def _sample_goal(self, spawn):
+        """Goal cell within goal_distance_range of spawn (geodesic), or None."""
+        from_spawn = self.map.distance_field(spawn[0], spawn[1]).grid
+        lo, hi = self.goal_distance_range
+        distances = from_spawn[self._goal_cells[:, 0], self._goal_cells[:, 1]]
+        candidates = self._goal_cells[(distances >= lo) & (distances <= hi)]
+        if len(candidates) == 0:
+            return None
+        return np.array(self._random_point_in_cell(
+            *candidates[self.np_random.integers(len(candidates))]))
 
     # -- gym API ----------------------------------------------------------
 
@@ -196,23 +157,46 @@ class HallwayRaycastEnv(gym.Env):
             ranges[finite] += self.np_random.normal(
                 0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
         self._ranges = spec.sanitize_ranges(ranges)
-        return spec.observation_from_ranges(self._ranges)
+        return spec.build_observation(self._ranges, self.pose, self.goal, self._prev_action)
+
+    def _info(self, **extra):
+        return {'pose': self.pose.copy(), 'goal': self.goal.copy(),
+                'goal_distance': self._goal_distance, **extra}
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.pose = self._sample_spawn_pose() if self.random_spawn else self.spawn_pose.copy()
-        if self.collides():
-            raise RuntimeError(f'Spawn pose {self.pose} is in collision')
+        options = options or {}
+        spawn, goal = options.get('spawn'), options.get('goal')
+        for _ in range(MAX_SAMPLE_TRIES):
+            pose = np.array(spawn if spawn is not None else self._sample_spawn_pose(),
+                            dtype=np.float64)
+            goal_xy = np.array(goal, dtype=np.float64) if goal is not None \
+                else self._sample_goal(pose)
+            if goal_xy is not None:
+                break
+            if spawn is not None:
+                raise RuntimeError(f'No goal within {self.goal_distance_range} m of {spawn}')
+        else:
+            raise RuntimeError(f'No spawn/goal pair found in {MAX_SAMPLE_TRIES} tries')
+        if self.collides(pose):
+            raise RuntimeError(f'Spawn pose {pose} is in collision')
+
+        self.pose, self.goal = pose, goal_xy
+        self._goal_field = self.map.distance_field(*self.goal)
+        self._goal_distance = self._goal_field(*self.pose[:2])
+        if not np.isfinite(self._goal_distance):
+            raise RuntimeError(f'Goal {self.goal} unreachable from spawn {self.pose}')
         self._velocity[:] = 0.0
+        self._prev_action[:] = 0.0
         self._step_count = 0
-        return self._observe(), {'pose': self.pose.copy()}
+        self._max_steps = spec.episode_step_limit(self._goal_distance)
+        return self._observe(), self._info()
 
     def step(self, action):
-        linear, angular = spec.action_to_cmd(action)
-        target = np.array([linear, angular])
-        max_delta = np.array([spec.MAX_LINEAR_ACCEL, spec.MAX_ANGULAR_ACCEL]) \
-            * spec.CONTROL_PERIOD / N_SUBSTEPS
+        action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        target = np.array(spec.action_to_cmd(action))
         dt = spec.CONTROL_PERIOD / N_SUBSTEPS
+        max_delta = np.array([spec.MAX_LINEAR_ACCEL, spec.MAX_ANGULAR_ACCEL]) * dt
         for _ in range(N_SUBSTEPS):
             self._velocity += np.clip(target - self._velocity, -max_delta, max_delta)
             v, w = self._velocity
@@ -220,14 +204,19 @@ class HallwayRaycastEnv(gym.Env):
             self.pose[1] += v * np.sin(self.pose[2]) * dt
             self.pose[2] = (self.pose[2] + w * dt + np.pi) % (2 * np.pi) - np.pi
         self._step_count += 1
+        self._prev_action = action
 
-        obs = self._observe()
         collided = self.collides()
-        terminated = collided
-        truncated = self._step_count >= spec.MAX_EPISODE_STEPS
-        reward = spec.placeholder_reward(linear, collided)
-        info = {'min_range': float(np.min(self._ranges)), 'pose': self.pose.copy(),
-                'collided': collided}
+        goal_distance = self._goal_field(*self.pose[:2])
+        reward, reached = spec.step_outcome(
+            self._goal_distance, goal_distance, self.pose, self.goal, collided)
+        if np.isfinite(goal_distance):
+            self._goal_distance = goal_distance
+        obs = self._observe()
+        terminated = collided or reached
+        truncated = self._step_count >= self._max_steps
+        info = self._info(min_range=float(np.min(self._ranges)), collided=collided,
+                          is_success=reached)
         return obs, reward, terminated, truncated, info
 
     def render(self):
@@ -251,4 +240,7 @@ class HallwayRaycastEnv(gym.Env):
               y + s * outline[:, 0] + c * outline[:, 1], (30, 80, 220))
         heading = np.linspace(0, spec.FOOTPRINT_HALF_LENGTH, 6)
         paint(x + c * heading, y + s * heading, (30, 160, 30))
+        ring = np.linspace(0, 2 * np.pi, 48)
+        paint(self.goal[0] + spec.GOAL_TOLERANCE * np.cos(ring),
+              self.goal[1] + spec.GOAL_TOLERANCE * np.sin(ring), (230, 150, 0))
         return image[::-1].copy()  # +y up, as in RViz

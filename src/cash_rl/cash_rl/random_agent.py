@@ -20,8 +20,11 @@ def main():
                 obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += reward
                 steps += 1
-            print(f'episode {episode}: steps={steps} reward={episode_reward:.2f} '
-                  f'ended_by={"collision" if terminated else "truncated"}')
+            ended_by = 'truncated'
+            if terminated:
+                ended_by = 'goal' if info['is_success'] else 'collision'
+            print(f'episode {episode}: goal={info["goal"]} steps={steps} '
+                  f'reward={episode_reward:.2f} ended_by={ended_by}')
     finally:
         env.close()
 

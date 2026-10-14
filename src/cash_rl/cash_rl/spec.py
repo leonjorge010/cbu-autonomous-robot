@@ -39,12 +39,46 @@ MAX_LINEAR_ACCEL = 1.0
 MAX_ANGULAR_ACCEL = 2.0
 
 CONTROL_PERIOD = 0.1
-MAX_EPISODE_STEPS = 500
-COLLISION_PENALTY = 10.0
+# Episode time limit: EPISODE_TIME_FACTOR x the time to cover the spawn's geodesic
+# goal distance at MAX_LINEAR_VEL, plus EPISODE_TIME_SLACK seconds for turning.
+EPISODE_TIME_FACTOR = 2.0
+EPISODE_TIME_SLACK = 10.0
+
+# Goal-reaching task. Observation = [N_OBS_BEAMS ranges / MAX_RANGE,
+# goal distance / MAX_GOAL_DISTANCE, cos(goal bearing), sin(goal bearing),
+# previous action (2)], with the goal in the robot's base_footprint frame.
+GOAL_TOLERANCE = 0.3
+MAX_GOAL_DISTANCE = 30.0
+N_OBS = N_OBS_BEAMS + 3 + 2
+
+# Reward per step: PROGRESS_WEIGHT * (decrease in geodesic goal distance, m)
+# - TIME_PENALTY, plus GOAL_REWARD on reaching the goal or - COLLISION_PENALTY
+# on collision (both end the episode). Progress is potential-based shaping, so
+# its episode total depends only on start and end distance, not the path.
+PROGRESS_WEIGHT = 10.0
+TIME_PENALTY = 0.01
+GOAL_REWARD = 10.0
+COLLISION_PENALTY = 20.0
+
+# Fixed evaluation goals: the corridor centerline in front of each door in
+# cash_sim/worlds/hallway.sdf (world frame == map frame).
+DOOR_GOALS = {
+    'door_101': (4.0, 0.0),
+    'door_105': (7.0, 0.0),
+    'door_102': (9.0, 0.0),
+    'door_103': (20.0, 0.0),
+    'door_104': (24.0, 0.0),
+    'door_201': (14.0, 6.0),
+    'door_202': (14.0, 9.0),
+}
+SPAWN_POSE = (0.0, 0.0, 0.0)  # sim.launch.py's default x, y, yaw
 
 
 def observation_space():
-    return gym.spaces.Box(low=0.0, high=1.0, shape=(N_OBS_BEAMS,), dtype=np.float32)
+    low = np.concatenate([np.zeros(N_OBS_BEAMS), [0.0, -1.0, -1.0], [-1.0, -1.0]])
+    high = np.ones(N_OBS)
+    return gym.spaces.Box(low=low.astype(np.float32), high=high.astype(np.float32),
+                          dtype=np.float32)
 
 
 def action_space():
@@ -64,9 +98,20 @@ def sanitize_ranges(ranges):
     return np.clip(ranges, 0.0, MAX_RANGE)
 
 
-def observation_from_ranges(obs_ranges):
-    """Normalize the N_OBS_BEAMS ranges (already sanitized) to [0, 1]."""
-    return (np.asarray(obs_ranges, dtype=np.float32) / MAX_RANGE).astype(np.float32)
+def goal_in_robot_frame(pose, goal):
+    """Return (distance, bearing) of goal (x, y) from pose (x, y, yaw)."""
+    dx, dy = goal[0] - pose[0], goal[1] - pose[1]
+    return float(np.hypot(dx, dy)), float(np.arctan2(dy, dx) - pose[2])
+
+
+def build_observation(obs_ranges, pose, goal, prev_action):
+    """Assemble the N_OBS observation from sanitized N_OBS_BEAMS ranges."""
+    distance, bearing = goal_in_robot_frame(pose, goal)
+    return np.concatenate([
+        np.asarray(obs_ranges, dtype=np.float32) / MAX_RANGE,
+        [min(distance / MAX_GOAL_DISTANCE, 1.0), np.cos(bearing), np.sin(bearing)],
+        np.clip(prev_action, -1.0, 1.0),
+    ]).astype(np.float32)
 
 
 def scan_hits_footprint(ranges, angles):
@@ -78,9 +123,25 @@ def scan_hits_footprint(ranges, angles):
         & (np.abs(y) < FOOTPRINT_HALF_WIDTH + COLLISION_MARGIN)))
 
 
-def placeholder_reward(linear_cmd, collided):
-    """Forward progress minus a collision penalty. Replace once goals exist."""
-    reward = linear_cmd * CONTROL_PERIOD
+def episode_step_limit(goal_distance):
+    """Return the step budget for an episode starting goal_distance (geodesic) away."""
+    seconds = EPISODE_TIME_FACTOR * goal_distance / MAX_LINEAR_VEL + EPISODE_TIME_SLACK
+    return int(np.ceil(seconds / CONTROL_PERIOD))
+
+
+def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided):
+    """Return (reward, reached) for one step.
+
+    goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
+    the traversable map) counts as no progress. Reaching is Euclidean, within
+    GOAL_TOLERANCE, and doesn't count on a colliding step.
+    """
+    progress = goal_distance - prev_goal_distance
+    progress = 0.0 if not np.isfinite(progress) else -progress
+    reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
+    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY
+    if reached:
+        reward += GOAL_REWARD
     if collided:
         reward -= COLLISION_PENALTY
-    return reward
+    return reward, reached
