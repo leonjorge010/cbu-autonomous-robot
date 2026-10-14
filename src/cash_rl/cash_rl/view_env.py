@@ -70,6 +70,60 @@ def footprint_corners(pose):
     return pose[:2] + corners @ np.array([[c, s], [-s, c]])
 
 
+class Scene:
+    """Matplotlib drawing of the map, doors, robot, beams, goal and trail on `ax`.
+
+    door_labels maps door name -> label text (default: the name). draw() with
+    pose None hides the robot and beams; goal None hides the goal.
+    """
+
+    def __init__(self, ax, env, door_labels=None):
+        from matplotlib.collections import LineCollection
+        from matplotlib.patches import Circle, Polygon
+        m = env.map
+        ax.imshow(m.pixels, cmap='gray', origin='lower', vmin=0, vmax=255, extent=[
+            m.origin[0], m.origin[0] + m.width * m.resolution,
+            m.origin[1], m.origin[1] + m.height * m.resolution])
+        for name, (gx, gy) in spec.DOOR_GOALS.items():
+            ax.plot(gx, gy, '+', color='0.6', ms=6)
+            ax.annotate((door_labels or {}).get(name, name), (gx, gy), xytext=(3, 4),
+                        textcoords='offset points', fontsize=7, color='0.45')
+        ax.set_xlabel('x (m)')
+        ax.set_ylabel('y (m)')
+        self.beams = ax.add_collection(
+            LineCollection([], colors='tab:red', linewidths=0.6, alpha=0.6))
+        self.trail, = ax.plot([], [], color='tab:blue', lw=1.2, alpha=0.7)
+        self.robot = ax.add_patch(Polygon(np.zeros((4, 2)), closed=True, fc='tab:blue',
+                                          ec='navy', alpha=0.8))
+        self.heading, = ax.plot([], [], color='white', lw=2)
+        self.goal = ax.add_patch(Circle((0, 0), spec.GOAL_TOLERANCE, fc='orange',
+                                        ec='darkorange', alpha=0.7))
+        self.title = ax.set_title('', fontsize=11, family='monospace')
+
+    def draw(self, pose, ranges, goal, trail, text):
+        self.robot.set_visible(pose is not None)
+        self.heading.set_visible(pose is not None)
+        self.beams.set_visible(pose is not None and ranges is not None)
+        if pose is not None:
+            c, s = np.cos(pose[2]), np.sin(pose[2])
+            if ranges is not None:
+                lidar = pose[:2] + spec.LIDAR_X * np.array([c, s])
+                angles = pose[2] + spec.OBS_BEAM_ANGLES
+                ends = lidar + ranges[:, None] * np.stack([np.cos(angles), np.sin(angles)],
+                                                          axis=1)
+                self.beams.set_segments([[lidar, end] for end in ends])
+            self.robot.set_xy(footprint_corners(pose))
+            tip = pose[:2] + spec.FOOTPRINT_HALF_LENGTH * np.array([c, s])
+            self.heading.set_data([pose[0], tip[0]], [pose[1], tip[1]])
+        self.goal.set_visible(goal is not None)
+        if goal is not None:
+            self.goal.center = goal
+        trail = np.zeros((0, 2)) if trail is None or len(trail) == 0 else np.asarray(trail)
+        self.trail.set_data(trail[:, 0], trail[:, 1])
+        self.title.set_text(text)
+        return self.beams, self.trail, self.robot, self.heading, self.goal, self.title
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--policy', default='downhill',
@@ -97,49 +151,19 @@ def main():
     if args.save:
         matplotlib.use('Agg')
     from matplotlib.animation import FuncAnimation, PillowWriter
-    from matplotlib.collections import LineCollection
-    from matplotlib.patches import Circle, Polygon
     import matplotlib.pyplot as plt
 
     env = HallwayRaycastEnv()
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
     frames = run_episodes(env, policy, goals, args.seed)
 
-    m = env.map
     fig, ax = plt.subplots(figsize=(14, 6.4))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.93, bottom=0.07)
-    ax.imshow(m.pixels, cmap='gray', origin='lower', vmin=0, vmax=255, extent=[
-        m.origin[0], m.origin[0] + m.width * m.resolution,
-        m.origin[1], m.origin[1] + m.height * m.resolution])
-    for name, (gx, gy) in spec.DOOR_GOALS.items():
-        ax.plot(gx, gy, '+', color='0.6', ms=6)
-        ax.annotate(name, (gx, gy), xytext=(3, 4), textcoords='offset points',
-                    fontsize=7, color='0.45')
-    ax.set_xlabel('x (m)')
-    ax.set_ylabel('y (m)')
-    beams = ax.add_collection(LineCollection([], colors='tab:red', linewidths=0.6, alpha=0.6))
-    trail, = ax.plot([], [], color='tab:blue', lw=1.2, alpha=0.7)
-    robot = ax.add_patch(Polygon(np.zeros((4, 2)), closed=True, fc='tab:blue', ec='navy',
-                                 alpha=0.8))
-    heading, = ax.plot([], [], color='white', lw=2)
-    goal = ax.add_patch(Circle((0, 0), spec.GOAL_TOLERANCE, fc='orange', ec='darkorange',
-                               alpha=0.7))
-    title = ax.set_title('', fontsize=11, family='monospace')
+    scene = Scene(ax, env)
 
     def draw(frame):
-        pose, ranges = frame['pose'], frame['ranges']
-        c, s = np.cos(pose[2]), np.sin(pose[2])
-        lidar = pose[:2] + spec.LIDAR_X * np.array([c, s])
-        angles = pose[2] + spec.OBS_BEAM_ANGLES
-        ends = lidar + ranges[:, None] * np.stack([np.cos(angles), np.sin(angles)], axis=1)
-        beams.set_segments([[lidar, end] for end in ends])
-        trail.set_data(frame['trail'][:, 0], frame['trail'][:, 1])
-        robot.set_xy(footprint_corners(pose))
-        tip = pose[:2] + spec.FOOTPRINT_HALF_LENGTH * np.array([c, s])
-        heading.set_data([pose[0], tip[0]], [pose[1], tip[1]])
-        goal.center = frame['goal']
-        title.set_text(frame['text'])
-        return beams, trail, robot, heading, goal, title
+        return scene.draw(frame['pose'], frame['ranges'], frame['goal'], frame['trail'],
+                          frame['text'])
 
     interval_ms = 1000 * spec.CONTROL_PERIOD / args.speed
     anim = FuncAnimation(fig, draw, frames=frames, interval=interval_ms, blit=False,
