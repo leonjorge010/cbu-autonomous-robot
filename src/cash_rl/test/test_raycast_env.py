@@ -83,6 +83,15 @@ def test_every_door_goal_is_reachable_from_spawn(env, name):
     assert total > expected_min
 
 
+def test_reverse_is_slower_than_forward(env):
+    assert spec.action_to_cmd([1.0, 0.0])[0] == pytest.approx(spec.MAX_LINEAR_VEL)
+    assert spec.action_to_cmd([-1.0, 0.0])[0] == pytest.approx(-spec.MAX_REVERSE_VEL)
+    env.reset(seed=0, options={'spawn': (10.0, 0.0, 0.0), 'goal': DOOR_101})
+    for _ in range(50):  # 5 s, long past the acceleration ramp
+        env.step(np.array([-1.0, 0.0]))
+    assert 10.0 - env.pose[0] < 5.0 * spec.MAX_REVERSE_VEL + 0.01
+
+
 def test_standing_still_times_out(env):
     _, start = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
     total, info = drive(env, lambda env: np.zeros(2))

@@ -33,6 +33,10 @@ FOOTPRINT_HALF_WIDTH = 0.245
 COLLISION_MARGIN = 0.05
 
 MAX_LINEAR_VEL = 0.5
+# Reverse is capped well below forward speed: the progress reward pays the same for
+# driving backward, so with a symmetric limit policies reversed ~half the time
+# instead of turning around. Slow reverse still lets the robot back off a wall.
+MAX_REVERSE_VEL = 0.15
 MAX_ANGULAR_VEL = 1.0
 # DiffDrive plugin limits (max_linear_acceleration / max_angular_acceleration).
 MAX_LINEAR_ACCEL = 1.0
@@ -86,9 +90,13 @@ def action_space():
 
 
 def action_to_cmd(action):
-    """Map a [-1, 1]^2 action to (linear_x m/s, angular_z rad/s)."""
+    """Map a [-1, 1]^2 action to (linear_x m/s, angular_z rad/s).
+
+    action[0] in [0, 1] scales MAX_LINEAR_VEL and in [-1, 0) MAX_REVERSE_VEL.
+    """
     action = np.clip(action, -1.0, 1.0)
-    return float(action[0]) * MAX_LINEAR_VEL, float(action[1]) * MAX_ANGULAR_VEL
+    linear = float(action[0]) * (MAX_LINEAR_VEL if action[0] >= 0 else MAX_REVERSE_VEL)
+    return linear, float(action[1]) * MAX_ANGULAR_VEL
 
 
 def sanitize_ranges(ranges):
