@@ -183,8 +183,13 @@ All seeds still reach 7/7 doors from spawn with the safety layer on.
 - **Collisions fall about 6×,** and success doesn't drop. Most episodes that would have collided
   become timeouts: the robot stops short instead of hitting the wall.
 - **The layer only intervenes on about 3% of steps,** so the policy still does almost all the driving.
-- **The 2D test uses a 360-beam scan for the safety layer.** Gazebo and the real sensor give 2160
-  beams. It hasn't been tested in Gazebo yet.
+- **Gazebo, with the full 2160-beam STL-27L scan:**
+  - With the layer on, `ppo_d800_prox` (best) reached 7/7 doors, and the layer never intervened.
+    So it raises no false alarms in normal driving, junction turns or door approaches.
+  - Driving at full speed into the end wall, straight and at an angle, it collided both times
+    without the layer. With the layer it stopped **10.2 cm and 10.4 cm** from the wall, right at
+    the 10 cm margin.
+- The 2D results above use a 360-beam scan for the safety layer, to keep raycasting cheap.
 
 ## Collision analysis
 
