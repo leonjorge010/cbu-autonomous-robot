@@ -43,11 +43,12 @@ Stack: Ubuntu 24.04 · ROS 2 Jazzy · Gazebo Harmonic · Stable-Baselines3 (PyTo
 | Model | Sensor model | Goals reached (200 unseen) | Collisions | Time spent reversing |
 |---|---|---|---|---|
 | `ppo_junction` | ideal LiDAR, fast reverse | 96% | 3% | 51% |
-| `ppo_d800_wallcost` (current) | real STL-27L LiDAR, slow reverse | 92% | 5.5% | 11% |
+| `ppo_d800_prox` (current) | real STL-27L LiDAR, slow reverse, keeps clear of walls | 96.5% | 3% | 8% |
 
-All models reach all 7 doors. Open problem: the current model still clips the junction corners at
-full speed (a proximity penalty is next). After that: random obstacles, then pedestrians, then a
-layout it has never seen.
+All models reach all 7 doors. The current model matches the old best while using the realistic
+sensor and almost never reversing. Remaining collisions are mostly at the water fountain and from
+awkward start poses. Next: Gazebo check of the new models, then random obstacles, then pedestrians,
+then a layout it has never seen.
 
 ## Setup (once per computer)
 
@@ -104,7 +105,7 @@ tensorboard --logdir ~/ros2_ws/runs    # open http://localhost:6006 and look at 
 Each run also has its `config.json` (every setting) and `eval.csv` (learning curve).
 ```bash
 cd ~/ros2_ws
-for run in ppo_d800_wallcost ppo_d800; do
+for run in ppo_d800_prox ppo_d800_wallcost ppo_d800; do
   mkdir -p runs/$run
   curl -L -o runs/$run/best_model.zip \
     https://github.com/leonjorge010/cbu-autonomous-robot/releases/download/models-2026-10-15/${run}_best_model.zip

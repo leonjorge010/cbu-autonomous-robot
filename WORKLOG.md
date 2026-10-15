@@ -32,7 +32,11 @@ for each session: what changed, results with numbers, and what's still open.
 - `ppo_d800_wallcost` (+ near-wall cost): 92.0% / 5.5% (best). East-corner hits fell from 12 to 3, but
   collisions moved to the west corner, always at full speed. Reached 90% eval at 0.4M steps
   (`ppo_junction`: 0.9M).
-- Released both as `models-2026-10-15`.
+- `ppo_d800_prox` (+ proximity penalty: up to 0.5 per step when the footprint is within 0.3 m of an
+  obstacle): **96.5% / 3.0% / 8.4% reversing** (best), matching `ppo_junction`'s 96% / 3% on the
+  harder task. Corner hits fell from 9 to 3; the 6 left are 2 fountain, 3 corners and 1 end wall.
+  Trained in 11 min with the CPU to itself. 100% on every periodic eval from 1.2M steps.
+- Released all three as `models-2026-10-15`.
 
 **Lessons**
 - Don't run two trainings or several evaluations at once. PyTorch takes all 22 threads per process,
@@ -40,8 +44,7 @@ for each session: what changed, results with numbers, and what's still open.
 - The 27-episode periodic eval can't rank models (100% there, 90–93% on 200 goals).
 
 **Open**
-- Proximity penalty (slow down near walls) to fix the corner collisions.
-- Gazebo eval of the D800 models; 2–3 seeds per setup (cancelled today for time).
+- Gazebo eval of the D800 models (`ppo_d800_prox` first); 2–3 seeds per setup (cancelled today for time).
 - LiDAR mounting position and height on the real chassis.
 
 ## 2026-10-14
