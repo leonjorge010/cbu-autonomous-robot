@@ -4,9 +4,11 @@ Every navigation policy trained so far: what task each one learned, how it was t
 scored. All numbers below were measured on 2026-10-15. Each model was evaluated with the code it
 was trained on, so each row is scored on its own task.
 
-**Current recommendation: `ppo_d800_prox`**, best checkpoint. It matches the code on `main` (real
-LiDAR model, slow reverse, near-wall cost, proximity penalty), and it ties the best success and
-collision rates of any model while reversing 8% of the time instead of 51%. Download it from the
+**Current recommendation: `ppo_d800_prox`** (seed 0, best checkpoint). It matches the code on `main`
+(real LiDAR model, slow reverse, near-wall cost, proximity penalty). Of the five seed-0 models it
+ties for the best success and collision rates, while reversing 8% of the time instead of 51%. Over
+three training seeds the same setup averages **93.4% success and 4.2% collisions** (see
+[Seed variation](#seed-variation)). Download it from the
 [`models-2026-10-15` release](https://github.com/leonjorge010/cbu-autonomous-robot/releases/tag/models-2026-10-15).
 
 ## Summary
@@ -131,6 +133,34 @@ doors in Gazebo with no collisions, and their returns were within 0.5 of 2D. For
 Gazebo used the STL-27L sensor model (2160 beams, 0.03–25 m), and episodes took 1–11 fewer steps
 than in 2D. `ppo_d800` and `ppo_d800_wallcost` have not been run in Gazebo.
 
+## Seed variation
+
+`ppo_d800_prox` was trained three times with identical settings and seeds 0, 1 and 2. Each row is
+200 held-out goals.
+
+| Seed | Checkpoint | Success | Collisions | Timeouts | Reversing |
+|---|---|---|---|---|---|
+| 0 | best | 96.5% | 3.0% | 0.5% | 8.4% |
+| 0 | final | 96.0% | 3.0% | 1.0% | 8.2% |
+| 1 | best | 91.5% | 6.0% | 2.5% | 7.9% |
+| 1 | final | 94.0% | 5.5% | 0.5% | 8.6% |
+| 2 | best | 92.0% | 3.5% | 4.5% | 12.2% |
+| 2 | final | 90.5% | 4.0% | 5.5% | 16.4% |
+| **Mean ± std** | best | **93.3 ± 2.8%** | **4.2 ± 1.6%** | 2.5 ± 2.0% | 9.5 ± 2.4% |
+| **Mean ± std** | final | **93.5 ± 2.8%** | **4.2 ± 1.3%** | 2.3 ± 2.8% | 11.1 ± 4.6% |
+
+All three seeds reach all 7 doors from spawn.
+
+- **Seed 0 was the luckiest run.** Its 96.5% / 3.0% is about one standard deviation above the
+  mean, so compare setups by the mean, not by seed 0.
+- **One-seed comparisons above are within this noise.** The ±3% spread in success is as large as
+  most of the differences between the seed-0 models in the Summary.
+- **Seed 2 fails differently.** 10 of its 11 timeouts end 0.4–1.1 m from the goal, with the robot
+  moving back and forth in place. It reaches the goal area and then can't finish the last
+  approach. That habit is also where its extra reversing comes from. Seeds 0 and 1 rarely do this.
+- **"Best" checkpoints aren't reliably better** than the end-of-training model. They're picked on 27
+  episodes, which is too few to pick between checkpoints.
+
 ## Collision analysis
 
 Where the 2D collisions happen on the 200-goal test:
@@ -155,8 +185,9 @@ Where the 2D collisions happen on the 200-goal test:
 
 ## Caveats
 
-- **One seed per setup.** Differences of a few percent (e.g. 92.0% vs 93.0%) are within
-  run-to-run noise. Repeating each setup with 2–3 seeds is still to do.
+- **Only `ppo_d800_prox` has multiple seeds.** It spreads ±2.8% in success and ±1.6% in
+  collisions across seeds, and the other setups are probably similar. Their single-seed differences
+  of a few percent aren't meaningful.
 - **Gazebo covers only the 7 doors from spawn.** Random start poses aren't supported there yet.
 - **The proximity penalty in Gazebo** measures distance from the scan, while 2D uses the map. They
   agree to about one map cell (5 cm), and the policy never sees the penalty at run time.

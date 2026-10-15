@@ -37,6 +37,9 @@ for each session: what changed, results with numbers, and what's still open.
   harder task. Corner hits fell from 9 to 3; the 6 left are 2 fountain, 3 corners and 1 end wall.
   Trained in 11 min with the CPU to itself. 100% on every periodic eval from 1.2M steps.
   Gazebo (STL-27L sensor model): 7/7 doors, no collisions, returns within 0.3 of 2D.
+- Seeds 1 and 2 of `ppo_d800_prox`: across 3 seeds, **93.4 ± 2.8% success, 4.2 ± 1.5% collisions**,
+  so seed 0 was lucky. Seed 2 mostly times out 0.4–1.1 m from the goal, moving back and forth.
+  The "best" checkpoint (27-episode eval) is often worse than the final one.
 - Released all three as `models-2026-10-15`.
 
 **Lessons**
@@ -45,6 +48,7 @@ for each session: what changed, results with numbers, and what's still open.
 - The 27-episode periodic eval can't rank models (100% there, 90–93% on 200 goals).
 
 **Open**
+- Final-approach stalls (seed 2); test 3M steps; pick checkpoints by the 200-goal test, not the 27-episode one.
 - Gazebo eval from varied start poses; 2–3 seeds per setup (cancelled today for time).
 - LiDAR mounting position and height on the real chassis.
 

@@ -43,10 +43,10 @@ Stack: Ubuntu 24.04 · ROS 2 Jazzy · Gazebo Harmonic · Stable-Baselines3 (PyTo
 | Model | Sensor model | Goals reached (200 unseen) | Collisions | Time spent reversing |
 |---|---|---|---|---|
 | `ppo_junction` | ideal LiDAR, fast reverse | 96% | 3% | 51% |
-| `ppo_d800_prox` (current) | real STL-27L LiDAR, slow reverse, keeps clear of walls | 96.5% | 3% | 8% |
+| `ppo_d800_prox` (current, mean of 3 seeds) | real STL-27L LiDAR, slow reverse, keeps clear of walls | 93% ± 3% | 4% ± 2% | 10% |
 
-All models reach all 7 doors. The current model matches the old best while using the realistic
-sensor and almost never reversing. Remaining collisions are mostly at the water fountain and from
+All models reach all 7 doors. The released seed of the current model scored 96.5% / 3%. The current
+model uses the realistic sensor and rarely reverses. Remaining collisions are mostly at the water fountain and from
 awkward start poses. Next: Gazebo check of the new models, then random obstacles, then pedestrians,
 then a layout it has never seen.
 
