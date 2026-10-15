@@ -60,6 +60,21 @@ def test_geodesic_distance_goes_around_the_junction_corner(env):
     assert 20.3 < info['goal_distance'] < 22.5
 
 
+@pytest.mark.parametrize('start, goal', [((14.0, 6.0), (20.0, 0.0)), ((4.0, 0.0), DOOR_202)])
+def test_cheapest_route_rounds_the_junction_corner_clear_of_collision(env, start, goal):
+    # Follow the distance field downhill cell by cell; the wall cost should keep the
+    # route well outside the collision boundary (half-width + margin = 0.295 m).
+    m = env.map
+    field = m.distance_field(*goal).grid
+    row, col = m.to_cell(*start)
+    clearances = []
+    while field[row, col] > 0.1:
+        row, col = min(((row + dr, col + dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                        if dr or dc), key=lambda rc: field[rc])
+        clearances.append(m.clearance[row, col])
+    assert min(clearances) > spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + 0.1
+
+
 def test_driving_into_end_wall_ends_episode_with_penalty(env):
     env.reset(seed=0, options={'spawn': (26.5, 0.0, 0.0), 'goal': DOOR_101})
     total, info = drive(env, lambda env: np.array([1.0, 0.0]))

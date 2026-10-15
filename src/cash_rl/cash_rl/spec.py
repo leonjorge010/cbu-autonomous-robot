@@ -68,6 +68,13 @@ N_OBS = N_OBS_BEAMS + 3 + 2
 # on collision (both end the episode). Progress is potential-based shaping, so
 # its episode total depends only on start and end distance, not the path.
 PROGRESS_WEIGHT = 10.0
+# The geodesic distance charges extra for passing near walls, so its cheapest route,
+# which the progress reward pulls the robot along, rounds corners at a safe distance
+# instead of clipping them. Moving through a cell with clearance c < SAFE_CLEARANCE
+# costs 1 + WALL_COST * ((SAFE_CLEARANCE - c) / SAFE_CLEARANCE)^2 per meter, e.g.
+# 3x at the 0.3 m collision boundary, 1.5x at 0.45 m; open corridor stays 1x.
+SAFE_CLEARANCE = 0.6
+WALL_COST = 8.0
 TIME_PENALTY = 0.01
 GOAL_REWARD = 10.0
 COLLISION_PENALTY = 20.0

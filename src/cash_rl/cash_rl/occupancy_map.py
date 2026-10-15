@@ -6,6 +6,7 @@ started at the spawn pose.
 """
 import os
 
+from cash_rl import spec
 import numpy as np
 from PIL import Image
 from scipy.ndimage import distance_transform_edt
@@ -110,8 +111,14 @@ class OccupancyMap:
         return free
 
     def _build_graph(self):
-        """8-connected graph over traversable cells, edge weights in meters."""
+        """8-connected graph over traversable cells, edge weights in meters.
+
+        Each edge's length is scaled by the mean of its two cells' wall-cost
+        factors (spec.SAFE_CLEARANCE, spec.WALL_COST).
+        """
         self.traversable = self.clearance >= TRAVERSABLE_CLEARANCE
+        nearness = np.clip(1.0 - self.clearance / spec.SAFE_CLEARANCE, 0.0, None)
+        cost = 1.0 + spec.WALL_COST * nearness ** 2
         self._traversable_cells = np.argwhere(self.traversable)
         node_of = np.full(self.free.shape, -1, dtype=np.int64)
         node_of[self.traversable] = np.arange(len(self._traversable_cells))
@@ -123,14 +130,18 @@ class OccupancyMap:
             ok[ok] = self.traversable[r2[ok], c2[ok]]
             src.append(node_of[rows[ok], cols[ok]])
             dst.append(node_of[r2[ok], c2[ok]])
-            weight.append(np.full(ok.sum(), np.hypot(dr, dc) * self.resolution))
+            factor = (cost[rows[ok], cols[ok]] + cost[r2[ok], c2[ok]]) / 2
+            weight.append(factor * np.hypot(dr, dc) * self.resolution)
         n = len(self._traversable_cells)
         self._graph = csr_matrix(
             (np.concatenate(weight), (np.concatenate(src), np.concatenate(dst))), shape=(n, n))
         self._node_of = node_of
 
     def distance_field(self, x, y):
-        """Geodesic distance from every traversable cell to (x, y); inf elsewhere."""
+        """Wall-cost-weighted geodesic distance from every traversable cell to (x, y).
+
+        inf on cells that are not traversable.
+        """
         row, col = self.to_cell(np.asarray(x), np.asarray(y))
         if (0 <= row < self.height and 0 <= col < self.width
                 and self.traversable[row, col]):
