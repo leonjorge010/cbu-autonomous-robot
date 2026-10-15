@@ -78,6 +78,12 @@ WALL_COST = 8.0
 TIME_PENALTY = 0.01
 GOAL_REWARD = 10.0
 COLLISION_PENALTY = 20.0
+# Proximity penalty per step: PROXIMITY_WEIGHT * (1 - c / PROXIMITY_DISTANCE)^2 when the
+# clearance c (gap between the footprint and the nearest obstacle) is below
+# PROXIMITY_DISTANCE, e.g. 0.35 at the 0.05 m collision margin, 0.13 at 0.15 m. The
+# wall cost above shapes the route; this teaches holding it at speed near walls.
+PROXIMITY_DISTANCE = 0.30
+PROXIMITY_WEIGHT = 0.5
 
 # Fixed evaluation goals: the corridor centerline in front of each door in
 # cash_sim/worlds/hallway.sdf (world frame == map frame).
@@ -146,23 +152,47 @@ def scan_hits_footprint(ranges, angles):
         & (np.abs(y) < FOOTPRINT_HALF_WIDTH + COLLISION_MARGIN)))
 
 
+def footprint_clearance(points):
+    """Smallest gap (m) between the footprint and (N, 2) base_footprint-frame points; 0 inside."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(points) == 0:
+        return float('inf')
+    dx = np.maximum(np.abs(points[:, 0]) - FOOTPRINT_HALF_LENGTH, 0.0)
+    dy = np.maximum(np.abs(points[:, 1]) - FOOTPRINT_HALF_WIDTH, 0.0)
+    return float(np.min(np.hypot(dx, dy)))
+
+
+def scan_footprint_clearance(ranges, angles):
+    """footprint_clearance of the scan returns (sanitized ranges, lidar-frame angles)."""
+    return footprint_clearance(np.stack(
+        [LIDAR_X + ranges * np.cos(angles), ranges * np.sin(angles)], axis=1))
+
+
+def proximity_penalty(clearance):
+    """Per-step penalty for a footprint clearance (m); see PROXIMITY_DISTANCE."""
+    nearness = max(0.0, 1.0 - clearance / PROXIMITY_DISTANCE)
+    return PROXIMITY_WEIGHT * nearness ** 2
+
+
 def episode_step_limit(goal_distance):
     """Return the step budget for an episode starting goal_distance (geodesic) away."""
     seconds = EPISODE_TIME_FACTOR * goal_distance / MAX_LINEAR_VEL + EPISODE_TIME_SLACK
     return int(np.ceil(seconds / CONTROL_PERIOD))
 
 
-def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided):
+def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
+                 clearance=float('inf')):
     """Return (reward, reached) for one step.
 
     goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
     the traversable map) counts as no progress. Reaching is Euclidean, within
-    GOAL_TOLERANCE, and doesn't count on a colliding step.
+    GOAL_TOLERANCE, and doesn't count on a colliding step. clearance is the
+    footprint's gap to the nearest obstacle (m), for the proximity penalty.
     """
     progress = goal_distance - prev_goal_distance
     progress = 0.0 if not np.isfinite(progress) else -progress
     reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
-    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY
+    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY - proximity_penalty(clearance)
     if reached:
         reward += GOAL_REWARD
     if collided:

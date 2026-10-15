@@ -80,6 +80,8 @@ class HallwayRaycastEnv(gym.Env):
         self._collision_outline = _rectangle_perimeter(
             spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN,
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN, self._ray_step)
+        self._footprint_outline = _rectangle_perimeter(
+            spec.FOOTPRINT_HALF_LENGTH, spec.FOOTPRINT_HALF_WIDTH, self.map.resolution / 2)
         self._spawn_outline = _rectangle_perimeter(
             spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
@@ -112,6 +114,22 @@ class HallwayRaycastEnv(gym.Env):
     def collides(self, pose=None):
         """Return True if the margin-inflated footprint at `pose` overlaps a non-free cell."""
         return self._outline_hits(self._collision_outline, self.pose if pose is None else pose)
+
+    def clearance(self, pose=None):
+        """Gap (m) between the footprint at `pose` and the nearest map obstacle.
+
+        Map clearance (cell center to nearest obstacle cell center) sampled along
+        the footprint edge, so accurate to about half a cell.
+        """
+        x, y, yaw = self.pose if pose is None else pose
+        c, s = np.cos(yaw), np.sin(yaw)
+        outline = self._footprint_outline
+        row, col = self.map.to_cell(x + c * outline[:, 0] - s * outline[:, 1],
+                                    y + s * outline[:, 0] + c * outline[:, 1])
+        inside = (row >= 0) & (row < self.map.height) & (col >= 0) & (col < self.map.width)
+        if not np.all(inside):
+            return 0.0
+        return float(np.min(self.map.clearance[row, col]))
 
     def raycast(self, pose=None):
         """Noise-free ranges (m) of the N_OBS_BEAMS observed beams from `pose`.
@@ -233,16 +251,17 @@ class HallwayRaycastEnv(gym.Env):
         self._prev_action = action
 
         collided = self.collides()
+        clearance = self.clearance()
         goal_distance = self._goal_field(*self.pose[:2])
         reward, reached = spec.step_outcome(
-            self._goal_distance, goal_distance, self.pose, self.goal, collided)
+            self._goal_distance, goal_distance, self.pose, self.goal, collided, clearance)
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observe()
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
-        info = self._info(min_range=float(np.min(self._ranges)), collided=collided,
-                          is_success=reached)
+        info = self._info(min_range=float(np.min(self._ranges)), clearance=clearance,
+                          collided=collided, is_success=reached)
         return obs, reward, terminated, truncated, info
 
     def render(self):

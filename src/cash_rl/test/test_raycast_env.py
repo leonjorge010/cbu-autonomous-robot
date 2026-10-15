@@ -119,6 +119,46 @@ def test_noisy_scans_drop_some_beams():
     assert np.mean(dropped) == pytest.approx(spec.BEAM_DROPOUT_PROB, abs=0.01)
 
 
+def test_footprint_clearance_geometry():
+    hl, hw = spec.FOOTPRINT_HALF_LENGTH, spec.FOOTPRINT_HALF_WIDTH
+    assert spec.footprint_clearance([[hl + 0.1, 0.0]]) == pytest.approx(0.1)
+    assert spec.footprint_clearance([[0.0, -hw - 0.2]]) == pytest.approx(0.2)
+    assert spec.footprint_clearance([[hl + 0.3, hw + 0.4]]) == pytest.approx(0.5)
+    assert spec.footprint_clearance([[0.1, 0.1], [hl + 1.0, 0.0]]) == 0.0
+    assert spec.proximity_penalty(1.0) == 0.0
+    assert spec.proximity_penalty(0.0) == pytest.approx(spec.PROXIMITY_WEIGHT)
+
+
+def test_clearance_matches_corridor_walls(env):
+    # Spawn faces +x in the 2.4 m corridor: the footprint's long sides are
+    # 1.2 - half-width from the walls (SLAM walls are good to about a cell).
+    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    expected = 1.2 - spec.FOOTPRINT_HALF_WIDTH
+    assert env.clearance() == pytest.approx(expected, abs=2 * env.map.resolution)
+    # Rotated 90 degrees the half-length faces the walls instead.
+    assert env.clearance((0.0, 0.0, np.pi / 2)) == pytest.approx(
+        1.2 - spec.FOOTPRINT_HALF_LENGTH, abs=2 * env.map.resolution)
+
+
+def test_driving_along_a_wall_costs_a_proximity_penalty(env, monkeypatch):
+    # Same drive 0.15 m from the north wall, with and without the penalty.
+    y = 1.2 - spec.FOOTPRINT_HALF_WIDTH - 0.15
+
+    def drive_along_wall():
+        env.reset(seed=0, options={'spawn': (5.0, y, 0.0), 'goal': (20.0, y)})
+        steps = [env.step(np.array([1.0, 0.0])) for _ in range(20)]
+        assert not any(info['collided'] for *_, info in steps)
+        return sum(reward for _, reward, *_ in steps), [info['clearance'] for *_, info in steps]
+
+    with_penalty, clearances = drive_along_wall()
+    penalty = sum(spec.proximity_penalty(c) for c in clearances)
+    monkeypatch.setattr(spec, 'PROXIMITY_WEIGHT', 0.0)
+    without_penalty, _ = drive_along_wall()
+    assert max(clearances) < spec.PROXIMITY_DISTANCE
+    assert penalty > 1.0
+    assert with_penalty == pytest.approx(without_penalty - penalty)
+
+
 def test_standing_still_times_out(env):
     _, start = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
     total, info = drive(env, lambda env: np.zeros(2))

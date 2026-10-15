@@ -176,17 +176,20 @@ class HallwayEnv(gym.Env):
         self._prev_action = action
 
         ranges = self._sanitized_ranges()
-        collided = spec.scan_hits_footprint(ranges, self._scan_angles())
+        angles = self._scan_angles()
+        collided = spec.scan_hits_footprint(ranges, angles)
+        clearance = spec.scan_footprint_clearance(ranges, angles)
         goal_distance = self._goal_field(*self._latest_pose[:2])
         reward, reached = spec.step_outcome(
-            self._goal_distance, goal_distance, self._latest_pose, self.goal, collided)
+            self._goal_distance, goal_distance, self._latest_pose, self.goal, collided,
+            clearance)
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observation()
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
-        info = self._info(min_range=float(np.min(ranges)), collided=collided,
-                          is_success=reached)
+        info = self._info(min_range=float(np.min(ranges)), clearance=clearance,
+                          collided=collided, is_success=reached)
         return obs, reward, terminated, truncated, info
 
     def close(self):
