@@ -17,7 +17,7 @@ Stack: Ubuntu 24.04 · ROS 2 Jazzy · Gazebo Harmonic · Stable-Baselines3 (PyTo
 
 1. **Simulate.** `cash_sim` has a Gazebo model of the hallway (a 30 m corridor with a side
    branch, classroom doors, a bench, a water fountain and a trash can) and a differential-drive
-   robot with a 360° 12 m LiDAR.
+   robot with a 360° LiDAR modeled on the real one (LDROBOT STL-27L: 25 m range, 10 Hz).
 2. **Map.** We drove the robot through the hallway with SLAM Toolbox and saved the map in `maps/`.
    This is the same thing the real robot will do in the real building.
 3. **Train.** Gazebo is far too slow for reinforcement learning, so `cash_rl` has a lightweight 2D
