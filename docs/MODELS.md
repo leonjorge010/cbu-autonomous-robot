@@ -22,7 +22,7 @@ evaluation (random start heading, goals 1–25 m away along the hallway).
 | `ppo_d800` (final) | real LiDAR, slow reverse | 93.0% | 7.0% | 0.0% | 8.6% | ✅ |
 | `ppo_d800_wallcost` (best) | + corner-safe route | 92.0% | 5.5% | 2.5% | 10.7% | ✅ |
 | `ppo_d800_wallcost` (final) | + corner-safe route | 91.5% | 8.5% | 0.0% | 9.2% | ✅ |
-| `ppo_d800_prox` (best) ⭐ | + proximity penalty | **96.5%** | **3.0%** | 0.5% | 8.4% | ✅ |
+| `ppo_d800_prox` (best) ⭐ | + proximity penalty | **96.5%** | **3.0%** | 0.5% | 8.4% | ✅ (also in Gazebo) |
 | `ppo_d800_prox` (final) | + proximity penalty | 96.0% | **3.0%** | 1.0% | **8.2%** | ✅ |
 
 The newer models do a slightly harder task (noisy real sensor, slow reverse), so the two groups
@@ -126,8 +126,10 @@ Returns from `ppo_d800_wallcost` and `ppo_d800_prox` use different rewards, so r
 compared across those rows.
 
 **Doors from spawn:** every model reaches all 7 classroom doors with no collisions, in 29.4–30.5 s
-on average. **Gazebo:** `ppo_baseline` and `ppo_junction` reached 7/7 doors in Gazebo, with
-returns within 0.5 of 2D. The D800 models have not been run in Gazebo yet.
+on average. **Gazebo:** `ppo_baseline`, `ppo_junction` and `ppo_d800_prox` (best) each reached 7/7
+doors in Gazebo with no collisions, and their returns were within 0.5 of 2D. For `ppo_d800_prox`,
+Gazebo used the STL-27L sensor model (2160 beams, 0.03–25 m), and episodes took 1–11 fewer steps
+than in 2D. `ppo_d800` and `ppo_d800_wallcost` have not been run in Gazebo.
 
 ## Collision analysis
 
@@ -155,7 +157,7 @@ Where the 2D collisions happen on the 200-goal test:
 
 - **One seed per setup.** Differences of a few percent (e.g. 92.0% vs 93.0%) are within
   run-to-run noise. Repeating each setup with 2–3 seeds is still to do.
-- **2D only for the D800 models.** Gazebo evaluation is still pending.
+- **Gazebo covers only the 7 doors from spawn.** Random start poses aren't supported there yet.
 - **The proximity penalty in Gazebo** measures distance from the scan, while 2D uses the map. They
   agree to about one map cell (5 cm), and the policy never sees the penalty at run time.
 - **Every model trained on one hallway map** with no people or moving obstacles. These numbers
