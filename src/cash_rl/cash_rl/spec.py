@@ -120,6 +120,12 @@ def action_to_cmd(action):
     return linear, float(action[1]) * MAX_ANGULAR_VEL
 
 
+def cmd_to_action(linear, angular):
+    """Inverse of action_to_cmd (clipped to the action space)."""
+    a0 = linear / (MAX_LINEAR_VEL if linear >= 0 else MAX_REVERSE_VEL)
+    return np.clip(np.array([a0, angular / MAX_ANGULAR_VEL], dtype=np.float32), -1.0, 1.0)
+
+
 def sanitize_ranges(ranges):
     """NaN/+inf (no return) -> MAX_RANGE; -inf (below range_min) -> 0."""
     ranges = np.asarray(ranges, dtype=np.float32)

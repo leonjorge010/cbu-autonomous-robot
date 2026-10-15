@@ -21,6 +21,7 @@ SPAWN_CLEARANCE = 0.15
 # Random goals sit on cells at least this far from any obstacle.
 GOAL_CLEARANCE = 0.5
 DEFAULT_GOAL_DISTANCE_RANGE = (1.0, 15.0)
+SAFETY_SCAN_ANGLES = np.linspace(-np.pi, np.pi, 360, endpoint=False)
 # hallway.sdf: the main corridor spans |y| <= 1.2 m; the side branch rises in +y
 # from the junction at x = 14 m. Cells above this line count as the branch.
 BRANCH_MIN_Y = 1.5
@@ -131,8 +132,8 @@ class HallwayRaycastEnv(gym.Env):
             return 0.0
         return float(np.min(self.map.clearance[row, col]))
 
-    def raycast(self, pose=None):
-        """Noise-free ranges (m) of the N_OBS_BEAMS observed beams from `pose`.
+    def raycast(self, pose=None, angles=None):
+        """Noise-free ranges (m) of the N_OBS_BEAMS observed beams (or `angles`) from `pose`.
 
         Mirrors gpu_lidar: no return within MAX_RANGE -> +inf; a hit closer than
         MIN_RANGE -> -inf. Pass through spec.sanitize_ranges before use.
@@ -141,8 +142,10 @@ class HallwayRaycastEnv(gym.Env):
         c, s = np.cos(yaw), np.sin(yaw)
         lidar_x = x + c * spec.LIDAR_X
         lidar_y = y + s * spec.LIDAR_X
-        beam_cos = c * self._beam_cos - s * self._beam_sin
-        beam_sin = s * self._beam_cos + c * self._beam_sin
+        local_cos, local_sin = (self._beam_cos, self._beam_sin) if angles is None \
+            else (np.cos(angles), np.sin(angles))
+        beam_cos = c * local_cos - s * local_sin
+        beam_sin = s * local_cos + c * local_sin
         px = lidar_x + beam_cos[:, None] * self._ray_ts[None, :]
         py = lidar_y + beam_sin[:, None] * self._ray_ts[None, :]
         blocked = ~self.map.is_free(px, py)
@@ -151,6 +154,19 @@ class HallwayRaycastEnv(gym.Env):
         first = blocked.argmax(axis=1)
         ranges = np.where(hit, self._ray_ts[first] - self._ray_step / 2, np.inf)
         return np.where(ranges < spec.MIN_RANGE, -np.inf, ranges)
+
+    def safety_scan(self):
+        """(ranges, angles) of a dense noisy scan for safety.limit_command.
+
+        SAFETY_SCAN_BEAMS evenly spaced beams (1 deg) rather than the real 2160, to
+        keep raycasting cheap; at the < 1 m distances that matter they are < 2 cm apart.
+        """
+        ranges = self.raycast(angles=SAFETY_SCAN_ANGLES)
+        if self.range_noise:
+            finite = np.isfinite(ranges)
+            ranges[finite] += self.np_random.normal(
+                0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
+        return spec.sanitize_ranges(ranges), SAFETY_SCAN_ANGLES
 
     def _cell_y(self, rows):
         return self.map.origin[1] + (rows + 0.5) * self.map.resolution

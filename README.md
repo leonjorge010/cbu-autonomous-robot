@@ -45,7 +45,8 @@ Stack: Ubuntu 24.04 · ROS 2 Jazzy · Gazebo Harmonic · Stable-Baselines3 (PyTo
 | `ppo_junction` | ideal LiDAR, fast reverse | 96% | 3% | 51% |
 | `ppo_d800_prox` (current, mean of 3 seeds) | real STL-27L LiDAR, slow reverse, keeps clear of walls | 93% ± 3% | 4% ± 2% | 10% |
 
-All models reach all 7 doors. The released seed of the current model scored 96.5% / 3%. The current
+With the LiDAR safety layer (`cash_rl/safety.py`, `evaluate --safety`) in front of the policy,
+collisions drop to 0.7% on average, with no loss in success. All models reach all 7 doors. The released seed of the current model scored 96.5% / 3%. The current
 model uses the realistic sensor and rarely reverses. Remaining collisions are mostly at the water fountain and from
 awkward start poses. Next: Gazebo check of the new models, then random obstacles, then pedestrians,
 then a layout it has never seen.

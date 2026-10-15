@@ -68,19 +68,21 @@ def evaluate(model, env, episodes):
     """Run (name, seed, options) episodes deterministically; return outcome dicts.
 
     Besides outcome and return: 'path' = distance driven (m), 'start_distance' =
-    geodesic start distance (m), 'reverse' = share of steps commanding reverse.
+    geodesic start distance (m), 'reverse' = share of steps commanding reverse,
+    'override' = share of steps a safety.SafetyWrapper changed the action.
     """
     results = []
     for name, seed, options in episodes:
         obs, info = env.reset(seed=seed, options=options)
         start_distance, prev = info['goal_distance'], info['pose'][:2].copy()
-        total, steps, path, reversing = 0.0, 0, 0.0, 0
+        total, steps, path, reversing, overrides = 0.0, 0, 0.0, 0, 0
         while True:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             total += reward
             steps += 1
             reversing += action[0] < 0
+            overrides += bool(info.get('safety_override', False))
             path += float(np.hypot(*(info['pose'][:2] - prev)))
             prev = info['pose'][:2].copy()
             if terminated or truncated:
@@ -89,7 +91,7 @@ def evaluate(model, env, episodes):
                         'collision': bool(info['collided']),
                         'timeout': not terminated, 'return': total, 'steps': steps,
                         'path': path, 'start_distance': start_distance,
-                        'reverse': reversing / steps})
+                        'reverse': reversing / steps, 'override': overrides / steps})
     return results
 
 

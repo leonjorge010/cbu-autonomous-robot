@@ -42,6 +42,13 @@ for each session: what changed, results with numbers, and what's still open.
   The "best" checkpoint (27-episode eval) is often worse than the final one.
 - Released all three as `models-2026-10-15`.
 
+**Safety layer** (`cash_rl/safety.py`, `evaluate --safety`)
+- Simulates each command over the stopping time and falls back to gentler commands if the footprint
+  would come within 10 cm of a scan point. On 3 seeds × 200 goals, collisions went from 4.2% to 0.7%;
+  success went from 93.5% to 94.3%; it overrode 3.2% of steps. Collisions mostly became timeouts.
+- Started the 3-seed `ppo_lr3m_s*` runs: 3M steps, linear LR decay (`--lr-schedule linear`),
+  100-goal periodic eval.
+
 **Lessons**
 - Don't run two trainings or several evaluations at once. PyTorch takes all 22 threads per process,
   and two runs stalled for 15 min. Use `OMP_NUM_THREADS=1` for parallel evaluations.

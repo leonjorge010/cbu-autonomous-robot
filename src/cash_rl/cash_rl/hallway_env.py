@@ -108,6 +108,10 @@ class HallwayEnv(gym.Env):
         scan = self._latest_scan
         return scan.angle_min + np.arange(len(scan.ranges)) * scan.angle_increment
 
+    def safety_scan(self):
+        """(ranges, angles) of the latest full scan for safety.limit_command."""
+        return self._sanitized_ranges(), self._scan_angles()
+
     def _observation(self):
         return spec.build_observation(
             self._sanitized_ranges()[spec.OBS_BEAM_INDICES], self._latest_pose, self.goal,

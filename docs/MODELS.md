@@ -161,6 +161,31 @@ All three seeds reach all 7 doors from spawn.
 - **"Best" checkpoints aren't reliably better** than the end-of-training model. They're picked on 27
   episodes, which is too few to pick between checkpoints.
 
+## With the safety layer
+
+`cash_rl/safety.py` sits between the policy and the wheels. Before sending a command, it simulates
+the motion over the robot's stopping time (up to ~0.6 s). If the robot's edge would come within
+10 cm of any LiDAR point, it substitutes a gentler command: less speed, then no turning, then a
+stop. Moving away from an obstacle is always allowed. It is pure numpy, so the same code can run on
+the Jetson.
+
+The same 200 held-out goals, end-of-training `ppo_d800_prox` models, 2D:
+
+| Seed | Without: success / collisions / timeouts | With safety layer | Steps overridden |
+|---|---|---|---|
+| 0 | 96.0% / 3.0% / 1.0% | 96.5% / **0.5%** / 3.0% | 2.7% |
+| 1 | 94.0% / 5.5% / 0.5% | 95.5% / **0.5%** / 4.0% | 3.1% |
+| 2 | 90.5% / 4.0% / 5.5% | 91.0% / **1.0%** / 8.0% | 3.7% |
+| **Mean** | 93.5% / 4.2% / 2.3% | **94.3% / 0.7% / 5.0%** | 3.2% |
+
+All seeds still reach 7/7 doors from spawn with the safety layer on.
+
+- **Collisions fall about 6×,** and success doesn't drop. Most episodes that would have collided
+  become timeouts: the robot stops short instead of hitting the wall.
+- **The layer only intervenes on about 3% of steps,** so the policy still does almost all the driving.
+- **The 2D test uses a 360-beam scan for the safety layer.** Gazebo and the real sensor give 2160
+  beams. It hasn't been tested in Gazebo yet.
+
 ## Collision analysis
 
 Where the 2D collisions happen on the 200-goal test:

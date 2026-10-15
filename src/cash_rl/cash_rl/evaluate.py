@@ -35,6 +35,7 @@ def summarize(results):
         'path_ratio': float(np.mean([r['path'] / r['start_distance'] for r in ok]))
         if ok else float('nan'),
         'reverse': mean('reverse', results),
+        'override': mean('override', results),
         'return': mean('return', results),
     }
 
@@ -46,6 +47,8 @@ def main():
     parser.add_argument('--repeats', type=int, default=1, help='episodes per door')
     parser.add_argument('--random', type=int, default=0,
                         help='held-out random spawn/goal pairs to add (2D only)')
+    parser.add_argument('--safety', action='store_true',
+                        help='run the policy behind the LiDAR safety layer (cash_rl.safety)')
     args = parser.parse_args()
     if args.random and args.env == 'gazebo':
         parser.error('--random is 2D only (HallwayEnv spawns from fixed poses)')
@@ -56,6 +59,10 @@ def main():
     else:
         from cash_rl.raycast_env import HallwayRaycastEnv
         env = HallwayRaycastEnv()
+    if args.safety:
+        from cash_rl.safety import SafetyWrapper
+        env = SafetyWrapper(env)
+    mode = f'{args.env}, safety layer' if args.safety else args.env
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})
              for name, goal in sorted(spec.DOOR_GOALS.items())
              for repeat in range(args.repeats)]
@@ -66,7 +73,7 @@ def main():
         for path in args.models:
             model = load_model(path)
             label = os.path.relpath(os.path.expanduser(path))
-            print(f'\n== {label} ({args.env})', flush=True)
+            print(f'\n== {label} ({mode})', flush=True)
             print(f'{"door":10} {"outcome":10} {"steps":>6} {"return":>8}', flush=True)
             door_results = []
             for episode in doors:
@@ -85,20 +92,23 @@ def main():
     def row(name, s):
         return (f'{name:44} {s["success"]:>7.1%} {s["collision"]:>9.1%} {s["timeout"]:>7.1%} '
                 f'{s["time_s"]:>7.1f} {s["path_ratio"]:>6.2f} {s["reverse"]:>7.1%} '
-                f'{s["return"]:>+8.1f}')
+                f'{s["return"]:>+8.1f}' + (f' {s["override"]:>8.1%}' if args.safety else ''))
     header = (f'{"":44} {"success":>7} {"collision":>9} {"timeout":>7} '
-              f'{"time_s":>7} {"path":>6} {"reverse":>7} {"return":>8}')
-    print(f'\nDoors from spawn ({len(doors)} episodes per model, {args.env})')
+              f'{"time_s":>7} {"path":>6} {"reverse":>7} {"return":>8}'
+              + (f' {"override":>8}' if args.safety else ''))
+    print(f'\nDoors from spawn ({len(doors)} episodes per model, {mode})')
     print(header)
     for label, door_summary, _ in summaries:
         print(row(label, door_summary))
     if randoms:
-        print(f'\nHeld-out random pairs ({len(randoms)} episodes per model, {args.env})')
+        print(f'\nHeld-out random pairs ({len(randoms)} episodes per model, {mode})')
         print(header)
         for label, _, random_summary in summaries:
             print(row(label, random_summary))
     print('\ntime_s and path (driven / geodesic start distance) average successful '
-          'episodes only; reverse = share of steps commanding reverse.')
+          'episodes only; reverse = share of steps commanding reverse'
+          + ('; override = share of steps the safety layer changed the command.'
+             if args.safety else '.'))
 
 
 if __name__ == '__main__':
