@@ -32,21 +32,22 @@ Stack: Ubuntu 24.04 · ROS 2 Jazzy · Gazebo Harmonic · Stable-Baselines3 (PyTo
 | | |
 |---|---|
 | Observation (41 numbers) | 36 LiDAR distances (every 10°), distance and direction to the goal, last action |
-| Action | forward speed (up to 0.5 m/s) and turn rate (up to 1 rad/s) |
-| Reward | + progress toward the goal measured *around* walls, − small time penalty, +10 for reaching the goal, −20 for a collision |
+| Action | forward speed (up to 0.5 m/s; reverse only 0.15 m/s) and turn rate (up to 1 rad/s) |
+| Reward | + progress toward the goal measured *around* walls (with extra cost near walls), − small time penalty, +10 for reaching the goal, −20 for a collision |
 | Success | within 0.3 m of the goal |
 | Evaluation | every 100k steps: all 7 doors from the spawn point + 20 fixed random start/goal pairs |
 
-**Results so far** (details in [WORKLOG.md](WORKLOG.md))
+**Results so far.** The full comparison, with every training parameter and learning curves, is in
+[docs/MODELS.md](docs/MODELS.md).
 
-| Run | Settings | Goals reached (200 unseen) | Collisions |
-|---|---|---|---|
-| `ppo_baseline` | 3M steps, goals 1–15 m away | 93% | 6% |
-| `ppo_junction` | 1.5M steps, goals 1–25 m, 30% of episodes cross the junction | 96% | 3% |
+| Model | Sensor model | Goals reached (200 unseen) | Collisions | Time spent reversing |
+|---|---|---|---|---|
+| `ppo_junction` | ideal LiDAR, fast reverse | 96% | 3% | 51% |
+| `ppo_d800_wallcost` (current) | real STL-27L LiDAR, slow reverse | 92% | 5.5% | 11% |
 
-Both models reach all 7 doors. `ppo_baseline` also reached all 7 in Gazebo.
-Open problems: the robot often drives in reverse instead of turning around, and it can clip the water
-fountain. Next steps are random obstacles, then pedestrians, then a layout it has never seen.
+All models reach all 7 doors. Open problem: the current model still clips the junction corners at
+full speed (a proximity penalty is next). After that: random obstacles, then pedestrians, then a
+layout it has never seen.
 
 ## Setup (once per computer)
 
@@ -99,16 +100,19 @@ tensorboard --logdir ~/ros2_ws/runs    # open http://localhost:6006 and look at 
 ```
 
 **Or download the trained models** from the
-[`models-2026-10-14` release](https://github.com/leonjorge010/cbu-autonomous-robot/releases/tag/models-2026-10-14).
+[`models-2026-10-15` release](https://github.com/leonjorge010/cbu-autonomous-robot/releases/tag/models-2026-10-15).
 Each run also has its `config.json` (every setting) and `eval.csv` (learning curve).
 ```bash
 cd ~/ros2_ws
-for run in ppo_baseline ppo_junction; do
+for run in ppo_d800_wallcost ppo_d800; do
   mkdir -p runs/$run
   curl -L -o runs/$run/best_model.zip \
-    https://github.com/leonjorge010/cbu-autonomous-robot/releases/download/models-2026-10-14/${run}_best_model.zip
+    https://github.com/leonjorge010/cbu-autonomous-robot/releases/download/models-2026-10-15/${run}_best_model.zip
 done
 ```
+The older `ppo_baseline` and `ppo_junction` models
+([`models-2026-10-14`](https://github.com/leonjorge010/cbu-autonomous-robot/releases/tag/models-2026-10-14))
+were trained on the ideal sensor with fast reverse. Run them at commit `5cb4ade`.
 
 **Try a trained model** (2D, no Gazebo needed):
 ```bash
@@ -143,6 +147,7 @@ ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data:
 | `src/cash_rl/cash_rl/raycast_env.py` | Fast 2D training simulator |
 | `src/cash_rl/cash_rl/hallway_env.py` | The same task in Gazebo |
 | `src/cash_rl/cash_rl/train.py` | Training script. PPO hyperparameters are in `algo_kwargs` |
+| `docs/MODELS.md` | Comparison of every trained model: settings, hyperparameters, results |
 | `WORKLOG.md` | What was done each session, with numbers |
 
 ROS topics: `/cmd_vel` (drive), `/scan` (LiDAR, 10 Hz), `/odom`, `/tf`, `/clock`.

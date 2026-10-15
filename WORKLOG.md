@@ -3,6 +3,47 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-15
+
+**Sharing with the team**
+- Rewrote the README around the pipeline, first-time setup and how to run. Added
+  `requirements.txt` and the missing matplotlib dependency so a fresh clone works.
+- Published the 10-14 models as GitHub release `models-2026-10-14`, and gave the repo a
+  description and topics. Renamed the project to "CBU Autonomous Robot" in all prose (code names
+  `cash_*` unchanged).
+- Added `docs/MODELS.md`, a comparison of every model with all hyperparameters, learning curves and
+  held-out results.
+
+**Validation**
+- `ppo_junction` reached 7/7 doors in Gazebo with no collisions; returns within 0.5 of 2D.
+
+**Task changes** (all models before this need retraining)
+- Real LiDAR: the robot uses an LDROBOT D800 kit (STL-27L). Sim sensor now has 2160 points, 0.03–25 m
+  and 1.5 cm noise. The policy sees ranges clipped to 10 m, the sensor's range on dark surfaces.
+  Training drops 3% of beams to mimic glass.
+- Slow reverse: max reverse 0.15 m/s (forward 0.5). Reversing fell from ~51% to ~9% of steps.
+- Near-wall path cost: the path distance used by the reward ran 0.25 m from corners, inside the
+  0.295 m collision boundary. Cells within 0.6 m of a wall now cost extra, so the route rounds
+  corners at 0.46 m.
+
+**Training** (PPO, 1.5M steps each, same hyperparameters as before)
+- `ppo_d800` (real LiDAR + slow reverse): 200 held-out goals 93.0% success / 7.0% collisions
+  (final model). 12 of 14 collisions clipped the junction's east corner.
+- `ppo_d800_wallcost` (+ near-wall cost): 92.0% / 5.5% (best). East-corner hits fell from 12 to 3, but
+  collisions moved to the west corner, always at full speed. Reached 90% eval at 0.4M steps
+  (`ppo_junction`: 0.9M).
+- Released both as `models-2026-10-15`.
+
+**Lessons**
+- Don't run two trainings or several evaluations at once. PyTorch takes all 22 threads per process,
+  and two runs stalled for 15 min. Use `OMP_NUM_THREADS=1` for parallel evaluations.
+- The 27-episode periodic eval can't rank models (100% there, 90–93% on 200 goals).
+
+**Open**
+- Proximity penalty (slow down near walls) to fix the corner collisions.
+- Gazebo eval of the D800 models; 2–3 seeds per setup (cancelled today for time).
+- LiDAR mounting position and height on the real chassis.
+
 ## 2026-10-14
 
 **Mapping**
