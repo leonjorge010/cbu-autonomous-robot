@@ -14,7 +14,7 @@ three training seeds the same setup averages **93.4% success and 4.2% collisions
 ## Summary
 
 Held-out test: 200 random start/goal pairs the policy never saw in training or in periodic
-evaluation (random start heading, goals 1–25 m away along the hallway).
+evaluation (random start heading, goals 1–15 m away by path distance; the 7 doors cover the longer 4–24 m trips).
 
 | Model | Task | Success | Collisions | Timeouts | Steps reversing | All 7 doors |
 |---|---|---|---|---|---|---|
