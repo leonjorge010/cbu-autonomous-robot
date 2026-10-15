@@ -1,7 +1,7 @@
-# C.A.$.H Robot Workspace — Claude Code context
+# CBU Autonomous Robot workspace — Claude Code context
 
 ## Project
-CBU Autonomous Student Helper (C.A.$.H): an autonomous robot that escorts students to classrooms in the CBU Engineering building using SLAM navigation. Capstone team: Lancer Automation Systems. The real robot runs on a Jetson Orin Nano (needs JetPack 7.2+ for Ubuntu 24.04 / native Jazzy; JetPack 6 is 22.04 / Humble) with a 2D LiDAR only (no depth or RGB camera). This workspace is the simulation and software side; a DRL hallway-navigation policy will be trained here in simulation (CSCI 4220 project).
+CBU Autonomous Robot: an autonomous robot that escorts students to classrooms in the CBU Engineering building using SLAM navigation. Capstone team: Lancer Automation Systems. The real robot runs on a Jetson Orin Nano (needs JetPack 7.2+ for Ubuntu 24.04 / native Jazzy; JetPack 6 is 22.04 / Humble) with a 2D LiDAR only (no depth or RGB camera). This workspace is the simulation and software side; a DRL hallway-navigation policy will be trained here in simulation (CSCI 4220 project).
 
 ## Environment
 - Windows 11 → WSL2 Ubuntu 24.04, ROS 2 Jazzy, Gazebo Harmonic (gz sim 8) via ros_gz

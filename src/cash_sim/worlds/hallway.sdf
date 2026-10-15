@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- Generated hallway world for C.A.$.H. Main corridor along +x (2.4 m wide, 30 m long)
+<!-- Generated hallway world for the CBU Autonomous Robot. Main corridor along +x (2.4 m wide, 30 m long)
      with a branch going +y at x=14. Robot spawns at the origin facing +x. -->
 <sdf version="1.9">
   <world name="hallway">

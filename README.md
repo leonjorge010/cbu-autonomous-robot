@@ -1,6 +1,6 @@
-# C.A.$.H Robot Workspace
+# CBU Autonomous Robot
 
-Simulation and navigation software for **C.A.$.H** (CBU Autonomous Student Helper), a robot that
+Simulation and navigation software for the **CBU Autonomous Robot**, a robot that
 escorts students to classrooms in the CBU Engineering building. The real robot is a Jetson Orin Nano
 with a single 2D LiDAR, so the simulated robot has exactly that sensor and nothing else.
 

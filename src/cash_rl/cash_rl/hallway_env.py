@@ -1,4 +1,4 @@
-"""Gymnasium environment wrapping the C.A.$.H hallway sim over ROS 2 topics/services.
+"""Gymnasium environment wrapping the hallway sim over ROS 2 topics/services.
 
 Requires `sim.launch.py` (cash_sim) plus this package's bridge for the
 world-control/set-pose services and the robot's ground-truth pose already

@@ -1,4 +1,4 @@
-"""Launch the C.A.$.H hallway simulation: Gazebo + robot + ROS bridge + RViz."""
+"""Launch the CBU Autonomous Robot hallway simulation: Gazebo + robot + ROS bridge + RViz."""
 import os
 
 from ament_index_python.packages import get_package_share_directory

@@ -1,4 +1,4 @@
-"""Robot/sensor spec and episode rules shared by every C.A.$.H training env.
+"""Robot/sensor spec and episode rules shared by every training env.
 
 HallwayEnv (Gazebo over ROS) and HallwayRaycastEnv (fast 2D map raycaster) both
 take their observation, action, collision and reward definitions from here, so a

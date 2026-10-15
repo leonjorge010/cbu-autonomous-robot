@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!--
-  C.A.$.H simulation robot: differential drive base + 2D 360° LiDAR.
+  CBU Autonomous Robot simulation model: differential drive base + 2D 360° LiDAR.
   Dimensions are placeholders. Update them to match the real chassis.
 -->
 <robot name="cash_bot" xmlns:xacro="http://www.ros.org/wiki/xacro">

@@ -18,7 +18,7 @@ setup(
     zip_safe=True,
     maintainer='Jorge Leon Duran',
     maintainer_email='115505677+leonjorge010@users.noreply.github.com',
-    description='Gymnasium environment and training entry points for the C.A.$.H hallway DRL navigation policy',
+    description='Gymnasium environment and training entry points for the hallway DRL navigation policy',
     license='MIT',
     extras_require={'test': ['pytest']},
     entry_points={
