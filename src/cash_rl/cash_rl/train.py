@@ -178,6 +178,8 @@ def main():
     parser.add_argument('--junction-prob', type=float, default=0.0,
                         help='share of training episodes that start and end on opposite '
                              'sides of the junction')
+    parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
+                        help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
@@ -205,8 +207,13 @@ def main():
     # random spawn/goal pairs regardless of its training goal range.
     eval_env = HallwayRaycastEnv()
 
+    model_kwargs = dict(kwargs)
+    if args.lr_schedule == 'linear':
+        initial_lr = kwargs.get('learning_rate', 3e-4)
+        # SB3 passes progress_remaining, which goes from 1 to 0 over training.
+        model_kwargs['learning_rate'] = lambda progress: initial_lr * progress
     model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
-                             tensorboard_log=run_dir, **kwargs)
+                             tensorboard_log=run_dir, **model_kwargs)
     callbacks = [
         GoalEvalCallback(eval_env, args.eval_random, args.eval_freq, run_dir),
         CheckpointCallback(save_freq=max(1, args.checkpoint_freq // n_envs),
