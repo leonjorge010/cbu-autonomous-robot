@@ -52,7 +52,7 @@ class HallwayRaycastEnv(gym.Env):
     the episode needs the turn. For evaluation matching HallwayEnv, pass
     spec.SPAWN_POSE and one of spec.DOOR_GOALS. map_yaml defaults to
     occupancy_map.default_map_yaml(); range_noise adds the URDF's Gaussian range
-    noise; render_mode is None or 'rgb_array'.
+    noise and spec.BEAM_DROPOUT_PROB missing returns; render_mode is None or 'rgb_array'.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
@@ -175,6 +175,7 @@ class HallwayRaycastEnv(gym.Env):
             finite = np.isfinite(ranges)
             ranges[finite] += self.np_random.normal(
                 0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
+            ranges[self.np_random.random(len(ranges)) < spec.BEAM_DROPOUT_PROB] = np.inf
         self._ranges = spec.sanitize_ranges(ranges)
         return spec.build_observation(self._ranges, self.pose, self.goal, self._prev_action)
 

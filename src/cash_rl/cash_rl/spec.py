@@ -10,14 +10,22 @@ Values mirror cash_sim/urdf/cash_bot.urdf.xacro — keep them in sync.
 import gymnasium as gym
 import numpy as np
 
-# gpu_lidar: 360 samples over [-pi, pi] inclusive, so increment = 2*pi/359.
-N_SCAN_BEAMS = 360
+# LiDAR: LDROBOT STL-27L (D800 kit) — 360 deg, 2160 points/rev at 10 Hz, 0.03-25 m
+# (25 m on 80% reflectivity, only 10 m on 4%), +-15 mm accuracy.
+# gpu_lidar: 2160 samples over [-pi, pi] inclusive, so increment = 2*pi/2159.
+N_SCAN_BEAMS = 2160
 SCAN_ANGLE_MIN = -3.14159
 SCAN_ANGLE_MAX = 3.14159
 SCAN_ANGLE_INCREMENT = (SCAN_ANGLE_MAX - SCAN_ANGLE_MIN) / (N_SCAN_BEAMS - 1)
-MIN_RANGE = 0.15
-MAX_RANGE = 12.0
-RANGE_NOISE_STDDEV = 0.01
+MIN_RANGE = 0.03
+LIDAR_MAX_RANGE = 25.0  # the URDF sensor's range
+# The policy sees ranges clipped to MAX_RANGE: the sensor's guaranteed range on dark
+# surfaces, so readings don't depend on wall color.
+MAX_RANGE = 10.0
+RANGE_NOISE_STDDEV = 0.015
+# Training only (HallwayRaycastEnv): share of observed beams that return nothing, as
+# on glass or shiny metal. A guess, not a datasheet number.
+BEAM_DROPOUT_PROB = 0.03
 LIDAR_X = 0.05  # lidar_link offset ahead of base_footprint
 
 N_OBS_BEAMS = 36

@@ -83,6 +83,18 @@ def test_every_door_goal_is_reachable_from_spawn(env, name):
     assert total > expected_min
 
 
+def test_noisy_scans_drop_some_beams():
+    env = HallwayRaycastEnv()
+    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    # From spawn every beam hits a wall well inside MAX_RANGE except along the corridor.
+    walls = spec.sanitize_ranges(env.raycast()) < spec.MAX_RANGE - 1.0
+    dropped = []
+    for _ in range(200):
+        obs, *_ = env.step(np.zeros(2))
+        dropped.append(obs[:spec.N_OBS_BEAMS][walls] == 1.0)
+    assert np.mean(dropped) == pytest.approx(spec.BEAM_DROPOUT_PROB, abs=0.01)
+
+
 def test_standing_still_times_out(env):
     _, start = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
     total, info = drive(env, lambda env: np.zeros(2))
