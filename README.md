@@ -1,203 +1,165 @@
 # C.A.$.H Robot Workspace
 
-ROS 2 Jazzy workspace for the C.A.$.H autonomous hallway escort robot.
-Runs on Ubuntu 24.04 in WSL2 with Gazebo Harmonic.
+Simulation and navigation software for **C.A.$.H** (CBU Autonomous Student Helper), a robot that
+escorts students to classrooms in the CBU Engineering building. The real robot is a Jetson Orin Nano
+with a single 2D LiDAR, so the simulated robot has exactly that sensor and nothing else.
 
-## Start working (from computer power-on)
+Stack: Ubuntu 24.04 · ROS 2 Jazzy · Gazebo Harmonic · Stable-Baselines3 (PyTorch, CPU)
 
-1. **Open Ubuntu**
-   - Windows Terminal → click the ⌄ arrow → **Ubuntu 24.04**
-   - Or in PowerShell: `wsl -d Ubuntu-24.04`
+## How the model is developed
 
-2. **Go to the workspace and get the latest code**
+```
+ 1. Simulate      2. Map           3. Train in 2D        4. Check in Gazebo    5. Robot
+ Gazebo hallway → SLAM Toolbox  → fast raycast sim    → same policy, full   → Jetson +
+ + LiDAR robot    occupancy map   built on that map     physics sim           real LiDAR
+                                  (~2,300 steps/s)      (~10 steps/s)
+```
+
+1. **Simulate.** `cash_sim` has a Gazebo model of the hallway (a 30 m corridor with a side
+   branch, classroom doors, a bench, a water fountain and a trash can) and a differential-drive
+   robot with a 360° 12 m LiDAR.
+2. **Map.** We drove the robot through the hallway with SLAM Toolbox and saved the map in `maps/`.
+   This is the same thing the real robot will do in the real building.
+3. **Train.** Gazebo is far too slow for reinforcement learning, so `cash_rl` has a lightweight 2D
+   simulator that casts the LiDAR beams against the saved map. PPO learns to drive from a start
+   pose to a goal point.
+4. **Validate.** The trained policy runs unchanged in Gazebo, because both simulators share one task
+   definition (`src/cash_rl/cash_rl/spec.py`).
+5. **Deploy** (not started). The policy gets exported for the Jetson and runs on the real LiDAR.
+
+**The learning task**
+
+| | |
+|---|---|
+| Observation (41 numbers) | 36 LiDAR distances (every 10°), distance and direction to the goal, last action |
+| Action | forward speed (up to 0.5 m/s) and turn rate (up to 1 rad/s) |
+| Reward | + progress toward the goal measured *around* walls, − small time penalty, +10 for reaching the goal, −20 for a collision |
+| Success | within 0.3 m of the goal |
+| Evaluation | every 100k steps: all 7 doors from the spawn point + 20 fixed random start/goal pairs |
+
+**Results so far** (details in [WORKLOG.md](WORKLOG.md))
+
+| Run | Settings | Goals reached (200 unseen) | Collisions |
+|---|---|---|---|
+| `ppo_baseline` | 3M steps, goals 1–15 m away | 93% | 6% |
+| `ppo_junction` | 1.5M steps, goals 1–25 m, 30% of episodes cross the junction | 96% | 3% |
+
+Both models reach all 7 doors. `ppo_baseline` also reached all 7 in Gazebo.
+Open problems: the robot often drives in reverse instead of turning around, and it can clip the water
+fountain. Next steps are random obstacles, then pedestrians, then a layout it has never seen.
+
+## Setup (once per computer)
+
+On Windows, first install WSL2 with Ubuntu 24.04 (`wsl --install -d Ubuntu-24.04` in PowerShell), then
+do everything below inside Ubuntu.
+
+1. Install [ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)
+   (`ros-jazzy-desktop`) and `ros-jazzy-ros-gz`, which also installs Gazebo Harmonic.
+2. Clone into `~/ros2_ws` (the repo *is* the workspace). On WSL, keep it in the Linux home folder,
+   not under `/mnt/c`, because builds there are very slow.
    ```bash
+   git clone https://github.com/leonjorge010/cbu-autonomous-robot.git ~/ros2_ws
    cd ~/ros2_ws
-   git pull
    ```
-
-3. **Install any new dependencies** (only needed if packages were added)
+3. Install dependencies and build:
    ```bash
+   source /opt/ros/jazzy/setup.bash
+   sudo rosdep init 2>/dev/null; rosdep update
    rosdep install --from-paths src -y --ignore-src
-   ```
-
-4. **Build and source**
-   ```bash
+   pip install --user --break-system-packages --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
    colcon build --symlink-install
-   source install/setup.bash
    ```
-
-5. **Open the editor** (optional)
+4. Source the workspace automatically in new terminals:
    ```bash
-   code .
+   echo 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash' >> ~/.bashrc
+   ```
+5. WSL with an NVIDIA GPU only: add these lines to `~/.bashrc` so Gazebo renders on the GPU. Check
+   with `glxinfo -B`: the renderer should be D3D12, not `llvmpipe`.
+   ```bash
+   export GALLIUM_DRIVER=d3d12
+   export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
    ```
 
-6. **Extra terminals**: press `Alt+Shift+D` for a split pane. New terminals source the workspace
-   automatically (set up in `~/.bashrc`).
+Day to day: `cd ~/ros2_ws && git pull && colcon build --symlink-install`. You only need to rebuild
+when files are added or `setup.py` changes.
 
-## Run the hallway simulation
+## Run
 
+**Simulation.** `gui:=false` runs Gazebo without its window and shows everything in RViz. Opening
+both windows can freeze a laptop.
 ```bash
-ros2 launch cash_sim sim.launch.py
+ros2 launch cash_sim sim.launch.py gui:=false
+ros2 run teleop_twist_keyboard teleop_twist_keyboard     # 2nd terminal; drive with i j l , k
 ```
 
-Opens Gazebo (hallway world + robot) and RViz (robot model + LiDAR scan).
-**Lighter mode (recommended on the laptop):** `ros2 launch cash_sim sim.launch.py gui:=false` runs Gazebo headless and shows everything in RViz.
-
-Options: `gui:=false`, `rviz:=false`, and spawn pose `x:=… y:=… yaw:=…`.
-
-**Drive it** (in a second terminal):
+**Train a policy.** Takes about 19 min. Output goes to `runs/<name>/`, which is not committed.
 ```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-```
-Keep that terminal focused and use `i` / `j` / `l` / `,` / `k` to drive.
-
-**The world**: main corridor along +x (2.4 m wide, 30 m long) with a branch going +y at x = 14 m,
-classroom doors on the walls, and a bench, water fountain, and trash can as obstacles.
-The robot spawns at the origin facing +x.
-
-**ROS topics**
-
-| Topic | Type | Direction |
-|---|---|---|
-| `/cmd_vel` | `geometry_msgs/Twist` | ROS → Gazebo |
-| `/scan` | `sensor_msgs/LaserScan` (360°, 12 m, 10 Hz) | Gazebo → ROS |
-| `/odom` | `nav_msgs/Odometry` | Gazebo → ROS |
-| `/tf`, `/joint_states`, `/clock` | TF: `odom → base_footprint → base_link → …` | Gazebo → ROS |
-
-**Files** (`src/cash_sim/`)
-- `urdf/cash_bot.urdf.xacro`: robot model. Dimensions at the top are placeholders; update them to the real chassis.
-- `worlds/hallway.sdf`: the hallway world.
-- `config/bridge.yaml`: Gazebo ↔ ROS topic mapping.
-- `launch/sim.launch.py`: starts everything.
-- `rviz/cash_sim.rviz`: RViz layout.
-
-## Map the hallway with SLAM Toolbox
-
-One-time setup: `sudo apt update && sudo apt install -y ros-jazzy-slam-toolbox`, then rebuild
-(`colcon build --symlink-install && source install/setup.bash`).
-
-1. Start the sim (terminal 1): `ros2 launch cash_sim sim.launch.py gui:=false`
-2. Start SLAM (terminal 2): `ros2 launch cash_sim slam.launch.py`
-3. Drive around (terminal 3): `ros2 run teleop_twist_keyboard teleop_twist_keyboard`
-
-The growing occupancy grid shows up in RViz (`Map` display, topic `/map`). Drive the full
-length of the corridor and the +y branch, and loop back past somewhere you've already been
-so slam_toolbox can close the loop and correct drift.
-
-**Save the map** (terminal 4, once you're happy with the coverage):
-```bash
-ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data: '/home/jorge_leon/ros2_ws/maps/hallway'}}"
-```
-Writes `maps/hallway.pgm` + `maps/hallway.yaml` (used later by Nav2). Commit good maps —
-they're checked in. Use a `maps/scratch_*` name for throwaway test runs; those are
-gitignored.
-
-To keep mapping *state* itself (not just the raster) so you can resume later instead of
-re-driving from scratch:
-```bash
-ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '/home/jorge_leon/ros2_ws/maps/hallway'}"
-```
-
-The committed map (`maps/hallway.*`) is aligned with the Gazebo world frame, because SLAM was started
-at the spawn pose, so map coordinates equal world coordinates from `hallway.sdf`.
-
-## Train the navigation policy (DRL)
-
-The `cash_rl` package trains a policy that drives from a start pose to a goal point (for example a
-classroom door) using only the LiDAR scan and the goal's relative position. Training runs in a fast
-2D simulator built on the SLAM map (~2,300 steps/s vs ~10 in Gazebo); the trained policy then runs
-unchanged in Gazebo.
-
-One-time setup (CPU-only PyTorch; `numpy<2` keeps ROS 2 Jazzy's numpy working):
-```bash
-pip install --user --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch "numpy<2"
-pip install --user --break-system-packages stable-baselines3 tensorboard gymnasium "numpy<2"
-```
-
-**Train** (results go to `runs/<name>/`, which is gitignored; ~1,300 steps/s on the laptop CPU):
-```bash
-# recommended settings (best so far, ~19 min):
 ros2 run cash_rl train --name my_run --timesteps 1500000 --goal-distance-range 1 25 --junction-prob 0.3
-ros2 run cash_rl train --help           # all options (algo, seed, eval frequency, ...)
-tensorboard --logdir ~/ros2_ws/runs     # then open http://localhost:6006, look at the eval/ charts
+tensorboard --logdir ~/ros2_ws/runs    # open http://localhost:6006 and look at the eval/ charts
 ```
-Every 100k steps the policy is evaluated on all 7 doors from spawn plus 20 fixed random goals;
-`runs/<name>/eval.csv` has success, collision and timeout rates for plotting, and
-`runs/<name>/config.json` records every setting the run used. `--junction-prob` is the share of
-training episodes that start on one side of the junction with the goal on the other.
 
-Where to change things: training-run settings are `train` flags; PPO hyperparameters are in
-`algo_kwargs` in `src/cash_rl/cash_rl/train.py`; the task itself (reward weights, goal tolerance,
-robot and LiDAR limits) is in `src/cash_rl/cash_rl/spec.py`, shared by the 2D sim and Gazebo.
-
-**Demo** a trained model interactively (2D, no Gazebo needed):
+**Or download the trained models** from the
+[`models-2026-10-14` release](https://github.com/leonjorge010/cbu-autonomous-robot/releases/tag/models-2026-10-14).
+Each run also has its `config.json` (every setting) and `eval.csv` (learning curve).
 ```bash
-ros2 run cash_rl demo                   # uses the newest runs/*/best_model.zip
+cd ~/ros2_ws
+for run in ppo_baseline ppo_junction; do
+  mkdir -p runs/$run
+  curl -L -o runs/$run/best_model.zip \
+    https://github.com/leonjorge010/cbu-autonomous-robot/releases/download/models-2026-10-14/${run}_best_model.zip
+done
 ```
-Left-click places the robot (drag to aim it), right-click sets the destination, keys 1–7 send it to
-a door, Esc clears. After it arrives, right-click again to continue from where it stopped.
 
-**Watch** episodes in a window (or add `--save out.gif`):
+**Try a trained model** (2D, no Gazebo needed):
 ```bash
-ros2 run cash_rl view_env --policy ~/ros2_ws/runs/my_run/best_model.zip --goal all
-ros2 run cash_rl view_env                  # hand-written reference controller, random goals
+ros2 run cash_rl demo                  # click to place the robot, right-click a destination, keys 1-7 = doors
+ros2 run cash_rl view_env --policy runs/my_run/best_model.zip --goal all   # add --save out.gif to record
+ros2 run cash_rl evaluate runs/my_run/best_model.zip                      # per-door results
+ros2 run cash_rl evaluate runs/a/best_model.zip runs/b/best_model.zip --random 200   # compare models
 ```
 
-**Evaluate** on the door goals, in 2D or in Gazebo, and compare models on held-out goals:
+**Evaluate in Gazebo.** Stop any training first, because Gazebo runs on wall-clock time.
 ```bash
-ros2 run cash_rl evaluate ~/ros2_ws/runs/my_run/best_model.zip
-ros2 run cash_rl evaluate runs/run_a/best_model.zip runs/run_b/best_model.zip --random 200
-ros2 launch cash_rl train_env.launch.py                                    # terminal 1, for Gazebo
-ros2 run cash_rl evaluate ~/ros2_ws/runs/my_run/best_model.zip --env gazebo # terminal 2
+ros2 launch cash_rl train_env.launch.py                                 # terminal 1
+ros2 run cash_rl evaluate runs/my_run/best_model.zip --env gazebo       # terminal 2
 ```
-Run Gazebo evaluations with training stopped: Gazebo steps on wall-clock time, and training load
-slows the simulation. To watch, run `gz sim -g` in another terminal (not together with RViz).
 
-**Results so far** (Oct 14 2026; details in [WORKLOG.md](WORKLOG.md)):
-
-| Run | Settings | Best model | Held-out goals reached (200) | Collisions |
-|---|---|---|---|---|
-| `ppo_baseline` | 3M steps, goals 1–15 m | 2.8M steps | 93.0% | 6.0% |
-| `ppo_junction` | 1.5M steps, goals 1–25 m, `--junction-prob 0.3` | 1.1M steps | 96.0% | 3.0% |
-
-Both best models reach all 7 doors from spawn; `ppo_baseline`'s also did in Gazebo. Known
-weaknesses: from random headings both models drive in reverse about half the time instead of turning
-around, and the policy can clip the water fountain when it hugs the north wall heading for the branch.
-
-## Save and push work
-
+**Re-map the hallway** (only if the world changes):
 ```bash
-git status
-git add .
-git commit -m "Describe what changed"
-git push
+ros2 launch cash_sim sim.launch.py gui:=false     # terminal 1
+ros2 launch cash_sim slam.launch.py               # terminal 2, then drive the whole hallway
+ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data: '$HOME/ros2_ws/maps/hallway'}}"
 ```
 
-## Quick checks
+## Where things are
 
-| Check | Command | Expected |
-|---|---|---|
-| GPU rendering | `glxinfo -B \| grep -i renderer` | `D3D12 (NVIDIA GeForce RTX 4060 ...)` |
-| Gazebo | `gz sim shapes.sdf` | Window with shapes opens |
-| ROS comms | `ros2 run demo_nodes_cpp talker` + `listener` in a 2nd pane | Listener prints `I heard: ...` |
-| GitHub login | `gh auth status` | `Logged in to github.com account leonjorge010` |
-| Sim topics | `ros2 topic hz /scan` (sim running) | ~10 Hz |
+| Path | What it is |
+|---|---|
+| `src/cash_sim/worlds/hallway.sdf` | The Gazebo hallway |
+| `src/cash_sim/urdf/cash_bot.urdf.xacro` | The robot. Dimensions are placeholders for the real chassis |
+| `src/cash_sim/launch/` | `sim.launch.py` (simulation), `slam.launch.py` (mapping) |
+| `maps/hallway.*` | The saved SLAM map that training uses |
+| `src/cash_rl/cash_rl/spec.py` | **The task**: observation, action, reward, collision. Shared by both simulators |
+| `src/cash_rl/cash_rl/raycast_env.py` | Fast 2D training simulator |
+| `src/cash_rl/cash_rl/hallway_env.py` | The same task in Gazebo |
+| `src/cash_rl/cash_rl/train.py` | Training script. PPO hyperparameters are in `algo_kwargs` |
+| `WORKLOG.md` | What was done each session, with numbers |
+
+ROS topics: `/cmd_vel` (drive), `/scan` (LiDAR, 10 Hz), `/odom`, `/tf`, `/clock`.
+
+## Contributing
+
+- Make small commits with clear messages, and add a dated entry to `WORKLOG.md` after each session.
+- Never commit `build/`, `install/`, `log/`, `runs/` (model weights) or rosbags.
+- Training changes should be reported with the `eval/` numbers, not the training reward.
 
 ## Troubleshooting
 
-- **Renderer says `llvmpipe` (slow, CPU rendering)**: make sure `~/.bashrc` contains
-  `export GALLIUM_DRIVER=d3d12` and `export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA`, then `source ~/.bashrc`.
-- **`git push` / `gh` asks to log in**: the access token may have expired. Generate a new classic token
-  (scopes: repo, workflow, read:org, admin:public_key) and run `gh auth login` → Paste an authentication token.
-- **Package not found after building**: run `source install/setup.bash` in that terminal.
-- **Robot starts in a weird place / odom is wrong after relaunching**: Ctrl+C sometimes leaves an old
-  Gazebo server running, and the relaunch silently reuses it. Check with `pgrep -af "gz sim"`; if more
-  than one shows up (or any after stopping the sim), `kill -9 <pid>` the extras and relaunch. Always check
-  this before a SLAM mapping pass.
-- **Robot doesn't move with teleop**: the teleop terminal must be focused, and the sim must be playing (not paused).
-- **Slow builds**: make sure you're in `~/ros2_ws`, not under `/mnt/c/...`.
-- **`code .` opens the wrong folder, or `cd ~/ros2_ws` says "path not found"**: you're in Windows
-  PowerShell, not WSL Ubuntu — this project only exists inside WSL. Run `wsl -d Ubuntu-24.04` to switch
-  (plain `wsl` can land you in Docker Desktop's internal distro instead if that's your current default —
-  check with `wsl -l -v`, and fix it with `wsl --set-default Ubuntu-24.04`). Then `cd ~/ros2_ws && code .`
-  from that shell. VS Code should show "WSL: Ubuntu-24.04" in the bottom-left corner.
+- **`cd ~/ros2_ws` fails or VS Code opens the wrong folder**: you're in PowerShell, not Ubuntu. Run
+  `wsl -d Ubuntu-24.04` (and `wsl --set-default Ubuntu-24.04` so this sticks).
+- **Package not found**: run `source install/setup.bash`, or rebuild if you just pulled new files.
+- **Robot spawns in a weird place after a relaunch**: an old Gazebo server survived Ctrl+C. Check with
+  `pgrep -af "gz sim"`, `kill -9` any leftovers, and relaunch.
+- **Gazebo is very slow**: check `glxinfo -B`. If the renderer is `llvmpipe`, see setup step 5.
+- **Harmless messages**: `gz_frame_id ... not defined`, a segfault when Gazebo exits, and RViz
+  "Message Filter dropping message" right after startup.
