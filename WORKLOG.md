@@ -46,8 +46,10 @@ for each session: what changed, results with numbers, and what's still open.
 - Simulates each command over the stopping time and falls back to gentler commands if the footprint
   would come within 10 cm of a scan point. On 3 seeds × 200 goals, collisions went from 4.2% to 0.7%;
   success went from 93.5% to 94.3%; it overrode 3.2% of steps. Collisions mostly became timeouts.
-- Started the 3-seed `ppo_lr3m_s*` runs: 3M steps, linear LR decay (`--lr-schedule linear`),
-  100-goal periodic eval.
+- Started a 3-seed run with 3M steps, linear LR decay (`--lr-schedule linear`) and a 100-goal
+  periodic eval, but stopped it at 15% of seed 0 for time. To restart:
+  `for s in 0 1 2; do ros2 run cash_rl train --name ppo_lr3m_s$s --seed $s --timesteps 3000000 --lr-schedule linear --eval-random 100 --goal-distance-range 1 25 --junction-prob 0.3; done`
+  (~30 min per seed with nothing else running).
 
 **Lessons**
 - Don't run two trainings or several evaluations at once. PyTorch takes all 22 threads per process,
@@ -55,7 +57,9 @@ for each session: what changed, results with numbers, and what's still open.
 - The 27-episode periodic eval can't rank models (100% there, 90–93% on 200 goals).
 
 **Open**
-- Final-approach stalls (seed 2); test 3M steps; pick checkpoints by the 200-goal test, not the 27-episode one.
+- Restart the 3M + LR-decay experiment (above). Then try the robot's measured velocity and 72
+  beams as inputs, and a larger time penalty for the final-approach stalls (seed 2).
+- Safety layer in Gazebo (`evaluate --env gazebo --safety`), then as a ROS node for the robot.
 - Gazebo eval from varied start poses; 2–3 seeds per setup (cancelled today for time).
 - LiDAR mounting position and height on the real chassis.
 
