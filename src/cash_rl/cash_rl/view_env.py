@@ -4,11 +4,14 @@
     ros2 run cash_rl view_env --policy random --goal door_201
     ros2 run cash_rl view_env --goal all --save doors.gif
     ros2 run cash_rl view_env --policy ~/ros2_ws/runs/<run>/best_model.zip --goal all
+    ros2 run cash_rl view_env --map ~/ros2_ws/maps/cbu_floor2.yaml --lookahead 10 \
+        --goal tegr_221
 
-Shows the SLAM map to scale with the robot footprint (collision margin
-included), the 36 observed lidar beams, the goal tolerance circle, the path so
-far, and episode step/return/outcome. Episodes are simulated up front (the 2D
-env is fast), then played back at real time × --speed.
+Shows the map to scale (keep-out zones shaded red) with the robot footprint
+(collision margin included), the 36 observed lidar beams, the goal tolerance
+circle, the lookahead waypoint, the path so far, and episode step/return/outcome.
+The map and lookahead default to the --policy model's training run. Episodes are
+simulated up front (the 2D env is fast), then played back at real time × --speed.
 """
 import argparse
 
@@ -30,7 +33,8 @@ def load_trained_policy(path):
     model = load_model(path)
 
     def policy(env):
-        obs = spec.build_observation(env._ranges, env.pose, env.goal, env._prev_action)
+        obs = spec.build_observation(env._ranges, env.pose, env.observed_goal,
+                                     env._prev_action)
         return model.predict(obs, deterministic=True)[0]
     return policy
 
@@ -39,14 +43,15 @@ def run_episodes(env, policy, goals, seed):
     """Simulate episodes; return a list of per-step snapshots for playback."""
     frames = []
     for i, (goal_name, goal) in enumerate(goals):
-        options = {'spawn': spec.SPAWN_POSE, 'goal': goal} if goal is not None else None
+        options = {'spawn': env.map.spawn, 'goal': goal} if goal is not None else None
         _, info = env.reset(seed=seed + i, options=options)
         goal_name = goal_name or f'random ({info["goal"][0]:.1f}, {info["goal"][1]:.1f})'
         trail, total, step, outcome = [env.pose[:2].copy()], 0.0, 0, ''
         while True:
             frames.append({
                 'pose': env.pose.copy(), 'ranges': env._ranges.copy(),
-                'goal': env.goal.copy(), 'trail': np.array(trail), 'text': (
+                'goal': env.goal.copy(), 'waypoint': env.observed_goal.copy(),
+                'trail': np.array(trail), 'text': (
                     f'episode {i + 1}/{len(goals)}   goal: {goal_name}   '
                     f'step {step}/{env._max_steps}   return {total:+.1f}   {outcome}')})
             if outcome:
@@ -58,6 +63,7 @@ def run_episodes(env, policy, goals, seed):
             trail.append(env.pose[:2].copy())
             if terminated or truncated:
                 outcome = ('REACHED GOAL' if info['is_success']
+                           else 'KEEP-OUT ZONE' if info.get('keepout')
                            else 'COLLISION' if info['collided'] else 'TIMED OUT')
     return frames
 
@@ -71,10 +77,11 @@ def footprint_corners(pose):
 
 
 class Scene:
-    """Matplotlib drawing of the map, doors, robot, beams, goal and trail on `ax`.
+    """Matplotlib drawing of the map, goals, robot, beams, goal and trail on `ax`.
 
-    door_labels maps door name -> label text (default: the name). draw() with
-    pose None hides the robot and beams; goal None hides the goal.
+    door_labels maps goal name -> label text (default: the name). draw() with
+    pose None hides the robot and beams; goal None hides the goal; waypoint None
+    (or equal to the goal) hides the lookahead waypoint.
     """
 
     def __init__(self, ax, env, door_labels=None):
@@ -84,7 +91,12 @@ class Scene:
         ax.imshow(m.pixels, cmap='gray', origin='lower', vmin=0, vmax=255, extent=[
             m.origin[0], m.origin[0] + m.width * m.resolution,
             m.origin[1], m.origin[1] + m.height * m.resolution])
-        for name, (gx, gy) in spec.DOOR_GOALS.items():
+        extent = [m.origin[0], m.origin[0] + m.width * m.resolution,
+                  m.origin[1], m.origin[1] + m.height * m.resolution]
+        if m.keepout.any():
+            ax.imshow(np.ma.masked_where(~m.keepout, m.keepout), cmap='Reds', vmin=0, vmax=3,
+                      alpha=0.5, origin='lower', extent=extent)
+        for name, (gx, gy) in m.goals.items():
             ax.plot(gx, gy, '+', color='0.6', ms=6)
             ax.annotate((door_labels or {}).get(name, name), (gx, gy), xytext=(3, 4),
                         textcoords='offset points', fontsize=7, color='0.45')
@@ -98,9 +110,10 @@ class Scene:
         self.heading, = ax.plot([], [], color='white', lw=2)
         self.goal = ax.add_patch(Circle((0, 0), spec.GOAL_TOLERANCE, fc='orange',
                                         ec='darkorange', alpha=0.7))
+        self.waypoint, = ax.plot([], [], 'x', color='darkorange', ms=8, mew=2)
         self.title = ax.set_title('', fontsize=11, family='monospace')
 
-    def draw(self, pose, ranges, goal, trail, text):
+    def draw(self, pose, ranges, goal, trail, text, waypoint=None):
         self.robot.set_visible(pose is not None)
         self.heading.set_visible(pose is not None)
         self.beams.set_visible(pose is not None and ranges is not None)
@@ -118,10 +131,32 @@ class Scene:
         self.goal.set_visible(goal is not None)
         if goal is not None:
             self.goal.center = goal
+        show_waypoint = waypoint is not None and (goal is None or not np.allclose(waypoint, goal))
+        self.waypoint.set_visible(show_waypoint)
+        if show_waypoint:
+            self.waypoint.set_data([waypoint[0]], [waypoint[1]])
         trail = np.zeros((0, 2)) if trail is None or len(trail) == 0 else np.asarray(trail)
         self.trail.set_data(trail[:, 0], trail[:, 1])
         self.title.set_text(text)
-        return self.beams, self.trail, self.robot, self.heading, self.goal, self.title
+        return (self.beams, self.trail, self.robot, self.heading, self.goal, self.waypoint,
+                self.title)
+
+
+def map_and_lookahead(args):
+    """--map/--lookahead, defaulting to the --policy model's training run."""
+    trained = {}
+    if args.policy and args.policy.endswith('.zip'):
+        from cash_rl.train import run_config
+        trained = run_config(args.policy)['args']
+    lookahead = args.lookahead if args.lookahead is not None else trained.get('lookahead')
+    return args.map or trained.get('map'), lookahead
+
+
+def figure_size(env, width=14.0, max_height=9.0):
+    """Figure (w, h) in inches fitting the map's aspect ratio."""
+    aspect = env.map.height / env.map.width
+    return (width, min(max_height, width * aspect + 1.0)) if aspect < 0.6 \
+        else (max_height / aspect + 1.5, max_height)
 
 
 def main():
@@ -129,23 +164,28 @@ def main():
     parser.add_argument('--policy', default='downhill',
                         help=f"{' or '.join(sorted(POLICIES))}, or a trained model .zip")
     parser.add_argument('--goal', default='random',
-                        help="'random', 'all' (every door from spawn), or a door name: "
-                             + ', '.join(sorted(spec.DOOR_GOALS)))
+                        help="'random', 'all' (every named goal from the spawn), or a goal "
+                             "name from the map's goals file")
     parser.add_argument('--episodes', type=int, default=3,
                         help='number of episodes with --goal random')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
+    parser.add_argument('--map', help='occupancy map .yaml')
+    parser.add_argument('--lookahead', type=float, help='waypoint lookahead (m)')
     args = parser.parse_args()
 
+    map_yaml, lookahead = map_and_lookahead(args)
+    env = HallwayRaycastEnv(map_yaml=map_yaml, lookahead=lookahead)
     if args.goal == 'random':
         goals = [(None, None)] * args.episodes
     elif args.goal == 'all':
-        goals = sorted(spec.DOOR_GOALS.items())
-    elif args.goal in spec.DOOR_GOALS:
-        goals = [(args.goal, spec.DOOR_GOALS[args.goal])]
+        goals = sorted(env.map.goals.items())
+    elif args.goal in env.map.goals:
+        goals = [(args.goal, env.map.goals[args.goal])]
     else:
-        parser.error(f'unknown goal {args.goal!r}')
+        parser.error(f'unknown goal {args.goal!r}; {env.map.name} has: '
+                     + ', '.join(sorted(env.map.goals)))
 
     import matplotlib
     if args.save:
@@ -153,17 +193,16 @@ def main():
     from matplotlib.animation import FuncAnimation, PillowWriter
     import matplotlib.pyplot as plt
 
-    env = HallwayRaycastEnv()
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
     frames = run_episodes(env, policy, goals, args.seed)
 
-    fig, ax = plt.subplots(figsize=(14, 6.4))
+    fig, ax = plt.subplots(figsize=figure_size(env))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.93, bottom=0.07)
     scene = Scene(ax, env)
 
     def draw(frame):
         return scene.draw(frame['pose'], frame['ranges'], frame['goal'], frame['trail'],
-                          frame['text'])
+                          frame['text'], frame['waypoint'])
 
     interval_ms = 1000 * spec.CONTROL_PERIOD / args.speed
     anim = FuncAnimation(fig, draw, frames=frames, interval=interval_ms, blit=False,

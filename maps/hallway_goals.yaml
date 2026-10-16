@@ -1,0 +1,14 @@
+# Named goals for maps/hallway.yaml (cash_sim/worlds/hallway.sdf): the corridor centerline in
+# front of each door, the fixed evaluation set. World frame == map frame.
+spawn: [0.0, 0.0, 0.0]  # sim.launch.py's default x, y, yaw
+goals:
+  door_101: [4.0, 0.0]
+  door_105: [7.0, 0.0]
+  door_102: [9.0, 0.0]
+  door_103: [20.0, 0.0]
+  door_104: [24.0, 0.0]
+  door_201: [14.0, 6.0]
+  door_202: [14.0, 9.0]
+# The main corridor spans |y| <= 1.2 m; the side branch rises in +y from the junction at
+# x = 14 m. Cells at or above this line count as the branch (junction_prob episodes).
+branch_min_y: 1.5

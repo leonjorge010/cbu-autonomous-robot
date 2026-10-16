@@ -1,13 +1,14 @@
-"""Fast 2D Gymnasium env: raycasts the robot's LiDAR against the SLAM hallway map.
+"""Fast 2D Gymnasium env: raycasts the robot's LiDAR against an occupancy map.
 
 Same observation/action/collision/reward definitions as HallwayEnv (both come
 from cash_rl.spec), but with no ROS or Gazebo: a unicycle model with the
 DiffDrive plugin's acceleration limits, and the 36 observed beams raycast
-against maps/hallway.pgm. Runs thousands of steps/sec, for training; validate
-trained policies against HallwayEnv in Gazebo afterwards.
+against the map (maps/hallway.yaml by default, or $CASH_MAP_YAML / map_yaml).
+Runs thousands of steps/sec, for training; validate trained policies against
+HallwayEnv in Gazebo afterwards.
 
-The map frame is aligned with the Gazebo world frame (SLAM was started at the
-spawn pose), so poses here are world coordinates from hallway.sdf.
+The map frame is aligned with the Gazebo world frame, so poses here are world
+coordinates of the matching cash_sim world.
 """
 from cash_rl import spec
 from cash_rl.occupancy_map import OccupancyMap
@@ -22,9 +23,6 @@ SPAWN_CLEARANCE = 0.15
 GOAL_CLEARANCE = 0.5
 DEFAULT_GOAL_DISTANCE_RANGE = (1.0, 15.0)
 SAFETY_SCAN_ANGLES = np.linspace(-np.pi, np.pi, 360, endpoint=False)
-# hallway.sdf: the main corridor spans |y| <= 1.2 m; the side branch rises in +y
-# from the junction at x = 14 m. Cells above this line count as the branch.
-BRANCH_MIN_Y = 1.5
 MAX_SAMPLE_TRIES = 1000
 
 
@@ -50,22 +48,37 @@ class HallwayRaycastEnv(gym.Env):
     free space, and a goal whose geodesic distance from the spawn is within
     goal_distance_range. With probability junction_prob, a sampled spawn and goal
     are put on opposite sides of the junction (main corridor vs. side branch), so
-    the episode needs the turn. For evaluation matching HallwayEnv, pass
-    spec.SPAWN_POSE and one of spec.DOOR_GOALS. map_yaml defaults to
-    occupancy_map.default_map_yaml(); range_noise adds the URDF's Gaussian range
-    noise and spec.BEAM_DROPOUT_PROB missing returns; render_mode is None or 'rgb_array'.
+    the episode needs the turn; only for maps whose goals file sets branch_min_y.
+    For evaluation matching HallwayEnv, pass self.map.spawn and one of
+    self.map.goals. map_yaml defaults to occupancy_map.default_map_yaml();
+    range_noise adds the URDF's Gaussian range noise and spec.BEAM_DROPOUT_PROB
+    missing returns; render_mode is None or 'rgb_array'.
+
+    Keep-out zones (the map's keepout sidecar) are never spawned in or used as
+    goals, routes go around them, and driving the robot's center into one ends
+    the episode as a collision (info['collided'] and info['keepout'] both True):
+    a virtual wall, as Nav2's keepout filter would enforce.
+
+    lookahead (m): if set, the observation's goal is a waypoint that far along the
+    cheapest route instead of the goal itself (once the goal is closer, the goal),
+    so goals beyond the policy's training range or around several corners can be
+    reached. Reward, success and the step limit still use the real goal.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
 
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
-                 range_noise=True, render_mode=None, junction_prob=0.0):
+                 range_noise=True, render_mode=None, junction_prob=0.0, lookahead=None):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
         self.map = OccupancyMap(map_yaml)
         self.goal_distance_range = goal_distance_range
+        if junction_prob > 0 and self.map.branch_min_y is None:
+            raise ValueError(f'junction_prob needs branch_min_y in the goals file of '
+                             f'{self.map.yaml_path}')
         self.junction_prob = junction_prob
+        self.lookahead = lookahead
         self.range_noise = range_noise
         self.render_mode = render_mode
 
@@ -87,14 +100,17 @@ class HallwayRaycastEnv(gym.Env):
             spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             self._ray_step)
-        self._goal_cells = np.argwhere(self.map.clearance >= GOAL_CLEARANCE)
-        self._in_branch = {
-            'spawn': self._cell_y(self.map.free_cells[:, 0]) >= BRANCH_MIN_Y,
-            'goal': self._cell_y(self._goal_cells[:, 0]) >= BRANCH_MIN_Y,
-        }
+        self._goal_cells = np.argwhere((self.map.clearance >= GOAL_CLEARANCE)
+                                       & ~self.map.keepout)
+        if self.map.branch_min_y is not None:
+            self._in_branch = {
+                'spawn': self._cell_y(self.map.allowed_cells[:, 0]) >= self.map.branch_min_y,
+                'goal': self._cell_y(self._goal_cells[:, 0]) >= self.map.branch_min_y,
+            }
 
-        self.pose = np.array(spec.SPAWN_POSE, dtype=np.float64)
+        self.pose = np.array(self.map.spawn or (0.0, 0.0, 0.0), dtype=np.float64)
         self.goal = np.zeros(2)
+        self.observed_goal = np.zeros(2)  # the goal or, with lookahead, the waypoint
         self._goal_field = None
         self._goal_distance = 0.0
         self._velocity = np.zeros(2)
@@ -177,8 +193,8 @@ class HallwayRaycastEnv(gym.Env):
 
     def _sample_spawn_pose(self, in_branch=None):
         """Collision-free pose; in_branch True/False limits it to the branch/corridor."""
-        cells = self.map.free_cells if in_branch is None \
-            else self.map.free_cells[self._in_branch['spawn'] == in_branch]
+        cells = self.map.allowed_cells if in_branch is None \
+            else self.map.allowed_cells[self._in_branch['spawn'] == in_branch]
         for _ in range(MAX_SAMPLE_TRIES):
             row, col = cells[self.np_random.integers(len(cells))]
             pose = np.array([*self._random_point_in_cell(row, col),
@@ -204,6 +220,8 @@ class HallwayRaycastEnv(gym.Env):
     # -- gym API ----------------------------------------------------------
 
     def _observe(self):
+        self.observed_goal = self.goal if self.lookahead is None \
+            else self._goal_field.waypoint(self.pose[0], self.pose[1], self.lookahead)
         ranges = self.raycast()
         if self.range_noise:
             finite = np.isfinite(ranges)
@@ -211,7 +229,8 @@ class HallwayRaycastEnv(gym.Env):
                 0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
             ranges[self.np_random.random(len(ranges)) < spec.BEAM_DROPOUT_PROB] = np.inf
         self._ranges = spec.sanitize_ranges(ranges)
-        return spec.build_observation(self._ranges, self.pose, self.goal, self._prev_action)
+        return spec.build_observation(self._ranges, self.pose, self.observed_goal,
+                                      self._prev_action)
 
     def _info(self, **extra):
         return {'pose': self.pose.copy(), 'goal': self.goal.copy(),
@@ -240,6 +259,8 @@ class HallwayRaycastEnv(gym.Env):
             raise RuntimeError(f'No spawn/goal pair found in {MAX_SAMPLE_TRIES} tries')
         if self.collides(pose):
             raise RuntimeError(f'Spawn pose {pose} is in collision')
+        if self.map.in_keepout(pose[0], pose[1]):
+            raise RuntimeError(f'Spawn pose {pose} is in a keep-out zone')
 
         self.pose, self.goal = pose, goal_xy
         self._goal_field = self.map.distance_field(*self.goal)
@@ -266,7 +287,8 @@ class HallwayRaycastEnv(gym.Env):
         self._step_count += 1
         self._prev_action = action
 
-        collided = self.collides()
+        entered_keepout = bool(self.map.in_keepout(self.pose[0], self.pose[1]))
+        collided = self.collides() or entered_keepout
         clearance = self.clearance()
         goal_distance = self._goal_field(*self.pose[:2])
         reward, reached = spec.step_outcome(
@@ -277,13 +299,14 @@ class HallwayRaycastEnv(gym.Env):
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
         info = self._info(min_range=float(np.min(self._ranges)), clearance=clearance,
-                          collided=collided, is_success=reached)
+                          collided=collided, keepout=entered_keepout, is_success=reached)
         return obs, reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode != 'rgb_array':
             return None
         image = np.repeat(self.map.pixels[:, :, None], 3, axis=2)
+        image[self.map.keepout] = (image[self.map.keepout] * 0.6 + [90, 0, 0]).astype(np.uint8)
 
         def paint(wx, wy, color):
             row, col = self.map.to_cell(np.asarray(wx), np.asarray(wy))

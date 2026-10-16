@@ -2,13 +2,19 @@
 
     ros2 run cash_rl train                                  # PPO, 3M steps
     ros2 run cash_rl train --algo sac --timesteps 1000000
+    ros2 run cash_rl train --map ~/ros2_ws/maps/cbu_floor2.yaml --lookahead 10
     tensorboard --logdir ~/ros2_ws/runs                     # watch it
 
 Writes runs/<name>/ in the workspace (gitignored): config.json, TensorBoard
 logs, eval.csv, checkpoints/, best_model.zip and final_model.zip.
 
+--map picks the occupancy map (default $CASH_MAP_YAML, else maps/hallway.yaml);
+its keep-out zones and named goals come from the sidecar files next to it (see
+occupancy_map). The resolved map path is recorded in config.json, and evaluate
+uses it by default.
+
 Every --eval-freq steps the deterministic policy is evaluated on a fixed set:
-each spec.DOOR_GOALS entry from spec.SPAWN_POSE (what HallwayEnv evaluates in
+each of the map's named goals from the map's spawn (what HallwayEnv evaluates in
 Gazebo) plus --eval-random fixed-seed random spawn/goal pairs. Success,
 collision and timeout rates and mean return go to TensorBoard (eval/*) and
 eval.csv — those, not the exploration-noisy training reward, are the learning
@@ -39,16 +45,35 @@ def runs_dir():
     return os.path.join(os.path.dirname(os.path.dirname(default_map_yaml())), 'runs')
 
 
-def load_model(path):
-    """Load a train.py model zip; the algo is read from the run's config.json."""
-    path = os.path.expanduser(path)
-    directory = os.path.dirname(os.path.abspath(path))
+def run_config(model_path):
+    """Return the config.json of the run a train.py model zip belongs to."""
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(model_path)))
     for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
         config = os.path.join(candidate, 'config.json')
         if os.path.isfile(config):
             with open(config) as f:
-                return ALGOS[json.load(f)['args']['algo']].load(path, device='cpu')
-    raise FileNotFoundError(f'No config.json next to or above {path}')
+                return json.load(f)
+    raise FileNotFoundError(f'No config.json next to or above {model_path}')
+
+
+def load_model(path):
+    """Load a train.py model zip; the algo is read from the run's config.json."""
+    path = os.path.expanduser(path)
+    return ALGOS[run_config(path)['args']['algo']].load(path, device='cpu')
+
+
+def goal_episodes(env, repeats=1):
+    """(name, seed, options) episodes: the env map's named goals from its spawn.
+
+    Goals at the spawn itself (e.g. cbu_floor2's stair_1) are skipped.
+    """
+    m = env.unwrapped.map
+    if m.spawn is None:
+        return []
+    return [(name, repeat, {'spawn': m.spawn, 'goal': goal})
+            for name, goal in sorted(m.goals.items())
+            if np.hypot(goal[0] - m.spawn[0], goal[1] - m.spawn[1]) > 1.0
+            for repeat in range(repeats)]
 
 
 def algo_kwargs(algo, n_envs):
@@ -89,6 +114,7 @@ def evaluate(model, env, episodes):
                 break
         results.append({'name': name, 'success': bool(info['is_success']),
                         'collision': bool(info['collided']),
+                        'keepout': bool(info.get('keepout', False)),
                         'timeout': not terminated, 'return': total, 'steps': steps,
                         'path': path, 'start_distance': start_distance,
                         'reverse': reversing / steps, 'override': overrides / steps})
@@ -103,8 +129,7 @@ class GoalEvalCallback(BaseCallback):
         self.eval_env = eval_env
         self.eval_freq = eval_freq
         self.run_dir = run_dir
-        self.episodes = [(name, 0, {'spawn': spec.SPAWN_POSE, 'goal': goal})
-                         for name, goal in sorted(spec.DOOR_GOALS.items())]
+        self.episodes = goal_episodes(eval_env)
         self.episodes += [(f'random_{i}', EVAL_SEED_BASE + i, None) for i in range(n_random)]
         self.best = (-1.0, -np.inf)
         self.last_eval = 0
@@ -142,7 +167,7 @@ class GoalEvalCallback(BaseCallback):
             'collision_rate': rate('collision'),
             'timeout_rate': rate('timeout'),
             'mean_return': rate('return'),
-            'door_success_rate': rate('success', doors),
+            'door_success_rate': rate('success', doors) if doors else float('nan'),
             'random_success_rate': rate('success', randoms) if randoms else float('nan'),
             'mean_steps_success': float(np.mean(succeeded)) if succeeded else float('nan'),
         }
@@ -177,6 +202,11 @@ def main():
     parser.add_argument('--goal-distance-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
                         default=DEFAULT_GOAL_DISTANCE_RANGE,
                         help='geodesic distance range (m) of random training goals')
+    parser.add_argument('--map', help='occupancy map .yaml (default: $CASH_MAP_YAML, else '
+                                      'maps/hallway.yaml)')
+    parser.add_argument('--lookahead', type=float, default=None,
+                        help='observe a waypoint this far (m) along the route instead of the '
+                             'goal, in training and eval (default: the goal itself)')
     parser.add_argument('--junction-prob', type=float, default=0.0,
                         help='share of training episodes that start and end on opposite '
                              'sides of the junction')
@@ -186,6 +216,7 @@ def main():
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
 
+    args.map = os.path.abspath(os.path.expanduser(args.map or default_map_yaml()))
     n_envs = args.n_envs or (12 if args.algo == 'ppo' else 4)
     name = args.name or f'{args.algo}_{datetime.datetime.now():%Y%m%d_%H%M%S}'
     run_dir = os.path.join(runs_dir(), name)
@@ -199,15 +230,15 @@ def main():
                   f, indent=2, default=str)
 
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
-    env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range),
-                  'junction_prob': args.junction_prob}
+    env_kwargs = {'map_yaml': args.map, 'goal_distance_range': tuple(args.goal_distance_range),
+                  'junction_prob': args.junction_prob, 'lookahead': args.lookahead}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
                              monitor_kwargs={'info_keywords': ('is_success',)})
     # Eval always uses the default goal range, so every run is scored on the same
     # random spawn/goal pairs regardless of its training goal range.
-    eval_env = HallwayRaycastEnv()
+    eval_env = HallwayRaycastEnv(map_yaml=args.map, lookahead=args.lookahead)
 
     model_kwargs = dict(kwargs)
     if args.lr_schedule == 'linear':
@@ -221,8 +252,8 @@ def main():
         CheckpointCallback(save_freq=max(1, args.checkpoint_freq // n_envs),
                            save_path=os.path.join(run_dir, 'checkpoints'), name_prefix='model'),
     ]
-    print(f'Training {args.algo.upper()} for {args.timesteps:,} steps with {n_envs} envs '
-          f'-> {run_dir}', flush=True)
+    print(f'Training {args.algo.upper()} for {args.timesteps:,} steps with {n_envs} envs on '
+          f'{os.path.relpath(args.map)} -> {run_dir}', flush=True)
     try:
         model.learn(total_timesteps=args.timesteps, callback=callbacks, tb_log_name='tb',
                     progress_bar=False)

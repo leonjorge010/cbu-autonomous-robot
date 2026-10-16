@@ -54,7 +54,8 @@ def test_turning_beside_a_close_wall_is_blocked():
 @pytest.mark.parametrize('yaw', [0.0, 0.6])
 def test_wrapped_env_never_hits_the_end_wall(yaw):
     env = safety.SafetyWrapper(HallwayRaycastEnv(range_noise=False))
-    env.reset(seed=0, options={'spawn': (25.0, 0.0, yaw), 'goal': spec.DOOR_GOALS['door_101']})
+    door_101 = env.unwrapped.map.goals['door_101']
+    env.reset(seed=0, options={'spawn': (25.0, 0.0, yaw), 'goal': door_101})
     for _ in range(200):
         _, _, terminated, _, info = env.step(np.array([1.0, 0.0]))
         assert not info['collided']

@@ -85,19 +85,6 @@ COLLISION_PENALTY = 20.0
 PROXIMITY_DISTANCE = 0.30
 PROXIMITY_WEIGHT = 0.5
 
-# Fixed evaluation goals: the corridor centerline in front of each door in
-# cash_sim/worlds/hallway.sdf (world frame == map frame).
-DOOR_GOALS = {
-    'door_101': (4.0, 0.0),
-    'door_105': (7.0, 0.0),
-    'door_102': (9.0, 0.0),
-    'door_103': (20.0, 0.0),
-    'door_104': (24.0, 0.0),
-    'door_201': (14.0, 6.0),
-    'door_202': (14.0, 9.0),
-}
-SPAWN_POSE = (0.0, 0.0, 0.0)  # sim.launch.py's default x, y, yaw
-
 
 def observation_space():
     low = np.concatenate([np.zeros(N_OBS_BEAMS), [0.0, -1.0, -1.0], [-1.0, -1.0]])

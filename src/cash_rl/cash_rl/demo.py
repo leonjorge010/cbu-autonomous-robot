@@ -2,17 +2,19 @@
 
     ros2 run cash_rl demo                                   # newest runs/*/best_model.zip
     ros2 run cash_rl demo --policy ~/ros2_ws/runs/<run>/best_model.zip
+    ros2 run cash_rl demo --map ~/ros2_ws/maps/cbu_floor2.yaml --lookahead 10
 
 In the window:
   left-click            place the robot (facing +x, down the corridor)
   left-drag             place it and aim it: press at the spot, release toward
                         the direction it should face
   right-click           drive to the clicked point
-  1-7                   drive to that door (numbers are shown on the map)
+  1-9                   drive to that named goal (numbers are shown on the map)
   Esc                   clear the robot
-After an episode ends, right-click (or 1-7) again to continue from where the
+After an episode ends, right-click (or 1-9) again to continue from where the
 robot stopped (an escort with several legs), or left-click to place it anew.
-Runs HallwayRaycastEnv (the 2D simulator); no ROS or Gazebo needed.
+Runs HallwayRaycastEnv (the 2D simulator); no ROS or Gazebo needed. The map and
+lookahead default to the model's training run; keep-out zones are shaded red.
 """
 import argparse
 import glob
@@ -21,12 +23,11 @@ import os
 from cash_rl import spec
 from cash_rl.raycast_env import HallwayRaycastEnv
 from cash_rl.train import runs_dir
-from cash_rl.view_env import load_trained_policy, Scene
+from cash_rl.view_env import figure_size, load_trained_policy, map_and_lookahead, Scene
 import numpy as np
 
-DOOR_KEYS = {str(i + 1): name for i, name in enumerate(sorted(spec.DOOR_GOALS))}
 HELP = ('left-click: place robot (drag to aim)  ·  right-click: destination  ·  '
-        '1-7: door  ·  Esc: clear')
+        '1-9: named goal  ·  Esc: clear')
 # A left-drag shorter than this (m) counts as a plain click: keep the default heading.
 MIN_AIM_DRAG = 0.2
 
@@ -42,29 +43,36 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--policy', help='train.py model .zip (default: newest best_model.zip)')
     parser.add_argument('--speed', type=float, default=1.5, help='playback speed multiplier')
+    parser.add_argument('--map', help="occupancy map .yaml (default: the model's run)")
+    parser.add_argument('--lookahead', type=float,
+                        help="waypoint lookahead (m) (default: the model's run)")
     args = parser.parse_args()
 
     import matplotlib.pyplot as plt
 
     model_path = os.path.expanduser(args.policy or newest_best_model())
+    args.policy = model_path
     policy = load_trained_policy(model_path)
-    env = HallwayRaycastEnv()
+    map_yaml, lookahead = map_and_lookahead(args)
+    env = HallwayRaycastEnv(map_yaml=map_yaml, lookahead=lookahead)
+    door_keys = {str(i + 1): name for i, name in enumerate(sorted(env.map.goals)[:9])}
     model_name = os.path.relpath(model_path, os.path.dirname(runs_dir()))
 
-    fig, ax = plt.subplots(figsize=(14, 6.6))
+    fig, ax = plt.subplots(figsize=figure_size(env))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.92, bottom=0.1)
     fig.canvas.manager.set_window_title(f'CBU Autonomous Robot demo — {model_name}')
     scene = Scene(ax, env, door_labels={name: f'{key}  {name}'
-                                        for key, name in DOOR_KEYS.items()})
+                                        for key, name in door_keys.items()})
     fig.text(0.04, 0.015, HELP, fontsize=9, color='0.35')
 
     # mode: 'place' -> 'aim' (left button held) -> 'ready' -> 'driving' -> 'done'
     st = {'mode': 'place', 'pose': None, 'ranges': None, 'goal': None, 'trail': [],
-          'goal_name': '', 'step': 0, 'return': 0.0, 'episode': 0,
+          'waypoint': None, 'goal_name': '', 'step': 0, 'return': 0.0, 'episode': 0,
           'text': 'Left-click to place the robot (drag to aim it)'}
 
     def redraw():
-        scene.draw(st['pose'], st['ranges'], st['goal'], st['trail'], st['text'])
+        scene.draw(st['pose'], st['ranges'], st['goal'], st['trail'], st['text'],
+                   st['waypoint'])
         fig.canvas.draw_idle()
 
     def preview(pose):
@@ -72,7 +80,8 @@ def main():
         st['ranges'] = spec.sanitize_ranges(env.raycast(st['pose']))
 
     def start_over(text='Left-click to place the robot (drag to aim it)'):
-        st.update(mode='place', pose=None, ranges=None, goal=None, trail=[], text=text)
+        st.update(mode='place', pose=None, ranges=None, goal=None, waypoint=None, trail=[],
+                  text=text)
 
     def drive_to(goal, name):
         if st['mode'] not in ('ready', 'done'):
@@ -88,7 +97,8 @@ def main():
         except RuntimeError:
             st['text'] = f"Can't drive to {name}: not reachable from here. Pick another."
             return
-        st.update(mode='driving', goal=env.goal.copy(), goal_name=name, step=0,
+        st.update(mode='driving', goal=env.goal.copy(), waypoint=env.observed_goal.copy(),
+                  goal_name=name, step=0,
                   trail=[env.pose[:2].copy()], ranges=env._ranges.copy())
         st['return'] = 0.0
 
@@ -113,11 +123,15 @@ def main():
                 st['text'] = 'Left-click to place the robot first'
             elif not env.map.is_free(*xy):
                 st['text'] = 'That spot is inside a wall — right-click open floor'
+            elif env.map.in_keepout(*xy):
+                st['text'] = 'That spot is in a keep-out zone — right-click the corridor'
             else:
                 drive_to(xy, f'point ({xy[0]:.1f}, {xy[1]:.1f})')
         elif event.button == 1 and st['mode'] != 'driving':
             if not env.map.is_free(*xy):
                 st['text'] = 'That spot is inside a wall — left-click open floor'
+            elif env.map.in_keepout(*xy):
+                st['text'] = 'That spot is in a keep-out zone — left-click the corridor'
             else:
                 start_over()
                 preview((*xy, 0.0))
@@ -140,15 +154,15 @@ def main():
             start_over('Too close to a wall there — left-click to place it again')
         else:
             st.update(mode='ready', trail=[],
-                      text='Right-click a destination, or press 1-7 for a door')
+                      text='Right-click a destination, or press 1-9 for a named goal')
         redraw()
 
     def on_key(event):
         if event.key == 'escape':
             start_over()
-        elif event.key in DOOR_KEYS and st['mode'] in ('ready', 'done'):
-            name = DOOR_KEYS[event.key]
-            drive_to(spec.DOOR_GOALS[name], name)
+        elif event.key in door_keys and st['mode'] in ('ready', 'done'):
+            name = door_keys[event.key]
+            drive_to(env.map.goals[name], name)
         redraw()
 
     def tick():
@@ -158,10 +172,12 @@ def main():
         st['step'] += 1
         st['return'] += reward
         st['pose'], st['ranges'] = env.pose.copy(), env._ranges.copy()
+        st['waypoint'] = env.observed_goal.copy()
         st['trail'].append(env.pose[:2].copy())
         outcome = ''
         if terminated or truncated:
             outcome = ('REACHED GOAL' if info['is_success']
+                       else 'KEEP-OUT ZONE' if info.get('keepout')
                        else 'COLLISION' if info['collided'] else 'TIMED OUT')
             st['mode'] = 'done'
         st['text'] = (f'goal: {st["goal_name"]}   step {st["step"]}/{env._max_steps}   '

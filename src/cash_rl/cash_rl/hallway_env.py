@@ -1,4 +1,4 @@
-"""Gymnasium environment wrapping the hallway sim over ROS 2 topics/services.
+"""Gymnasium environment wrapping the Gazebo sim over ROS 2 topics/services.
 
 Requires `sim.launch.py` (cash_sim) plus this package's bridge for the
 world-control/set-pose services and the robot's ground-truth pose already
@@ -17,7 +17,6 @@ from ros_gz_interfaces.msg import Entity, WorldControl, WorldReset
 from ros_gz_interfaces.srv import ControlWorld, SetEntityPose
 from sensor_msgs.msg import LaserScan
 
-WORLD_NAME = 'hallway'
 ROBOT_NAME = 'cash_bot'
 # sim.launch.py's hardcoded spawn z.
 SPAWN_Z = 0.02
@@ -27,20 +26,26 @@ TELEPORT_TOLERANCE = 0.1
 
 
 class HallwayEnv(gym.Env):
-    """Scan-in / cmd_vel-out environment for a single cash_bot in hallway.sdf.
+    """Scan-in / cmd_vel-out environment for a single cash_bot in a cash_sim world.
 
     Observation, action, collision and reward definitions live in cash_rl.spec,
     shared with HallwayRaycastEnv. reset(options=...) accepts 'spawn' (x, y, yaw),
-    default spec.SPAWN_POSE, and 'goal' (x, y), default a random spec.DOOR_GOALS
-    entry. Robot pose comes from Gazebo ground truth (/model/cash_bot/pose), and
-    geodesic goal distances for the reward from the SLAM map (map_yaml).
+    default the map's spawn, and 'goal' (x, y), default a random one of the map's
+    goals. Robot pose comes from Gazebo ground truth (/model/cash_bot/pose), and
+    geodesic goal distances for the reward from the map (map_yaml, default
+    occupancy_map.default_map_yaml()). The Gazebo world is named after the map
+    (maps/hallway.yaml -> world 'hallway') unless `world` is given. Keep-out zones
+    and lookahead work as in HallwayRaycastEnv.
     """
 
     metadata = {'render_modes': []}
 
-    def __init__(self, map_yaml=None):
+    def __init__(self, map_yaml=None, world=None, lookahead=None):
         super().__init__()
         self._map = OccupancyMap(map_yaml)
+        self.map = self._map
+        self._world = world or self._map.name
+        self.lookahead = lookahead
         self._owns_rclpy = not rclpy.ok()
         if self._owns_rclpy:
             rclpy.init()
@@ -54,14 +59,15 @@ class HallwayEnv(gym.Env):
             PoseStamped, f'/model/{ROBOT_NAME}/pose', self._on_pose, 10)
         self._cmd_pub = self._node.create_publisher(Twist, '/cmd_vel', 10)
         self._reset_client = self._node.create_client(
-            ControlWorld, f'/world/{WORLD_NAME}/control')
+            ControlWorld, f'/world/{self._world}/control')
         self._set_pose_client = self._node.create_client(
-            SetEntityPose, f'/world/{WORLD_NAME}/set_pose')
+            SetEntityPose, f'/world/{self._world}/set_pose')
 
         self.observation_space = spec.observation_space()
         self.action_space = spec.action_space()
 
         self.goal = np.zeros(2)
+        self.observed_goal = np.zeros(2)
         self._goal_field = None
         self._goal_distance = 0.0
         self._prev_action = np.zeros(2, dtype=np.float32)
@@ -113,9 +119,11 @@ class HallwayEnv(gym.Env):
         return self._sanitized_ranges(), self._scan_angles()
 
     def _observation(self):
+        self.observed_goal = self.goal if self.lookahead is None else \
+            self._goal_field.waypoint(self._latest_pose[0], self._latest_pose[1], self.lookahead)
         return spec.build_observation(
-            self._sanitized_ranges()[spec.OBS_BEAM_INDICES], self._latest_pose, self.goal,
-            self._prev_action)
+            self._sanitized_ranges()[spec.OBS_BEAM_INDICES], self._latest_pose,
+            self.observed_goal, self._prev_action)
 
     def _info(self, **extra):
         return {'pose': self._latest_pose.copy(), 'goal': self.goal.copy(),
@@ -124,16 +132,21 @@ class HallwayEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         options = options or {}
-        spawn = options.get('spawn', spec.SPAWN_POSE)
+        spawn = options.get('spawn', self._map.spawn)
         goal = options.get('goal')
+        if spawn is None:
+            raise ValueError(f'No spawn given and no spawn in the goals file of '
+                             f'{self._map.yaml_path}')
         if goal is None:
-            names = sorted(spec.DOOR_GOALS)
-            goal = spec.DOOR_GOALS[names[self.np_random.integers(len(names))]]
+            names = sorted(self._map.goals)
+            if not names:
+                raise ValueError(f'No goal given and no goals for {self._map.yaml_path}')
+            goal = self._map.goals[names[self.np_random.integers(len(names))]]
         self._cmd_pub.publish(Twist())
 
         if not self._reset_client.wait_for_service(timeout_sec=SCAN_WAIT_TIMEOUT):
             raise RuntimeError(
-                f'/world/{WORLD_NAME}/control service unavailable — is the '
+                f'/world/{self._world}/control service unavailable — is the '
                 'ControlWorld service bridge running? (launch/train_env.launch.py)')
         control_request = ControlWorld.Request()
         control_request.world_control = WorldControl(reset=WorldReset(model_only=True))
@@ -144,7 +157,7 @@ class HallwayEnv(gym.Env):
         # after world load (like cash_bot), so teleport it to the spawn explicitly.
         if not self._set_pose_client.wait_for_service(timeout_sec=SCAN_WAIT_TIMEOUT):
             raise RuntimeError(
-                f'/world/{WORLD_NAME}/set_pose service unavailable — is the '
+                f'/world/{self._world}/set_pose service unavailable — is the '
                 'SetEntityPose service bridge running? (launch/train_env.launch.py)')
         pose_request = SetEntityPose.Request()
         pose_request.entity = Entity(name=ROBOT_NAME, type=Entity.MODEL)
@@ -181,7 +194,8 @@ class HallwayEnv(gym.Env):
 
         ranges = self._sanitized_ranges()
         angles = self._scan_angles()
-        collided = spec.scan_hits_footprint(ranges, angles)
+        entered_keepout = bool(self._map.in_keepout(*self._latest_pose[:2]))
+        collided = spec.scan_hits_footprint(ranges, angles) or entered_keepout
         clearance = spec.scan_footprint_clearance(ranges, angles)
         goal_distance = self._goal_field(*self._latest_pose[:2])
         reward, reached = spec.step_outcome(
@@ -193,7 +207,7 @@ class HallwayEnv(gym.Env):
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
         info = self._info(min_range=float(np.min(ranges)), clearance=clearance,
-                          collided=collided, is_success=reached)
+                          collided=collided, keepout=entered_keepout, is_success=reached)
         return obs, reward, terminated, truncated, info
 
     def close(self):

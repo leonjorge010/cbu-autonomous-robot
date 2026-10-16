@@ -1,12 +1,15 @@
 from cash_rl import spec
+from cash_rl.occupancy_map import OccupancyMap
 from cash_rl.raycast_env import HallwayRaycastEnv
 from cash_rl.scripted import downhill
 from gymnasium.utils.env_checker import check_env
 import numpy as np
 import pytest
 
-DOOR_101 = spec.DOOR_GOALS['door_101']
-DOOR_202 = spec.DOOR_GOALS['door_202']
+HALLWAY = OccupancyMap()  # maps/hallway.yaml and its sidecars
+SPAWN = HALLWAY.spawn
+DOOR_101 = HALLWAY.goals['door_101']
+DOOR_202 = HALLWAY.goals['door_202']
 
 
 @pytest.fixture(scope='module')
@@ -37,7 +40,7 @@ def test_spaces_match_hallway_env_spec(env):
 def test_spawn_ranges_match_world_geometry(env):
     # At spawn (0, 0, 0) the corridor walls are 1.2 m to each side in hallway.sdf;
     # SLAM places walls to within about one map cell.
-    obs, _ = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    obs, _ = env.reset(seed=0, options={'spawn': SPAWN, 'goal': DOOR_101})
     ranges = obs[:spec.N_OBS_BEAMS] * spec.MAX_RANGE
     for angle in (-np.pi / 2, np.pi / 2):
         beam = np.argmin(np.abs(spec.OBS_BEAM_ANGLES - angle))
@@ -54,7 +57,7 @@ def test_goal_observation_is_robot_relative(env):
 
 
 def test_geodesic_distance_goes_around_the_junction_corner(env):
-    _, info = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_202})
+    _, info = env.reset(seed=0, options={'spawn': SPAWN, 'goal': DOOR_202})
     # Straight line is 16.6 m; around the branch's inner corner at (12.8, 1.2) it is
     # ~20.8 m, and the 8-connected grid overestimates by up to ~8%.
     assert 20.3 < info['goal_distance'] < 22.5
@@ -85,10 +88,10 @@ def test_driving_into_end_wall_ends_episode_with_penalty(env):
     assert 27.8 < front < 28.1
 
 
-@pytest.mark.parametrize('name', sorted(spec.DOOR_GOALS))
+@pytest.mark.parametrize('name', sorted(HALLWAY.goals))
 def test_every_door_goal_is_reachable_from_spawn(env, name):
-    goal = spec.DOOR_GOALS[name]
-    _, start = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': goal})
+    goal = HALLWAY.goals[name]
+    _, start = env.reset(seed=0, options={'spawn': SPAWN, 'goal': goal})
     total, info = drive(env, downhill)
     assert info['is_success'] and not info['collided']
     # Shaping telescopes: progress totals start distance minus the final distance.
@@ -109,7 +112,7 @@ def test_reverse_is_slower_than_forward(env):
 
 def test_noisy_scans_drop_some_beams():
     env = HallwayRaycastEnv()
-    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    env.reset(seed=0, options={'spawn': SPAWN, 'goal': DOOR_101})
     # From spawn every beam hits a wall well inside MAX_RANGE except along the corridor.
     walls = spec.sanitize_ranges(env.raycast()) < spec.MAX_RANGE - 1.0
     dropped = []
@@ -132,7 +135,7 @@ def test_footprint_clearance_geometry():
 def test_clearance_matches_corridor_walls(env):
     # Spawn faces +x in the 2.4 m corridor: the footprint's long sides are
     # 1.2 - half-width from the walls (SLAM walls are good to about a cell).
-    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    env.reset(seed=0, options={'spawn': SPAWN, 'goal': DOOR_101})
     expected = 1.2 - spec.FOOTPRINT_HALF_WIDTH
     assert env.clearance() == pytest.approx(expected, abs=2 * env.map.resolution)
     # Rotated 90 degrees the half-length faces the walls instead.
@@ -160,7 +163,7 @@ def test_driving_along_a_wall_costs_a_proximity_penalty(env, monkeypatch):
 
 
 def test_standing_still_times_out(env):
-    _, start = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    _, start = env.reset(seed=0, options={'spawn': SPAWN, 'goal': DOOR_101})
     total, info = drive(env, lambda env: np.zeros(2))
     assert not info['is_success'] and not info['collided']
     steps = spec.episode_step_limit(start['goal_distance'])
@@ -181,7 +184,7 @@ def test_random_spawns_and_goals_are_seeded_and_valid():
 
 
 def test_junction_episodes_cross_the_junction():
-    from cash_rl.raycast_env import BRANCH_MIN_Y
+    BRANCH_MIN_Y = HALLWAY.branch_min_y
     env = HallwayRaycastEnv(goal_distance_range=(1.0, 25.0), junction_prob=1.0)
     for seed in range(10):
         _, info = env.reset(seed=seed)
