@@ -31,13 +31,13 @@
 
     <model name="floor">
       <static>true</static>
-      <pose>26.587 35.886 0 0 0 0</pose>
+      <pose>25.573 30.569 0 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><plane><normal>0 0 1</normal><size>59.1 60.5</size></plane></geometry>
+          <geometry><plane><normal>0 0 1</normal><size>61.1 71.1</size></plane></geometry>
         </collision>
         <visual name="visual">
-          <geometry><plane><normal>0 0 1</normal><size>59.1 60.5</size></plane></geometry>
+          <geometry><plane><normal>0 0 1</normal><size>61.1 71.1</size></plane></geometry>
           <material>
             <ambient>0.55 0.55 0.55 1</ambient><diffuse>0.55 0.55 0.55 1</diffuse>
           </material>

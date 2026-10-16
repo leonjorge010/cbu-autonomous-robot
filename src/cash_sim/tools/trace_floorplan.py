@@ -66,6 +66,7 @@ OPEN_DOOR_LEAVES = [
     (38.8, 58.95, 39.35, 59.9),  # north corridor, south side
 ]
 SEED = (20.0, 12.0)  # a point in the south corridor
+SPAWN = (9.6, 16.8, 0.0)  # default start: the stair_1 goal in Gallery 2, facing out (east)
 # Enclosed dark blobs smaller than this are labels ("D2-6", "GALLERY 2"), not furniture.
 MIN_OBSTACLE_AREA = 0.6  # m^2
 SIMPLIFY_TOLERANCE = 0.06  # m, polygon simplification
@@ -193,6 +194,7 @@ def main():
                        'docs/cbu_floorplan.jpg by src/cash_sim/tools/trace_floorplan.py. '
                        'x east, y north, origin at the outer SW corner; meters.',
         'free_space': {'outer': outer, 'holes': holes},
+        'spawn': [round(v, 4) for v in SPAWN],
         'keepout': {k: list(v) for k, v in ZONES.items()},
         'doors': {k: [round(v[0], 2), round(v[1], 2), round(v[2], 4)] for k, v in DOORS.items()},
     }
