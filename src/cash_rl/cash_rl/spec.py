@@ -64,6 +64,15 @@ PROGRESS_WEIGHT = 10.0
 TIME_PENALTY = 0.01
 GOAL_REWARD = 10.0
 COLLISION_PENALTY = 20.0
+# Pedestrians (HallwayRaycastEnv only). Within PEDESTRIAN_COMFORT_DISTANCE (gap
+# between the disc and the margin-inflated footprint) a pedestrian yields to the
+# robot, and the robot pays up to PEDESTRIAN_PROXIMITY_PENALTY per pedestrian per
+# step, rising linearly from 0 at the edge of that zone to the full amount at
+# contact. Hitting a pedestrian costs PEDESTRIAN_COLLISION_PENALTY instead of
+# COLLISION_PENALTY.
+PEDESTRIAN_COMFORT_DISTANCE = 0.8
+PEDESTRIAN_PROXIMITY_PENALTY = 0.3
+PEDESTRIAN_COLLISION_PENALTY = 40.0
 
 # Fixed evaluation goals: the corridor centerline in front of each door in
 # cash_sim/worlds/hallway.sdf (world frame == map frame).
@@ -158,19 +167,34 @@ def episode_step_limit(goal_distance):
     return int(np.ceil(seconds / CONTROL_PERIOD))
 
 
-def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided):
+def pedestrian_proximity_penalty(pedestrian_gaps):
+    """Return the step's total penalty for pedestrians within the comfort zone.
+
+    pedestrian_gaps are distances (m) from each pedestrian's edge to the
+    margin-inflated footprint; negative (overlap) counts as contact.
+    """
+    gaps = np.asarray(pedestrian_gaps, dtype=np.float64)
+    closeness = np.clip(1.0 - gaps / PEDESTRIAN_COMFORT_DISTANCE, 0.0, 1.0)
+    return PEDESTRIAN_PROXIMITY_PENALTY * float(closeness.sum())
+
+
+def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
+                 pedestrian_gaps=(), hit_pedestrian=False):
     """Return (reward, reached) for one step.
 
     goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
     the traversable map) counts as no progress. Reaching is Euclidean, within
-    GOAL_TOLERANCE, and doesn't count on a colliding step.
+    GOAL_TOLERANCE, and doesn't count on a colliding step. pedestrian_gaps adds
+    the proximity penalty; a collision with hit_pedestrian set costs
+    PEDESTRIAN_COLLISION_PENALTY instead of COLLISION_PENALTY.
     """
     progress = goal_distance - prev_goal_distance
     progress = 0.0 if not np.isfinite(progress) else -progress
     reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
-    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY
+    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY \
+        - pedestrian_proximity_penalty(pedestrian_gaps)
     if reached:
         reward += GOAL_REWARD
     if collided:
-        reward -= COLLISION_PENALTY
+        reward -= PEDESTRIAN_COLLISION_PENALTY if hit_pedestrian else COLLISION_PENALTY
     return reward, reached

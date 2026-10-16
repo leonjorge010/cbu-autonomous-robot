@@ -1,6 +1,7 @@
 from cash_rl import spec
 from cash_rl.raycast_env import BRANCH_MIN_Y, HallwayRaycastEnv
-from cash_rl.raycast_env import PEDESTRIAN_RADIUS, PEDESTRIAN_SPEED_RANGE
+from cash_rl.raycast_env import PEDESTRIAN_RADIUS, PEDESTRIAN_SLOW_FACTOR
+from cash_rl.raycast_env import PEDESTRIAN_SPEED_RANGE, PEDESTRIAN_TURN_DISTANCE
 from cash_rl.raycast_env import PEDESTRIAN_WALL_CLEARANCE
 from cash_rl.scripted import downhill
 from gymnasium.utils.env_checker import check_env
@@ -200,11 +201,68 @@ def test_pedestrian_touching_footprint_is_a_collision():
     assert not env.collides()
 
 
-def test_pedestrian_walking_into_robot_ends_episode():
-    env, _ = pedestrian_env((2.0, 0.0), velocity=(-1.0, 0.0))
-    total, info = drive(env, lambda env: np.zeros(2))
-    assert info['collided'] and not info['is_success']
-    assert total < -spec.COLLISION_PENALTY + 1.0
+def test_pedestrian_heading_for_parked_robot_turns_back():
+    env, _ = pedestrian_env((3.0, 0.0), velocity=(-1.0, 0.0))
+    total, gaps = 0.0, []
+    for _ in range(60):
+        _, reward, terminated, _, info = env.step(np.zeros(2))
+        total += reward
+        gaps.append(info['min_pedestrian_gap'])
+        assert not terminated
+    assert min(gaps) >= PEDESTRIAN_TURN_DISTANCE - 0.1 * PEDESTRIAN_SLOW_FACTOR * 1.0
+    assert env._pedestrian_velocities[0, 0] > 0  # walking away now
+    # Its approach cost the robot more than the time penalty alone.
+    assert total < -spec.TIME_PENALTY * 60 - 0.5
+
+
+def test_pedestrian_slows_only_when_approaching_inside_comfort_zone():
+    front = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + PEDESTRIAN_RADIUS
+    inside = front + (PEDESTRIAN_TURN_DISTANCE + spec.PEDESTRIAN_COMFORT_DISTANCE) / 2
+    for velocity, expected_speed in (((-1.0, 0.0), PEDESTRIAN_SLOW_FACTOR),  # toward
+                                     ((1.0, 0.0), 1.0)):                     # away
+        env, _ = pedestrian_env((inside, 0.0), velocity=velocity)
+        before = env.pedestrians[0].copy()
+        env.step(np.zeros(2))
+        moved = np.hypot(*(env.pedestrians[0] - before))
+        assert moved == pytest.approx(expected_speed * spec.CONTROL_PERIOD)
+    # Approaching but still outside the comfort zone: full speed.
+    far = front + spec.PEDESTRIAN_COMFORT_DISTANCE + 0.5
+    env, _ = pedestrian_env((far, 0.0), velocity=(-1.0, 0.0))
+    env.step(np.zeros(2))
+    assert env.pedestrians[0, 0] == pytest.approx(far - spec.CONTROL_PERIOD)
+
+
+def test_driving_into_pedestrian_costs_more_than_a_wall():
+    env, _ = pedestrian_env((2.0, 0.0))  # standing still, so it never yields
+    total, info = drive(env, lambda env: np.array([1.0, 0.0]))
+    assert info['collided'] and info['hit_pedestrian'] and not info['is_success']
+    # Progress (< 2 m) can't offset the penalty; the proximity penalty adds to it.
+    assert total < -spec.PEDESTRIAN_COLLISION_PENALTY + spec.PROGRESS_WEIGHT * 2.0
+    assert spec.PEDESTRIAN_COLLISION_PENALTY > spec.COLLISION_PENALTY
+
+
+def test_wall_collision_is_not_a_pedestrian_hit():
+    env = HallwayRaycastEnv(range_noise=False, n_pedestrians=2)
+    env.reset(seed=0, options={'spawn': (26.5, 0.0, 0.0), 'goal': DOOR_101})
+    env.pedestrians[:] = (5.0, 0.0)
+    env._pedestrian_velocities[:] = 0.0
+    _, info = drive(env, lambda env: np.array([1.0, 0.0]))
+    assert info['collided'] and not info['hit_pedestrian']
+
+
+def test_pedestrian_proximity_penalty_ramps_to_contact():
+    comfort = spec.PEDESTRIAN_COMFORT_DISTANCE
+    full = spec.PEDESTRIAN_PROXIMITY_PENALTY
+    assert spec.pedestrian_proximity_penalty([]) == 0.0
+    assert spec.pedestrian_proximity_penalty([comfort, comfort + 1]) == 0.0
+    assert spec.pedestrian_proximity_penalty([comfort / 2]) == pytest.approx(full / 2)
+    assert spec.pedestrian_proximity_penalty([0.0, -0.1]) == pytest.approx(2 * full)
+    # Without pedestrian arguments step_outcome is unchanged (HallwayEnv's case).
+    pose, goal = (0.0, 0.0, 0.0), (5.0, 0.0)
+    assert spec.step_outcome(5.0, 4.0, pose, goal, True)[0] == pytest.approx(
+        spec.PROGRESS_WEIGHT - spec.TIME_PENALTY - spec.COLLISION_PENALTY)
+    assert spec.step_outcome(5.0, 4.0, pose, goal, True, [-0.1], True)[0] == pytest.approx(
+        spec.PROGRESS_WEIGHT - spec.TIME_PENALTY - full - spec.PEDESTRIAN_COLLISION_PENALTY)
 
 
 def test_pedestrians_walk_the_corridors_clear_of_walls():

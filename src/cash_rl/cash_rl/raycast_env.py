@@ -10,9 +10,11 @@ The map frame is aligned with the Gazebo world frame (SLAM was started at the
 spawn pose), so poses here are world coordinates from hallway.sdf.
 
 Optional pedestrians (n_pedestrians, default 0) are discs that walk up and down
-the corridors at constant speed, turning back at walls and obstacles; they block
-beams and count for collisions, but ignore the robot and each other. They exist
-only here, not in Gazebo.
+the corridors, turning back at walls and obstacles. One heading toward the robot
+slows down once it is within spec.PEDESTRIAN_COMFORT_DISTANCE and turns back if
+it gets within PEDESTRIAN_TURN_DISTANCE; they ignore each other. They block
+beams and count for collisions, and the robot is penalized for coming close
+(spec.step_outcome). They exist only here, not in Gazebo.
 """
 from cash_rl import spec
 from cash_rl.occupancy_map import OccupancyMap
@@ -38,6 +40,11 @@ PEDESTRIAN_SPEED_RANGE = (0.8, 1.4)
 PEDESTRIAN_WALL_CLEARANCE = PEDESTRIAN_RADIUS + 0.05
 # Pedestrians start at least this far from the robot's spawn.
 PEDESTRIAN_SPAWN_DISTANCE = 2.0
+# A pedestrian heading toward the robot walks at this fraction of its speed
+# inside spec.PEDESTRIAN_COMFORT_DISTANCE, and turns back inside
+# PEDESTRIAN_TURN_DISTANCE (both gaps to the margin-inflated footprint).
+PEDESTRIAN_SLOW_FACTOR = 0.3
+PEDESTRIAN_TURN_DISTANCE = 0.3
 
 
 def _rectangle_perimeter(half_length, half_width, spacing):
@@ -136,25 +143,30 @@ class HallwayRaycastEnv(gym.Env):
         return np.where(ok, self.map.clearance[np.clip(row, 0, self.map.height - 1),
                                                np.clip(col, 0, self.map.width - 1)], 0.0)
 
-    def _pedestrian_hits(self, pose, inflation=0.0):
-        """Return True if a pedestrian overlaps the footprint (grown by inflation)."""
-        if len(self.pedestrians) == 0:
-            return False
-        x, y, yaw = pose
+    def pedestrian_gaps(self, pose=None):
+        """Return each pedestrian's edge distance (m) to the inflated footprint at `pose`.
+
+        Negative means overlap (a collision).
+        """
+        x, y, yaw = self.pose if pose is None else pose
         c, s = np.cos(yaw), np.sin(yaw)
         dx, dy = self.pedestrians[:, 0] - x, self.pedestrians[:, 1] - y
         # Pedestrian centers in the robot frame, then distance to the rectangle.
         local_x, local_y = c * dx + s * dy, -s * dx + c * dy
-        half_length = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + inflation
-        half_width = spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + inflation
-        gap = np.hypot(np.maximum(np.abs(local_x) - half_length, 0.0),
-                       np.maximum(np.abs(local_y) - half_width, 0.0))
-        return bool(np.any(gap < PEDESTRIAN_RADIUS))
+        half_length = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN
+        half_width = spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN
+        center_gap = np.hypot(np.maximum(np.abs(local_x) - half_length, 0.0),
+                              np.maximum(np.abs(local_y) - half_width, 0.0))
+        return center_gap - PEDESTRIAN_RADIUS
+
+    def hits_pedestrian(self, pose=None):
+        """Return True if a pedestrian overlaps the inflated footprint at `pose`."""
+        return bool(np.any(self.pedestrian_gaps(pose) < 0.0))
 
     def collides(self, pose=None):
         """Return True if the inflated footprint at `pose` hits the map or a pedestrian."""
         pose = self.pose if pose is None else pose
-        return self._outline_hits(self._collision_outline, pose) or self._pedestrian_hits(pose)
+        return self._outline_hits(self._collision_outline, pose) or self.hits_pedestrian(pose)
 
     def raycast(self, pose=None):
         """Noise-free ranges (m) of the N_OBS_BEAMS observed beams from `pose`.
@@ -244,10 +256,22 @@ class HallwayRaycastEnv(gym.Env):
         self._pedestrian_velocities = np.array(velocities).reshape(-1, 2)
 
     def _move_pedestrians(self, dt):
-        """Advance pedestrians by dt; one that would get too close to a wall turns back."""
+        """Advance pedestrians by dt, yielding to the robot and turning back at walls.
+
+        _pedestrian_velocities hold each one's walking velocity; a pedestrian
+        heading toward the robot turns back inside PEDESTRIAN_TURN_DISTANCE and
+        walks at PEDESTRIAN_SLOW_FACTOR of it inside the comfort distance.
+        """
         if len(self.pedestrians) == 0:
             return
-        ahead = self.pedestrians + self._pedestrian_velocities * dt
+        gaps = self.pedestrian_gaps()
+        to_robot = self.pose[:2] - self.pedestrians
+        approaching = np.einsum('ij,ij->i', self._pedestrian_velocities, to_robot) > 0
+        turn = approaching & (gaps < PEDESTRIAN_TURN_DISTANCE)
+        self._pedestrian_velocities[turn] *= -1.0
+        slow = approaching & ~turn & (gaps < spec.PEDESTRIAN_COMFORT_DISTANCE)
+        speed_factor = np.where(slow, PEDESTRIAN_SLOW_FACTOR, 1.0)[:, None]
+        ahead = self.pedestrians + self._pedestrian_velocities * speed_factor * dt
         blocked = self._clearance_at(ahead[:, 0], ahead[:, 1]) < PEDESTRIAN_WALL_CLEARANCE
         self._pedestrian_velocities[blocked] *= -1.0
         self.pedestrians[~blocked] = ahead[~blocked]
@@ -328,17 +352,21 @@ class HallwayRaycastEnv(gym.Env):
         self._step_count += 1
         self._prev_action = action
 
-        collided = self.collides()
+        gaps = self.pedestrian_gaps()
+        hit_pedestrian = bool(np.any(gaps < 0.0))
+        collided = hit_pedestrian or self._outline_hits(self._collision_outline, self.pose)
         goal_distance = self._goal_field(*self.pose[:2])
         reward, reached = spec.step_outcome(
-            self._goal_distance, goal_distance, self.pose, self.goal, collided)
+            self._goal_distance, goal_distance, self.pose, self.goal, collided,
+            pedestrian_gaps=gaps, hit_pedestrian=hit_pedestrian)
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observe()
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
         info = self._info(min_range=float(np.min(self._ranges)), collided=collided,
-                          is_success=reached)
+                          hit_pedestrian=hit_pedestrian, is_success=reached,
+                          min_pedestrian_gap=float(gaps.min()) if len(gaps) else np.inf)
         return obs, reward, terminated, truncated, info
 
     def render(self):
