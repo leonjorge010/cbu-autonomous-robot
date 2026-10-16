@@ -53,7 +53,7 @@ def main():
 
     fig, ax = plt.subplots(figsize=(14, 6.6))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.92, bottom=0.1)
-    fig.canvas.manager.set_window_title(f'C.A.$.H demo — {model_name}')
+    fig.canvas.manager.set_window_title(f'CBU Autonomous Robot demo — {model_name}')
     scene = Scene(ax, env, door_labels={name: f'{key}  {name}'
                                         for key, name in DOOR_KEYS.items()})
     fig.text(0.04, 0.015, HELP, fontsize=9, color='0.35')

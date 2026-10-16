@@ -22,7 +22,7 @@ setup(
     zip_safe=True,
     maintainer='Jorge Leon Duran',
     maintainer_email='115505677+leonjorge010@users.noreply.github.com',
-    description='Gazebo hallway simulation and robot model for the C.A.$.H escort robot',
+    description='Gazebo hallway simulation and robot model for the CBU Autonomous Robot',
     license='MIT',
     extras_require={'test': ['pytest']},
     entry_points={'console_scripts': []},

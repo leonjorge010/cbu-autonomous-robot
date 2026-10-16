@@ -30,6 +30,7 @@ SPAWN_CLEARANCE = 0.15
 # Random goals sit on cells at least this far from any obstacle.
 GOAL_CLEARANCE = 0.5
 DEFAULT_GOAL_DISTANCE_RANGE = (1.0, 15.0)
+SAFETY_SCAN_ANGLES = np.linspace(-np.pi, np.pi, 360, endpoint=False)
 # hallway.sdf: the main corridor spans |y| <= 1.2 m; the side branch rises in +y
 # from the junction at x = 14 m. Cells above this line count as the branch.
 BRANCH_MIN_Y = 1.5
@@ -78,9 +79,10 @@ class HallwayRaycastEnv(gym.Env):
     the episode needs the turn. For evaluation matching HallwayEnv, pass
     spec.SPAWN_POSE and one of spec.DOOR_GOALS. map_yaml defaults to
     occupancy_map.default_map_yaml(); range_noise adds the URDF's Gaussian range
-    noise; render_mode is None or 'rgb_array'. n_pedestrians adds that many
-    pedestrians (see the module docstring), placed at random on every reset; their
-    positions are in `pedestrians` (n, 2) after reset/step.
+    noise and spec.BEAM_DROPOUT_PROB missing returns; render_mode is None or 'rgb_array'.
+    n_pedestrians adds that many pedestrians (see the module docstring), placed at
+    random on every reset; their positions are in `pedestrians` (n, 2) after
+    reset/step.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
@@ -109,6 +111,8 @@ class HallwayRaycastEnv(gym.Env):
         self._collision_outline = _rectangle_perimeter(
             spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN,
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN, self._ray_step)
+        self._footprint_outline = _rectangle_perimeter(
+            spec.FOOTPRINT_HALF_LENGTH, spec.FOOTPRINT_HALF_WIDTH, self.map.resolution / 2)
         self._spawn_outline = _rectangle_perimeter(
             spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
@@ -174,8 +178,24 @@ class HallwayRaycastEnv(gym.Env):
         pose = self.pose if pose is None else pose
         return self._outline_hits(self._collision_outline, pose) or self.hits_pedestrian(pose)
 
-    def raycast(self, pose=None):
-        """Noise-free ranges (m) of the N_OBS_BEAMS observed beams from `pose`.
+    def clearance(self, pose=None):
+        """Gap (m) between the footprint at `pose` and the nearest map obstacle.
+
+        Map clearance (cell center to nearest obstacle cell center) sampled along
+        the footprint edge, so accurate to about half a cell.
+        """
+        x, y, yaw = self.pose if pose is None else pose
+        c, s = np.cos(yaw), np.sin(yaw)
+        outline = self._footprint_outline
+        row, col = self.map.to_cell(x + c * outline[:, 0] - s * outline[:, 1],
+                                    y + s * outline[:, 0] + c * outline[:, 1])
+        inside = (row >= 0) & (row < self.map.height) & (col >= 0) & (col < self.map.width)
+        if not np.all(inside):
+            return 0.0
+        return float(np.min(self.map.clearance[row, col]))
+
+    def raycast(self, pose=None, angles=None):
+        """Noise-free ranges (m) of the N_OBS_BEAMS observed beams (or `angles`) from `pose`.
 
         Mirrors gpu_lidar: no return within MAX_RANGE -> +inf; a hit closer than
         MIN_RANGE -> -inf. Pedestrians block beams like walls. Pass through
@@ -185,8 +205,10 @@ class HallwayRaycastEnv(gym.Env):
         c, s = np.cos(yaw), np.sin(yaw)
         lidar_x = x + c * spec.LIDAR_X
         lidar_y = y + s * spec.LIDAR_X
-        beam_cos = c * self._beam_cos - s * self._beam_sin
-        beam_sin = s * self._beam_cos + c * self._beam_sin
+        local_cos, local_sin = (self._beam_cos, self._beam_sin) if angles is None \
+            else (np.cos(angles), np.sin(angles))
+        beam_cos = c * local_cos - s * local_sin
+        beam_sin = s * local_cos + c * local_sin
         px = lidar_x + beam_cos[:, None] * self._ray_ts[None, :]
         py = lidar_y + beam_sin[:, None] * self._ray_ts[None, :]
         blocked = ~self.map.is_free(px, py)
@@ -207,6 +229,19 @@ class HallwayRaycastEnv(gym.Env):
             t = np.where(disc >= 0, t, np.inf).min(axis=1)
             ranges = np.where(t <= spec.MAX_RANGE, np.minimum(ranges, t), ranges)
         return np.where(ranges < spec.MIN_RANGE, -np.inf, ranges)
+
+    def safety_scan(self):
+        """(ranges, angles) of a dense noisy scan for safety.limit_command.
+
+        SAFETY_SCAN_BEAMS evenly spaced beams (1 deg) rather than the real 2160, to
+        keep raycasting cheap; at the < 1 m distances that matter they are < 2 cm apart.
+        """
+        ranges = self.raycast(angles=SAFETY_SCAN_ANGLES)
+        if self.range_noise:
+            finite = np.isfinite(ranges)
+            ranges[finite] += self.np_random.normal(
+                0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
+        return spec.sanitize_ranges(ranges), SAFETY_SCAN_ANGLES
 
     def _cell_y(self, rows):
         return self.map.origin[1] + (rows + 0.5) * self.map.resolution
@@ -324,6 +359,7 @@ class HallwayRaycastEnv(gym.Env):
             finite = np.isfinite(ranges)
             ranges[finite] += self.np_random.normal(
                 0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
+            ranges[self.np_random.random(len(ranges)) < spec.BEAM_DROPOUT_PROB] = np.inf
         self._ranges = spec.sanitize_ranges(ranges)
         self._scan_stack = spec.new_scan_stack(self._ranges) if new_episode \
             else spec.push_scan(self._scan_stack, self._ranges)
@@ -394,17 +430,19 @@ class HallwayRaycastEnv(gym.Env):
         gaps = self.pedestrian_gaps()
         hit_pedestrian = bool(np.any(gaps < 0.0))
         collided = hit_pedestrian or self._outline_hits(self._collision_outline, self.pose)
+        clearance = self.clearance()
         goal_distance = self._goal_field(*self.pose[:2])
         reward, reached = spec.step_outcome(
-            self._goal_distance, goal_distance, self.pose, self.goal, collided,
+            self._goal_distance, goal_distance, self.pose, self.goal, collided, clearance,
             pedestrian_gaps=gaps, hit_pedestrian=hit_pedestrian)
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observe()
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
-        info = self._info(min_range=float(np.min(self._ranges)), collided=collided,
-                          hit_pedestrian=hit_pedestrian, is_success=reached,
+        info = self._info(min_range=float(np.min(self._ranges)), clearance=clearance,
+                          collided=collided, hit_pedestrian=hit_pedestrian,
+                          is_success=reached,
                           min_pedestrian_gap=float(gaps.min()) if len(gaps) else np.inf)
         return obs, reward, terminated, truncated, info
 

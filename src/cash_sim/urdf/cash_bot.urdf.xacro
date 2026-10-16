@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!--
-  C.A.$.H simulation robot: differential drive base + 2D 360° LiDAR.
+  CBU Autonomous Robot simulation model: differential drive base + 2D 360° LiDAR.
   Dimensions are placeholders. Update them to match the real chassis.
 -->
 <robot name="cash_bot" xmlns:xacro="http://www.ros.org/wiki/xacro">
@@ -24,7 +24,8 @@
   <xacro:property name="lidar_radius" value="0.035"/>
   <xacro:property name="lidar_height" value="0.04"/>
   <xacro:property name="lidar_x"      value="0.05"/>
-  <xacro:property name="lidar_range"  value="12.0"/>
+  <!-- LiDAR: LDROBOT STL-27L (D800 kit); keep the sensor block below in sync with cash_rl/spec.py -->
+  <xacro:property name="lidar_range"  value="25.0"/>
 
   <!-- ===== Inertia helpers ===== -->
   <xacro:macro name="box_inertia" params="m x y z">
@@ -185,7 +186,7 @@
       <lidar>
         <scan>
           <horizontal>
-            <samples>360</samples>
+            <samples>2160</samples>
             <resolution>1</resolution>
             <min_angle>-3.14159</min_angle>
             <max_angle>3.14159</max_angle>
@@ -198,14 +199,14 @@
           </vertical>
         </scan>
         <range>
-          <min>0.15</min>
+          <min>0.03</min>
           <max>${lidar_range}</max>
           <resolution>0.01</resolution>
         </range>
         <noise>
           <type>gaussian</type>
           <mean>0.0</mean>
-          <stddev>0.01</stddev>
+          <stddev>0.015</stddev>
         </noise>
       </lidar>
     </sensor>

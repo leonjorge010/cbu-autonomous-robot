@@ -1,4 +1,4 @@
-"""Gymnasium environment wrapping the C.A.$.H hallway sim over ROS 2 topics/services.
+"""Gymnasium environment wrapping the hallway sim over ROS 2 topics/services.
 
 Requires `sim.launch.py` (cash_sim) plus this package's bridge for the
 world-control/set-pose services and the robot's ground-truth pose already
@@ -109,6 +109,10 @@ class HallwayEnv(gym.Env):
         scan = self._latest_scan
         return scan.angle_min + np.arange(len(scan.ranges)) * scan.angle_increment
 
+    def safety_scan(self):
+        """(ranges, angles) of the latest full scan for safety.limit_command."""
+        return self._sanitized_ranges(), self._scan_angles()
+
     def _observation(self, new_episode=False):
         """Push the latest scan onto the stack (or start one) and build the observation."""
         obs_ranges = self._sanitized_ranges()[spec.OBS_BEAM_INDICES]
@@ -180,17 +184,20 @@ class HallwayEnv(gym.Env):
         self._prev_action = action
 
         ranges = self._sanitized_ranges()
-        collided = spec.scan_hits_footprint(ranges, self._scan_angles())
+        angles = self._scan_angles()
+        collided = spec.scan_hits_footprint(ranges, angles)
+        clearance = spec.scan_footprint_clearance(ranges, angles)
         goal_distance = self._goal_field(*self._latest_pose[:2])
         reward, reached = spec.step_outcome(
-            self._goal_distance, goal_distance, self._latest_pose, self.goal, collided)
+            self._goal_distance, goal_distance, self._latest_pose, self.goal, collided,
+            clearance)
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observation()
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
-        info = self._info(min_range=float(np.min(ranges)), collided=collided,
-                          is_success=reached)
+        info = self._info(min_range=float(np.min(ranges)), clearance=clearance,
+                          collided=collided, is_success=reached)
         return obs, reward, terminated, truncated, info
 
     def close(self):

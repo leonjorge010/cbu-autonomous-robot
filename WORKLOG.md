@@ -3,6 +3,120 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-16
+
+**Real floor plan → sim world** (TEGR 2nd floor, from a phone photo of the printed plan, `docs/cbu_floorplan.jpg`)
+- `src/cash_sim/tools/trace_floorplan.py`: perspective-corrects the photo from the building's 4 outer
+  corners, scales it with the plan's 0–40 ft bar (40 ft = 415 px, 2.94 cm/px; building 61 × 72 m),
+  extracts the thick wall lines, and keeps the walkable area inside hand-placed corridor rectangles
+  whose edges sit on the wall lines, so every doorway is closed. Label text is removed; three door
+  leaves drawn swung open into the corridor are cleared (modeled shut).
+- Measured corridor widths: south (201–205) ~2.3 m, west (228–230) ~3.0–3.2 m, north (221–226) ~2.3 m.
+  Narrower than the 3 m guessed by eye; the sim hallway is 2.4 m.
+- Result `src/cash_sim/worlds/cbu_floor2_layout.yaml`: 594 m² of free space (corridors, Gallery 2,
+  women's restroom vestibule, alcove outside 228, Elevator 2 lobby), the counter in Learning Zone 3,
+  keep-out rectangles for Learning Zones 2/3/4 (open to the corridor, so traced as open space), and
+  24 door goals on the corridor centerline facing each door.
+- Fixed the Gallery 2 corner (spotted against the plan): Stair 1 has no wall on the gallery side, so
+  its flights are now open space + keep-out (one flight goes down; a 2D LiDAR can't see a drop, so the
+  real robot must rely on the keep-out), the stair core is an obstacle, and `elevator_1`/`stair_1`
+  goals were added (26 total). Elevator 1's door faces the west end of the 201–205 corridor.
+- `src/cash_sim/tools/build_floorplan_world.py` turns the layout into `worlds/cbu_floor2.sdf`
+  (329 wall boxes, `gz sdf -k` valid), `maps/cbu_floor2.{pgm,yaml}` and the Nav2 keepout mask
+  `maps/cbu_floor2_keepout.{pgm,yaml}`. Wall boxes vs. traced polygon: 20 of 143k sample points
+  overlap (sharp corners); the map matches to within one 5 cm cell.
+- `sim.launch.py` has a `world` argument: `world:=cbu_floor2 x:=14.1 y:=30 yaw:=1.57` spawns in the
+  west corridor.
+- Checked with the existing code (`CASH_MAP_YAML=maps/cbu_floor2.yaml`): one connected traversable
+  area, every door ≥ 0.65 m from walls, geodesic field 36 ms/goal, `downhill` reaches 40/40 random
+  goals and crosses the building (west corridor → 221/205/elevator_2) with no collisions.
+
+**Open**
+- Not checked in Gazebo yet (needs a run: `ros2 launch cash_sim sim.launch.py world:=cbu_floor2
+  gui:=true rviz:=false x:=14.1 y:=30 yaw:=1.57`).
+- In person: tape one corridor width (fixes the ±2–5% photo scale); what the atrium edge is (glass
+  railing would give no LiDAR returns); whether TEGR 214/216 have corridor doors (their main doors
+  face Learning Zone 3, so their goals sit at the zone opening); restroom door positions; what the
+  "D2-x" wall items are.
+- Env support for this map: keep-out zones in spawn/goal sampling and the geodesic (a virtual wall),
+  per-map door goals and spawn instead of `spec.DOOR_GOALS`/`SPAWN_POSE`, and the hallway-specific
+  junction sampling (`BRANCH_MIN_Y`). Goals can now be up to ~85 m away, past
+  `MAX_GOAL_DISTANCE` (30 m), so long escorts should be chained through waypoints.
+
+## 2026-10-15
+
+**Sharing with the team**
+- Rewrote the README around the pipeline, first-time setup and how to run. Added
+  `requirements.txt` and the missing matplotlib dependency so a fresh clone works.
+- Published the 10-14 models as GitHub release `models-2026-10-14`, and gave the repo a
+  description and topics. Renamed the project to "CBU Autonomous Robot" in all prose (code names
+  `cash_*` unchanged).
+- Added `docs/MODELS.md`, a comparison of every model with all hyperparameters, learning curves and
+  held-out results.
+
+**Validation**
+- `ppo_junction` reached 7/7 doors in Gazebo with no collisions; returns within 0.5 of 2D.
+
+**Task changes** (all models before this need retraining)
+- Real LiDAR: the robot uses an LDROBOT D800 kit (STL-27L). Sim sensor now has 2160 points, 0.03–25 m
+  and 1.5 cm noise. The policy sees ranges clipped to 10 m, the sensor's range on dark surfaces.
+  Training drops 3% of beams to mimic glass.
+- Slow reverse: max reverse 0.15 m/s (forward 0.5). Reversing fell from ~51% to ~9% of steps.
+- Near-wall path cost: the path distance used by the reward ran 0.25 m from corners, inside the
+  0.295 m collision boundary. Cells within 0.6 m of a wall now cost extra, so the route rounds
+  corners at 0.46 m.
+
+**Training** (PPO, 1.5M steps each, same hyperparameters as before)
+- `ppo_d800` (real LiDAR + slow reverse): 200 held-out goals 93.0% success / 7.0% collisions
+  (final model). 12 of 14 collisions clipped the junction's east corner.
+- `ppo_d800_wallcost` (+ near-wall cost): 92.0% / 5.5% (best). East-corner hits fell from 12 to 3, but
+  collisions moved to the west corner, always at full speed. Reached 90% eval at 0.4M steps
+  (`ppo_junction`: 0.9M).
+- `ppo_d800_prox` (+ proximity penalty: up to 0.5 per step when the footprint is within 0.3 m of an
+  obstacle): **96.5% / 3.0% / 8.4% reversing** (best), matching `ppo_junction`'s 96% / 3% on the
+  harder task. Corner hits fell from 9 to 3; the 6 left are 2 fountain, 3 corners and 1 end wall.
+  Trained in 11 min with the CPU to itself. 100% on every periodic eval from 1.2M steps.
+  Gazebo (STL-27L sensor model): 7/7 doors, no collisions, returns within 0.3 of 2D.
+- Seeds 1 and 2 of `ppo_d800_prox`: across 3 seeds, **93.4 ± 2.8% success, 4.2 ± 1.5% collisions**,
+  so seed 0 was lucky. Seed 2 mostly times out 0.4–1.1 m from the goal, moving back and forth.
+  The "best" checkpoint (27-episode eval) is often worse than the final one.
+- Released all three as `models-2026-10-15`.
+
+**Safety layer** (`cash_rl/safety.py`, `evaluate --safety`)
+- Simulates each command over the stopping time and falls back to gentler commands if the footprint
+  would come within 10 cm of a scan point. On 3 seeds × 200 goals, collisions went from 4.2% to 0.7%;
+  success went from 93.5% to 94.3%; it overrode 3.2% of steps. Collisions mostly became timeouts.
+- Gazebo (2160-beam scan): 7/7 doors with no interventions. Driving full speed at the end wall, it
+  stopped 10.2 cm and 10.4 cm from the wall; without it, both runs collided.
+- Started a 3-seed run with 3M steps, linear LR decay (`--lr-schedule linear`) and a 100-goal
+  periodic eval, but stopped it at 15% of seed 0 for time. To restart:
+  `for s in 0 1 2; do ros2 run cash_rl train --name ppo_lr3m_s$s --seed $s --timesteps 3000000 --lr-schedule linear --eval-random 100 --goal-distance-range 1 25 --junction-prob 0.3; done`
+  (~30 min per seed with nothing else running).
+
+**Lessons**
+- Don't run two trainings or several evaluations at once. PyTorch takes all 22 threads per process,
+  and two runs stalled for 15 min. Use `OMP_NUM_THREADS=1` for parallel evaluations.
+- The 27-episode periodic eval can't rank models (100% there, 90–93% on 200 goals).
+
+**Open**
+- Restart the 3M + LR-decay experiment (above). Then try the robot's measured velocity and 72
+  beams as inputs, and a larger time penalty for the final-approach stalls (seed 2).
+- Safety layer as a ROS node between the policy and `/cmd_vel` for the robot.
+- Generalize beyond this one hallway. The sim hallway is invented, so the real CBU building is
+  itself a new map.
+  - Carries over unchanged: the sensor model, reward, PPO settings, tools and the safety layer.
+  - Per new map: a SLAM map (~20–30 min drive), `CASH_MAP_YAML`, goal/door list, then retrain
+    (3 seeds) and evaluate.
+  - One-time code work: the junction-crossing episodes (`BRANCH_MIN_Y`, junction at x = 14 m),
+    `DOOR_GOALS`/`SPAWN_POSE` and some tests assume this map's layout.
+  - The policy only sees LiDAR + relative goal, but has trained on one map, so it's untested on a
+    layout it has never seen. Plan, after random obstacles: train on several maps or procedurally
+    generated hallways (varied widths, junctions, obstacles), and hold out one layout as the test.
+  - Deployment still needs a map for localization and room waypoints (milestone 2). The policy does
+    local driving to waypoints and the safety layer protects at the last moment.
+- Gazebo eval from varied start poses; 2–3 seeds per setup (cancelled today for time).
+- LiDAR mounting position and height on the real chassis.
+
 ## 2026-10-14
 
 **Mapping**

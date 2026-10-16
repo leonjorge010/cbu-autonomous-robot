@@ -1,4 +1,4 @@
-"""Launch SLAM Toolbox (online async) against the running C.A.$.H sim.
+"""Launch SLAM Toolbox (online async) against the running hallway sim.
 
 Run this in a separate terminal after `sim.launch.py` is already up. It
 subscribes to /scan and odom->base_footprint tf, and publishes map->odom

@@ -89,19 +89,21 @@ def evaluate(model, env, episodes):
     """Run (name, seed, options) episodes deterministically; return outcome dicts.
 
     Besides outcome and return: 'path' = distance driven (m), 'start_distance' =
-    geodesic start distance (m), 'reverse' = share of steps commanding reverse.
+    geodesic start distance (m), 'reverse' = share of steps commanding reverse,
+    'override' = share of steps a safety.SafetyWrapper changed the action.
     """
     results = []
     for name, seed, options in episodes:
         obs, info = env.reset(seed=seed, options=options)
         start_distance, prev = info['goal_distance'], info['pose'][:2].copy()
-        total, steps, path, reversing = 0.0, 0, 0.0, 0
+        total, steps, path, reversing, overrides = 0.0, 0, 0.0, 0, 0
         while True:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             total += reward
             steps += 1
             reversing += action[0] < 0
+            overrides += bool(info.get('safety_override', False))
             path += float(np.hypot(*(info['pose'][:2] - prev)))
             prev = info['pose'][:2].copy()
             if terminated or truncated:
@@ -110,7 +112,7 @@ def evaluate(model, env, episodes):
                         'collision': bool(info['collided']),
                         'timeout': not terminated, 'return': total, 'steps': steps,
                         'path': path, 'start_distance': start_distance,
-                        'reverse': reversing / steps})
+                        'reverse': reversing / steps, 'override': overrides / steps})
     return results
 
 
@@ -201,6 +203,8 @@ def main():
                              'sides of the junction')
     parser.add_argument('--pedestrians', type=int, default=0,
                         help='moving pedestrians per episode, in training and eval')
+    parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
+                        help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
@@ -230,8 +234,13 @@ def main():
     # the training pedestrian count: runs are comparable only at equal counts.
     eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
 
+    model_kwargs = dict(kwargs)
+    if args.lr_schedule == 'linear':
+        initial_lr = kwargs.get('learning_rate', 3e-4)
+        # SB3 passes progress_remaining, which goes from 1 to 0 over training.
+        model_kwargs['learning_rate'] = lambda progress: initial_lr * progress
     model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
-                             tensorboard_log=run_dir, **kwargs)
+                             tensorboard_log=run_dir, **model_kwargs)
     callbacks = [
         GoalEvalCallback(eval_env, args.eval_random, args.eval_freq, run_dir),
         CheckpointCallback(save_freq=max(1, args.checkpoint_freq // n_envs),

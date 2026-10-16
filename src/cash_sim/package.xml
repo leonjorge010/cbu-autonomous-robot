@@ -3,7 +3,7 @@
 <package format="3">
   <name>cash_sim</name>
   <version>0.1.0</version>
-  <description>Gazebo hallway simulation and robot model for the C.A.$.H escort robot</description>
+  <description>Gazebo hallway simulation and robot model for the CBU Autonomous Robot</description>
   <maintainer email="115505677+leonjorge010@users.noreply.github.com">Jorge Leon Duran</maintainer>
   <license>MIT</license>
 

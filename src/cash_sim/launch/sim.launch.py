@@ -1,4 +1,4 @@
-"""Launch the C.A.$.H hallway simulation: Gazebo + robot + ROS bridge + RViz."""
+"""Launch the CBU Autonomous Robot hallway simulation: Gazebo + robot + ROS bridge + RViz."""
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -6,14 +6,13 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, LaunchConfiguration
+from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     pkg = get_package_share_directory('cash_sim')
-    world = os.path.join(pkg, 'worlds', 'hallway.sdf')
     xacro_file = os.path.join(pkg, 'urdf', 'cash_bot.urdf.xacro')
     bridge_config = os.path.join(pkg, 'config', 'bridge.yaml')
     rviz_config = os.path.join(pkg, 'rviz', 'cash_sim.rviz')
@@ -23,6 +22,7 @@ def generate_launch_description():
     x = LaunchConfiguration('x')
     y = LaunchConfiguration('y')
     yaw = LaunchConfiguration('yaw')
+    world = PathJoinSubstitution([pkg, 'worlds', [LaunchConfiguration('world'), '.sdf']])
 
     robot_description = ParameterValue(Command(['xacro ', xacro_file]), value_type=str)
 
@@ -32,12 +32,12 @@ def generate_launch_description():
     # gui:=true -> Gazebo server + window. gui:=false -> server only (headless, much lighter).
     gazebo_gui = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(gz_launch),
-        launch_arguments={'gz_args': f'-r {world}', 'on_exit_shutdown': 'true'}.items(),
+        launch_arguments={'gz_args': ['-r ', world], 'on_exit_shutdown': 'true'}.items(),
         condition=IfCondition(use_gui),
     )
     gazebo_headless = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(gz_launch),
-        launch_arguments={'gz_args': f'-r -s {world}', 'on_exit_shutdown': 'true'}.items(),
+        launch_arguments={'gz_args': ['-r -s ', world], 'on_exit_shutdown': 'true'}.items(),
         condition=UnlessCondition(use_gui),
     )
 
@@ -73,6 +73,9 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('world', default_value='hallway',
+                              description='World file in cash_sim/worlds, without .sdf '
+                                          '(hallway, cbu_floor2)'),
         DeclareLaunchArgument('gui', default_value='true',
                               description='Open the Gazebo window (false = headless)'),
         DeclareLaunchArgument('rviz', default_value='true', description='Open RViz'),

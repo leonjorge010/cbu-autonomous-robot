@@ -1,4 +1,4 @@
-"""Robot/sensor spec and episode rules shared by every C.A.$.H training env.
+"""Robot/sensor spec and episode rules shared by every training env.
 
 HallwayEnv (Gazebo over ROS) and HallwayRaycastEnv (fast 2D map raycaster) both
 take their observation, action, collision and reward definitions from here, so a
@@ -10,14 +10,22 @@ Values mirror cash_sim/urdf/cash_bot.urdf.xacro — keep them in sync.
 import gymnasium as gym
 import numpy as np
 
-# gpu_lidar: 360 samples over [-pi, pi] inclusive, so increment = 2*pi/359.
-N_SCAN_BEAMS = 360
+# LiDAR: LDROBOT STL-27L (D800 kit) — 360 deg, 2160 points/rev at 10 Hz, 0.03-25 m
+# (25 m on 80% reflectivity, only 10 m on 4%), +-15 mm accuracy.
+# gpu_lidar: 2160 samples over [-pi, pi] inclusive, so increment = 2*pi/2159.
+N_SCAN_BEAMS = 2160
 SCAN_ANGLE_MIN = -3.14159
 SCAN_ANGLE_MAX = 3.14159
 SCAN_ANGLE_INCREMENT = (SCAN_ANGLE_MAX - SCAN_ANGLE_MIN) / (N_SCAN_BEAMS - 1)
-MIN_RANGE = 0.15
-MAX_RANGE = 12.0
-RANGE_NOISE_STDDEV = 0.01
+MIN_RANGE = 0.03
+LIDAR_MAX_RANGE = 25.0  # the URDF sensor's range
+# The policy sees ranges clipped to MAX_RANGE: the sensor's guaranteed range on dark
+# surfaces, so readings don't depend on wall color.
+MAX_RANGE = 10.0
+RANGE_NOISE_STDDEV = 0.015
+# Training only (HallwayRaycastEnv): share of observed beams that return nothing, as
+# on glass or shiny metal. A guess, not a datasheet number.
+BEAM_DROPOUT_PROB = 0.03
 LIDAR_X = 0.05  # lidar_link offset ahead of base_footprint
 
 N_OBS_BEAMS = 36
@@ -33,6 +41,10 @@ FOOTPRINT_HALF_WIDTH = 0.245
 COLLISION_MARGIN = 0.05
 
 MAX_LINEAR_VEL = 0.5
+# Reverse is capped well below forward speed: the progress reward pays the same for
+# driving backward, so with a symmetric limit policies reversed ~half the time
+# instead of turning around. Slow reverse still lets the robot back off a wall.
+MAX_REVERSE_VEL = 0.15
 MAX_ANGULAR_VEL = 1.0
 # DiffDrive plugin limits (max_linear_acceleration / max_angular_acceleration).
 MAX_LINEAR_ACCEL = 1.0
@@ -61,15 +73,28 @@ SINGLE_SCAN_N_OBS = N_OBS_BEAMS + 3 + 2
 # on collision (both end the episode). Progress is potential-based shaping, so
 # its episode total depends only on start and end distance, not the path.
 PROGRESS_WEIGHT = 10.0
+# The geodesic distance charges extra for passing near walls, so its cheapest route,
+# which the progress reward pulls the robot along, rounds corners at a safe distance
+# instead of clipping them. Moving through a cell with clearance c < SAFE_CLEARANCE
+# costs 1 + WALL_COST * ((SAFE_CLEARANCE - c) / SAFE_CLEARANCE)^2 per meter, e.g.
+# 3x at the 0.3 m collision boundary, 1.5x at 0.45 m; open corridor stays 1x.
+SAFE_CLEARANCE = 0.6
+WALL_COST = 8.0
 TIME_PENALTY = 0.01
 GOAL_REWARD = 10.0
 COLLISION_PENALTY = 20.0
+# Proximity penalty per step: PROXIMITY_WEIGHT * (1 - c / PROXIMITY_DISTANCE)^2 when the
+# clearance c (gap between the footprint and the nearest obstacle) is below
+# PROXIMITY_DISTANCE, e.g. 0.35 at the 0.05 m collision margin, 0.13 at 0.15 m. The
+# wall cost above shapes the route; this teaches holding it at speed near walls.
+PROXIMITY_DISTANCE = 0.30
+PROXIMITY_WEIGHT = 0.5
 # Pedestrians (HallwayRaycastEnv only). Within PEDESTRIAN_COMFORT_DISTANCE (gap
 # between the disc and the margin-inflated footprint) a pedestrian yields to the
 # robot, and the robot pays up to PEDESTRIAN_PROXIMITY_PENALTY per pedestrian per
 # step, rising linearly from 0 at the edge of that zone to the full amount at
 # contact. Hitting a pedestrian costs PEDESTRIAN_COLLISION_PENALTY instead of
-# COLLISION_PENALTY.
+# COLLISION_PENALTY. Pedestrians don't count toward the wall clearance above.
 PEDESTRIAN_COMFORT_DISTANCE = 0.8
 PEDESTRIAN_PROXIMITY_PENALTY = 0.3
 PEDESTRIAN_COLLISION_PENALTY = 40.0
@@ -100,9 +125,19 @@ def action_space():
 
 
 def action_to_cmd(action):
-    """Map a [-1, 1]^2 action to (linear_x m/s, angular_z rad/s)."""
+    """Map a [-1, 1]^2 action to (linear_x m/s, angular_z rad/s).
+
+    action[0] in [0, 1] scales MAX_LINEAR_VEL and in [-1, 0) MAX_REVERSE_VEL.
+    """
     action = np.clip(action, -1.0, 1.0)
-    return float(action[0]) * MAX_LINEAR_VEL, float(action[1]) * MAX_ANGULAR_VEL
+    linear = float(action[0]) * (MAX_LINEAR_VEL if action[0] >= 0 else MAX_REVERSE_VEL)
+    return linear, float(action[1]) * MAX_ANGULAR_VEL
+
+
+def cmd_to_action(linear, angular):
+    """Inverse of action_to_cmd (clipped to the action space)."""
+    a0 = linear / (MAX_LINEAR_VEL if linear >= 0 else MAX_REVERSE_VEL)
+    return np.clip(np.array([a0, angular / MAX_ANGULAR_VEL], dtype=np.float32), -1.0, 1.0)
 
 
 def sanitize_ranges(ranges):
@@ -161,6 +196,28 @@ def scan_hits_footprint(ranges, angles):
         & (np.abs(y) < FOOTPRINT_HALF_WIDTH + COLLISION_MARGIN)))
 
 
+def footprint_clearance(points):
+    """Smallest gap (m) between the footprint and (N, 2) base_footprint-frame points; 0 inside."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(points) == 0:
+        return float('inf')
+    dx = np.maximum(np.abs(points[:, 0]) - FOOTPRINT_HALF_LENGTH, 0.0)
+    dy = np.maximum(np.abs(points[:, 1]) - FOOTPRINT_HALF_WIDTH, 0.0)
+    return float(np.min(np.hypot(dx, dy)))
+
+
+def scan_footprint_clearance(ranges, angles):
+    """footprint_clearance of the scan returns (sanitized ranges, lidar-frame angles)."""
+    return footprint_clearance(np.stack(
+        [LIDAR_X + ranges * np.cos(angles), ranges * np.sin(angles)], axis=1))
+
+
+def proximity_penalty(clearance):
+    """Per-step penalty for a footprint clearance (m); see PROXIMITY_DISTANCE."""
+    nearness = max(0.0, 1.0 - clearance / PROXIMITY_DISTANCE)
+    return PROXIMITY_WEIGHT * nearness ** 2
+
+
 def episode_step_limit(goal_distance):
     """Return the step budget for an episode starting goal_distance (geodesic) away."""
     seconds = EPISODE_TIME_FACTOR * goal_distance / MAX_LINEAR_VEL + EPISODE_TIME_SLACK
@@ -179,19 +236,21 @@ def pedestrian_proximity_penalty(pedestrian_gaps):
 
 
 def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
-                 pedestrian_gaps=(), hit_pedestrian=False):
+                 clearance=float('inf'), pedestrian_gaps=(), hit_pedestrian=False):
     """Return (reward, reached) for one step.
 
     goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
     the traversable map) counts as no progress. Reaching is Euclidean, within
-    GOAL_TOLERANCE, and doesn't count on a colliding step. pedestrian_gaps adds
-    the proximity penalty; a collision with hit_pedestrian set costs
-    PEDESTRIAN_COLLISION_PENALTY instead of COLLISION_PENALTY.
+    GOAL_TOLERANCE, and doesn't count on a colliding step. clearance is the
+    footprint's gap to the nearest obstacle (m), for the proximity penalty.
+    pedestrian_gaps adds the pedestrian proximity penalty; a collision with
+    hit_pedestrian set costs PEDESTRIAN_COLLISION_PENALTY instead of
+    COLLISION_PENALTY.
     """
     progress = goal_distance - prev_goal_distance
     progress = 0.0 if not np.isfinite(progress) else -progress
     reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
-    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY \
+    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY - proximity_penalty(clearance) \
         - pedestrian_proximity_penalty(pedestrian_gaps)
     if reached:
         reward += GOAL_REWARD

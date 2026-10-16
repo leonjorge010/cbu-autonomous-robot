@@ -63,6 +63,21 @@ def test_geodesic_distance_goes_around_the_junction_corner(env):
     assert 20.3 < info['goal_distance'] < 22.5
 
 
+@pytest.mark.parametrize('start, goal', [((14.0, 6.0), (20.0, 0.0)), ((4.0, 0.0), DOOR_202)])
+def test_cheapest_route_rounds_the_junction_corner_clear_of_collision(env, start, goal):
+    # Follow the distance field downhill cell by cell; the wall cost should keep the
+    # route well outside the collision boundary (half-width + margin = 0.295 m).
+    m = env.map
+    field = m.distance_field(*goal).grid
+    row, col = m.to_cell(*start)
+    clearances = []
+    while field[row, col] > 0.1:
+        row, col = min(((row + dr, col + dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                        if dr or dc), key=lambda rc: field[rc])
+        clearances.append(m.clearance[row, col])
+    assert min(clearances) > spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + 0.1
+
+
 def test_driving_into_end_wall_ends_episode_with_penalty(env):
     env.reset(seed=0, options={'spawn': (26.5, 0.0, 0.0), 'goal': DOOR_101})
     total, info = drive(env, lambda env: np.array([1.0, 0.0]))
@@ -84,6 +99,67 @@ def test_every_door_goal_is_reachable_from_spawn(env, name):
         + spec.GOAL_REWARD - spec.TIME_PENALTY * spec.episode_step_limit(
             start['goal_distance'])
     assert total > expected_min
+
+
+def test_reverse_is_slower_than_forward(env):
+    assert spec.action_to_cmd([1.0, 0.0])[0] == pytest.approx(spec.MAX_LINEAR_VEL)
+    assert spec.action_to_cmd([-1.0, 0.0])[0] == pytest.approx(-spec.MAX_REVERSE_VEL)
+    env.reset(seed=0, options={'spawn': (10.0, 0.0, 0.0), 'goal': DOOR_101})
+    for _ in range(50):  # 5 s, long past the acceleration ramp
+        env.step(np.array([-1.0, 0.0]))
+    assert 10.0 - env.pose[0] < 5.0 * spec.MAX_REVERSE_VEL + 0.01
+
+
+def test_noisy_scans_drop_some_beams():
+    env = HallwayRaycastEnv()
+    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    # From spawn every beam hits a wall well inside MAX_RANGE except along the corridor.
+    walls = spec.sanitize_ranges(env.raycast()) < spec.MAX_RANGE - 1.0
+    dropped = []
+    for _ in range(200):
+        obs, *_ = env.step(np.zeros(2))
+        dropped.append(obs[:spec.N_OBS_BEAMS][walls] == 1.0)
+    assert np.mean(dropped) == pytest.approx(spec.BEAM_DROPOUT_PROB, abs=0.01)
+
+
+def test_footprint_clearance_geometry():
+    hl, hw = spec.FOOTPRINT_HALF_LENGTH, spec.FOOTPRINT_HALF_WIDTH
+    assert spec.footprint_clearance([[hl + 0.1, 0.0]]) == pytest.approx(0.1)
+    assert spec.footprint_clearance([[0.0, -hw - 0.2]]) == pytest.approx(0.2)
+    assert spec.footprint_clearance([[hl + 0.3, hw + 0.4]]) == pytest.approx(0.5)
+    assert spec.footprint_clearance([[0.1, 0.1], [hl + 1.0, 0.0]]) == 0.0
+    assert spec.proximity_penalty(1.0) == 0.0
+    assert spec.proximity_penalty(0.0) == pytest.approx(spec.PROXIMITY_WEIGHT)
+
+
+def test_clearance_matches_corridor_walls(env):
+    # Spawn faces +x in the 2.4 m corridor: the footprint's long sides are
+    # 1.2 - half-width from the walls (SLAM walls are good to about a cell).
+    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    expected = 1.2 - spec.FOOTPRINT_HALF_WIDTH
+    assert env.clearance() == pytest.approx(expected, abs=2 * env.map.resolution)
+    # Rotated 90 degrees the half-length faces the walls instead.
+    assert env.clearance((0.0, 0.0, np.pi / 2)) == pytest.approx(
+        1.2 - spec.FOOTPRINT_HALF_LENGTH, abs=2 * env.map.resolution)
+
+
+def test_driving_along_a_wall_costs_a_proximity_penalty(env, monkeypatch):
+    # Same drive 0.15 m from the north wall, with and without the penalty.
+    y = 1.2 - spec.FOOTPRINT_HALF_WIDTH - 0.15
+
+    def drive_along_wall():
+        env.reset(seed=0, options={'spawn': (5.0, y, 0.0), 'goal': (20.0, y)})
+        steps = [env.step(np.array([1.0, 0.0])) for _ in range(20)]
+        assert not any(info['collided'] for *_, info in steps)
+        return sum(reward for _, reward, *_ in steps), [info['clearance'] for *_, info in steps]
+
+    with_penalty, clearances = drive_along_wall()
+    penalty = sum(spec.proximity_penalty(c) for c in clearances)
+    monkeypatch.setattr(spec, 'PROXIMITY_WEIGHT', 0.0)
+    without_penalty, _ = drive_along_wall()
+    assert max(clearances) < spec.PROXIMITY_DISTANCE
+    assert penalty > 1.0
+    assert with_penalty == pytest.approx(without_penalty - penalty)
 
 
 def test_standing_still_times_out(env):
@@ -296,7 +372,9 @@ def test_pedestrian_proximity_penalty_ramps_to_contact():
     pose, goal = (0.0, 0.0, 0.0), (5.0, 0.0)
     assert spec.step_outcome(5.0, 4.0, pose, goal, True)[0] == pytest.approx(
         spec.PROGRESS_WEIGHT - spec.TIME_PENALTY - spec.COLLISION_PENALTY)
-    assert spec.step_outcome(5.0, 4.0, pose, goal, True, [-0.1], True)[0] == pytest.approx(
+    reward, _ = spec.step_outcome(5.0, 4.0, pose, goal, True,
+                                  pedestrian_gaps=[-0.1], hit_pedestrian=True)
+    assert reward == pytest.approx(
         spec.PROGRESS_WEIGHT - spec.TIME_PENALTY - full - spec.PEDESTRIAN_COLLISION_PENALTY)
 
 
