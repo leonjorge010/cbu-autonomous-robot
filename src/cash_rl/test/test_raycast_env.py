@@ -1,5 +1,7 @@
 from cash_rl import spec
-from cash_rl.raycast_env import HallwayRaycastEnv
+from cash_rl.raycast_env import BRANCH_MIN_Y, HallwayRaycastEnv
+from cash_rl.raycast_env import PEDESTRIAN_RADIUS, PEDESTRIAN_SPEED_RANGE
+from cash_rl.raycast_env import PEDESTRIAN_WALL_CLEARANCE
 from cash_rl.scripted import downhill
 from gymnasium.utils.env_checker import check_env
 import numpy as np
@@ -38,7 +40,7 @@ def test_spawn_ranges_match_world_geometry(env):
     # At spawn (0, 0, 0) the corridor walls are 1.2 m to each side in hallway.sdf;
     # SLAM places walls to within about one map cell.
     obs, _ = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
-    ranges = obs[:spec.N_OBS_BEAMS] * spec.MAX_RANGE
+    ranges = obs[:spec.N_OBS_BEAMS] * spec.MAX_RANGE  # newest scan
     for angle in (-np.pi / 2, np.pi / 2):
         beam = np.argmin(np.abs(spec.OBS_BEAM_ANGLES - angle))
         assert ranges[beam] == pytest.approx(1.2, abs=2 * env.map.resolution)
@@ -46,7 +48,7 @@ def test_spawn_ranges_match_world_geometry(env):
 
 def test_goal_observation_is_robot_relative(env):
     obs, _ = env.reset(seed=0, options={'spawn': (0.0, 0.0, np.pi / 2), 'goal': DOOR_101})
-    distance, cos_bearing, sin_bearing = obs[spec.N_OBS_BEAMS:spec.N_OBS_BEAMS + 3]
+    distance, cos_bearing, sin_bearing = obs[-5:-2]
     assert distance == pytest.approx(4.0 / spec.MAX_GOAL_DISTANCE)
     # Facing +y with the goal at +x: the goal is 90 degrees to the right.
     assert cos_bearing == pytest.approx(0.0, abs=1e-6)
@@ -105,7 +107,6 @@ def test_random_spawns_and_goals_are_seeded_and_valid():
 
 
 def test_junction_episodes_cross_the_junction():
-    from cash_rl.raycast_env import BRANCH_MIN_Y
     env = HallwayRaycastEnv(goal_distance_range=(1.0, 25.0), junction_prob=1.0)
     for seed in range(10):
         _, info = env.reset(seed=seed)
@@ -134,3 +135,109 @@ def test_render_rgb_array():
     image = env.render()
     assert image.shape == (env.map.height, env.map.width, 3)
     assert image.dtype == np.uint8
+
+
+def scans(obs):
+    """Split an observation's scan part into (N_SCAN_STACK, N_OBS_BEAMS), newest first."""
+    return obs[:spec.N_SCAN_STACK * spec.N_OBS_BEAMS].reshape(spec.N_SCAN_STACK, -1)
+
+
+def test_scan_stack_starts_full_and_shifts_newest_first(env):
+    obs, _ = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    assert obs.shape == (spec.N_OBS,)
+    history = [scans(obs)[0]] * spec.N_SCAN_STACK
+    np.testing.assert_array_equal(scans(obs), history)
+    for _ in range(4):
+        obs, *_ = env.step(np.array([1.0, 0.5]))
+        history.insert(0, scans(obs)[0])
+        np.testing.assert_array_equal(scans(obs), history[:spec.N_SCAN_STACK])
+    np.testing.assert_array_equal(env.observation(), obs)
+
+
+def test_single_scan_observation_keeps_newest_scan_and_goal(env):
+    obs, _ = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    obs, *_ = env.step(np.array([1.0, 0.0]))
+    single = spec.single_scan_observation(obs)
+    assert single.shape == (spec.SINGLE_SCAN_N_OBS,)
+    np.testing.assert_array_equal(single[:spec.N_OBS_BEAMS], scans(obs)[0])
+    np.testing.assert_array_equal(single[spec.N_OBS_BEAMS:], obs[-5:])
+
+
+def test_no_pedestrians_by_default():
+    plain, none = HallwayRaycastEnv(), HallwayRaycastEnv(n_pedestrians=0)
+    for seed in range(3):
+        obs_a, info_a = plain.reset(seed=seed)
+        obs_b, info_b = none.reset(seed=seed)
+        np.testing.assert_array_equal(obs_a, obs_b)
+        assert info_a['pedestrians'].shape == (0, 2)
+
+
+def pedestrian_env(xy, velocity=(0.0, 0.0), spawn=spec.SPAWN_POSE):
+    """Env at spawn with its one pedestrian moved to xy; returns (env, obs)."""
+    env = HallwayRaycastEnv(range_noise=False, n_pedestrians=1)
+    env.reset(seed=0, options={'spawn': spawn, 'goal': DOOR_101})
+    env.pedestrians[0] = xy
+    env._pedestrian_velocities[0] = velocity
+    return env, env._observe()
+
+
+def test_pedestrian_blocks_beams_at_its_surface():
+    env, obs = pedestrian_env((3.0, 0.0))
+    ranges = scans(obs)[0] * spec.MAX_RANGE
+    forward = np.argmin(np.abs(spec.OBS_BEAM_ANGLES))
+    expected = 3.0 - spec.LIDAR_X - PEDESTRIAN_RADIUS
+    assert ranges[forward] == pytest.approx(expected, abs=0.01)
+    # Beams pointing elsewhere still see the walls.
+    side = np.argmin(np.abs(spec.OBS_BEAM_ANGLES - np.pi / 2))
+    assert ranges[side] == pytest.approx(1.2, abs=2 * env.map.resolution)
+
+
+def test_pedestrian_touching_footprint_is_a_collision():
+    front = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN
+    env, _ = pedestrian_env((front + PEDESTRIAN_RADIUS - 0.02, 0.0))
+    assert env.collides()
+    env.pedestrians[0] = (front + PEDESTRIAN_RADIUS + 0.02, 0.0)
+    assert not env.collides()
+
+
+def test_pedestrian_walking_into_robot_ends_episode():
+    env, _ = pedestrian_env((2.0, 0.0), velocity=(-1.0, 0.0))
+    total, info = drive(env, lambda env: np.zeros(2))
+    assert info['collided'] and not info['is_success']
+    assert total < -spec.COLLISION_PENALTY + 1.0
+
+
+def test_pedestrians_walk_the_corridors_clear_of_walls():
+    env = HallwayRaycastEnv(n_pedestrians=6)
+    for seed in range(3):
+        _, info = env.reset(seed=seed)
+        speeds = np.hypot(*env._pedestrian_velocities.T)
+        assert np.all((speeds >= PEDESTRIAN_SPEED_RANGE[0])
+                      & (speeds <= PEDESTRIAN_SPEED_RANGE[1]))
+        # Corridor-aligned: x motion in the main corridor, y motion in the branch.
+        in_branch = env.pedestrians[:, 1] >= BRANCH_MIN_Y
+        moving = np.abs(env._pedestrian_velocities)
+        assert np.all(moving[in_branch, 0] == 0) and np.all(moving[~in_branch, 1] == 0)
+        assert np.all(np.hypot(*(env.pedestrians - info['pose'][:2]).T) >= 2.0)
+        moves = np.zeros(len(env.pedestrians))
+        for _ in range(300):
+            before = env.pedestrians.copy()
+            env.step(np.zeros(2))  # robot may be hit; pedestrians keep walking regardless
+            moves += np.any(env.pedestrians != before, axis=1)
+            clearance = env._clearance_at(env.pedestrians[:, 0], env.pedestrians[:, 1])
+            assert np.all(clearance >= PEDESTRIAN_WALL_CLEARANCE)
+        # Only turnaround steps stand still, so nobody gets stuck against a wall.
+        assert np.all(moves > 250)
+
+
+def test_pedestrian_episodes_are_seeded():
+    env_a, env_b = HallwayRaycastEnv(n_pedestrians=3), HallwayRaycastEnv(n_pedestrians=3)
+    for seed in range(3):
+        _, info_a = env_a.reset(seed=seed)
+        _, info_b = env_b.reset(seed=seed)
+        np.testing.assert_array_equal(info_a['pedestrians'], info_b['pedestrians'])
+        assert len(info_a['pedestrians']) == 3
+
+
+def test_gymnasium_api_with_pedestrians():
+    check_env(HallwayRaycastEnv(n_pedestrians=3), skip_render_check=True)

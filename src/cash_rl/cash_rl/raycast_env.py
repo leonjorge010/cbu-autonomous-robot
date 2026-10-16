@@ -8,6 +8,11 @@ trained policies against HallwayEnv in Gazebo afterwards.
 
 The map frame is aligned with the Gazebo world frame (SLAM was started at the
 spawn pose), so poses here are world coordinates from hallway.sdf.
+
+Optional pedestrians (n_pedestrians, default 0) are discs that walk up and down
+the corridors at constant speed, turning back at walls and obstacles; they block
+beams and count for collisions, but ignore the robot and each other. They exist
+only here, not in Gazebo.
 """
 from cash_rl import spec
 from cash_rl.occupancy_map import OccupancyMap
@@ -25,6 +30,14 @@ DEFAULT_GOAL_DISTANCE_RANGE = (1.0, 15.0)
 # from the junction at x = 14 m. Cells above this line count as the branch.
 BRANCH_MIN_Y = 1.5
 MAX_SAMPLE_TRIES = 1000
+# Pedestrians: discs walking along the corridor axis (x in the main corridor, y
+# in the branch), at a speed drawn per episode.
+PEDESTRIAN_RADIUS = 0.25
+PEDESTRIAN_SPEED_RANGE = (0.8, 1.4)
+# Pedestrian centers keep at least this much map clearance (radius + a gap).
+PEDESTRIAN_WALL_CLEARANCE = PEDESTRIAN_RADIUS + 0.05
+# Pedestrians start at least this far from the robot's spawn.
+PEDESTRIAN_SPAWN_DISTANCE = 2.0
 
 
 def _rectangle_perimeter(half_length, half_width, spacing):
@@ -52,13 +65,15 @@ class HallwayRaycastEnv(gym.Env):
     the episode needs the turn. For evaluation matching HallwayEnv, pass
     spec.SPAWN_POSE and one of spec.DOOR_GOALS. map_yaml defaults to
     occupancy_map.default_map_yaml(); range_noise adds the URDF's Gaussian range
-    noise; render_mode is None or 'rgb_array'.
+    noise; render_mode is None or 'rgb_array'. n_pedestrians adds that many
+    pedestrians (see the module docstring), placed at random on every reset; their
+    positions are in `pedestrians` (n, 2) after reset/step.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
 
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
-                 range_noise=True, render_mode=None, junction_prob=0.0):
+                 range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
@@ -67,6 +82,7 @@ class HallwayRaycastEnv(gym.Env):
         self.junction_prob = junction_prob
         self.range_noise = range_noise
         self.render_mode = render_mode
+        self.n_pedestrians = int(n_pedestrians)
 
         self.observation_space = spec.observation_space()
         self.action_space = spec.action_space()
@@ -89,6 +105,7 @@ class HallwayRaycastEnv(gym.Env):
             'spawn': self._cell_y(self.map.free_cells[:, 0]) >= BRANCH_MIN_Y,
             'goal': self._cell_y(self._goal_cells[:, 0]) >= BRANCH_MIN_Y,
         }
+        self._pedestrian_cells = np.argwhere(self.map.clearance >= PEDESTRIAN_WALL_CLEARANCE)
 
         self.pose = np.array(spec.SPAWN_POSE, dtype=np.float64)
         self.goal = np.zeros(2)
@@ -97,6 +114,9 @@ class HallwayRaycastEnv(gym.Env):
         self._velocity = np.zeros(2)
         self._prev_action = np.zeros(2, dtype=np.float32)
         self._ranges = np.full(spec.N_OBS_BEAMS, spec.MAX_RANGE, dtype=np.float32)
+        self._scan_stack = spec.new_scan_stack(self._ranges)
+        self.pedestrians = np.zeros((0, 2))
+        self._pedestrian_velocities = np.zeros((0, 2))
         self._step_count = 0
         self._max_steps = 0
 
@@ -109,15 +129,39 @@ class HallwayRaycastEnv(gym.Env):
         wy = y + s * outline[:, 0] + c * outline[:, 1]
         return not np.all(self.map.is_free(wx, wy))
 
+    def _clearance_at(self, x, y):
+        """Map clearance (m) at world points; 0 off the map."""
+        row, col = self.map.to_cell(np.asarray(x), np.asarray(y))
+        ok = (row >= 0) & (row < self.map.height) & (col >= 0) & (col < self.map.width)
+        return np.where(ok, self.map.clearance[np.clip(row, 0, self.map.height - 1),
+                                               np.clip(col, 0, self.map.width - 1)], 0.0)
+
+    def _pedestrian_hits(self, pose, inflation=0.0):
+        """Return True if a pedestrian overlaps the footprint (grown by inflation)."""
+        if len(self.pedestrians) == 0:
+            return False
+        x, y, yaw = pose
+        c, s = np.cos(yaw), np.sin(yaw)
+        dx, dy = self.pedestrians[:, 0] - x, self.pedestrians[:, 1] - y
+        # Pedestrian centers in the robot frame, then distance to the rectangle.
+        local_x, local_y = c * dx + s * dy, -s * dx + c * dy
+        half_length = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + inflation
+        half_width = spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + inflation
+        gap = np.hypot(np.maximum(np.abs(local_x) - half_length, 0.0),
+                       np.maximum(np.abs(local_y) - half_width, 0.0))
+        return bool(np.any(gap < PEDESTRIAN_RADIUS))
+
     def collides(self, pose=None):
-        """Return True if the margin-inflated footprint at `pose` overlaps a non-free cell."""
-        return self._outline_hits(self._collision_outline, self.pose if pose is None else pose)
+        """Return True if the inflated footprint at `pose` hits the map or a pedestrian."""
+        pose = self.pose if pose is None else pose
+        return self._outline_hits(self._collision_outline, pose) or self._pedestrian_hits(pose)
 
     def raycast(self, pose=None):
         """Noise-free ranges (m) of the N_OBS_BEAMS observed beams from `pose`.
 
         Mirrors gpu_lidar: no return within MAX_RANGE -> +inf; a hit closer than
-        MIN_RANGE -> -inf. Pass through spec.sanitize_ranges before use.
+        MIN_RANGE -> -inf. Pedestrians block beams like walls. Pass through
+        spec.sanitize_ranges before use.
         """
         x, y, yaw = self.pose if pose is None else pose
         c, s = np.cos(yaw), np.sin(yaw)
@@ -132,6 +176,18 @@ class HallwayRaycastEnv(gym.Env):
         # Surface lies between the last free sample and the first blocked one.
         first = blocked.argmax(axis=1)
         ranges = np.where(hit, self._ray_ts[first] - self._ray_step / 2, np.inf)
+        if len(self.pedestrians):
+            # Exact ray/disc intersection: nearest t >= 0 with |lidar + t*dir - c| = r.
+            to_x = self.pedestrians[:, 0][None, :] - lidar_x
+            to_y = self.pedestrians[:, 1][None, :] - lidar_y
+            along = beam_cos[:, None] * to_x + beam_sin[:, None] * to_y
+            disc = along ** 2 - (to_x ** 2 + to_y ** 2 - PEDESTRIAN_RADIUS ** 2)
+            root = np.sqrt(np.maximum(disc, 0.0))
+            # Inside a disc (near < 0 < far) the hit is at range 0.
+            near, far = along - root, along + root
+            t = np.where(near >= 0, near, np.where(far >= 0, 0.0, np.inf))
+            t = np.where(disc >= 0, t, np.inf).min(axis=1)
+            ranges = np.where(t <= spec.MAX_RANGE, np.minimum(ranges, t), ranges)
         return np.where(ranges < spec.MIN_RANGE, -np.inf, ranges)
 
     def _cell_y(self, rows):
@@ -167,25 +223,63 @@ class HallwayRaycastEnv(gym.Env):
         return np.array(self._random_point_in_cell(
             *candidates[self.np_random.integers(len(candidates))]))
 
+    def _sample_pedestrians(self):
+        """Place n_pedestrians clear of walls and the robot, with corridor-axis velocities."""
+        positions, velocities = [], []
+        for _ in range(self.n_pedestrians):
+            for _ in range(MAX_SAMPLE_TRIES):
+                row, col = self._pedestrian_cells[
+                    self.np_random.integers(len(self._pedestrian_cells))]
+                xy = np.array(self._random_point_in_cell(row, col))
+                if np.hypot(*(xy - self.pose[:2])) >= PEDESTRIAN_SPAWN_DISTANCE:
+                    break
+            else:
+                raise RuntimeError('No pedestrian start found clear of the robot')
+            speed = self.np_random.uniform(*PEDESTRIAN_SPEED_RANGE)
+            sign = 1.0 if self.np_random.random() < 0.5 else -1.0
+            axis = np.array([0.0, 1.0]) if xy[1] >= BRANCH_MIN_Y else np.array([1.0, 0.0])
+            positions.append(xy)
+            velocities.append(sign * speed * axis)
+        self.pedestrians = np.array(positions).reshape(-1, 2)
+        self._pedestrian_velocities = np.array(velocities).reshape(-1, 2)
+
+    def _move_pedestrians(self, dt):
+        """Advance pedestrians by dt; one that would get too close to a wall turns back."""
+        if len(self.pedestrians) == 0:
+            return
+        ahead = self.pedestrians + self._pedestrian_velocities * dt
+        blocked = self._clearance_at(ahead[:, 0], ahead[:, 1]) < PEDESTRIAN_WALL_CLEARANCE
+        self._pedestrian_velocities[blocked] *= -1.0
+        self.pedestrians[~blocked] = ahead[~blocked]
+
     # -- gym API ----------------------------------------------------------
 
-    def _observe(self):
+    def _observe(self, new_episode=False):
+        """Take a scan, push it onto the scan stack (or start one) and return the obs."""
         ranges = self.raycast()
         if self.range_noise:
             finite = np.isfinite(ranges)
             ranges[finite] += self.np_random.normal(
                 0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
         self._ranges = spec.sanitize_ranges(ranges)
-        return spec.build_observation(self._ranges, self.pose, self.goal, self._prev_action)
+        self._scan_stack = spec.new_scan_stack(self._ranges) if new_episode \
+            else spec.push_scan(self._scan_stack, self._ranges)
+        return self.observation()
+
+    def observation(self):
+        """Return the current observation, rebuilt from the scan stack (no new scan)."""
+        return spec.build_observation(self._scan_stack, self.pose, self.goal, self._prev_action)
 
     def _info(self, **extra):
         return {'pose': self.pose.copy(), 'goal': self.goal.copy(),
-                'goal_distance': self._goal_distance, **extra}
+                'goal_distance': self._goal_distance,
+                'pedestrians': self.pedestrians.copy(), **extra}
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         options = options or {}
         spawn, goal = options.get('spawn'), options.get('goal')
+        self.pedestrians = np.zeros((0, 2))  # last episode's must not block this spawn
         # Draw only when enabled, so junction_prob=0 keeps seeded episodes unchanged.
         spawn_in_branch = None
         if spawn is None and goal is None and self.junction_prob > 0 \
@@ -207,6 +301,8 @@ class HallwayRaycastEnv(gym.Env):
             raise RuntimeError(f'Spawn pose {pose} is in collision')
 
         self.pose, self.goal = pose, goal_xy
+        # Drawn after spawn/goal (and only when enabled), so those stay seeded the same.
+        self._sample_pedestrians()
         self._goal_field = self.map.distance_field(*self.goal)
         self._goal_distance = self._goal_field(*self.pose[:2])
         if not np.isfinite(self._goal_distance):
@@ -215,7 +311,7 @@ class HallwayRaycastEnv(gym.Env):
         self._prev_action[:] = 0.0
         self._step_count = 0
         self._max_steps = spec.episode_step_limit(self._goal_distance)
-        return self._observe(), self._info()
+        return self._observe(new_episode=True), self._info()
 
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
@@ -228,6 +324,7 @@ class HallwayRaycastEnv(gym.Env):
             self.pose[0] += v * np.cos(self.pose[2]) * dt
             self.pose[1] += v * np.sin(self.pose[2]) * dt
             self.pose[2] = (self.pose[2] + w * dt + np.pi) % (2 * np.pi) - np.pi
+        self._move_pedestrians(spec.CONTROL_PERIOD)
         self._step_count += 1
         self._prev_action = action
 
@@ -266,6 +363,9 @@ class HallwayRaycastEnv(gym.Env):
         heading = np.linspace(0, spec.FOOTPRINT_HALF_LENGTH, 6)
         paint(x + c * heading, y + s * heading, (30, 160, 30))
         ring = np.linspace(0, 2 * np.pi, 48)
+        for px, py in self.pedestrians:
+            paint(px + PEDESTRIAN_RADIUS * np.cos(ring), py + PEDESTRIAN_RADIUS * np.sin(ring),
+                  (160, 40, 160))
         paint(self.goal[0] + spec.GOAL_TOLERANCE * np.cos(ring),
               self.goal[1] + spec.GOAL_TOLERANCE * np.sin(ring), (230, 150, 0))
         return image[::-1].copy()  # +y up, as in RViz

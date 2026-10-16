@@ -40,15 +40,35 @@ def runs_dir():
 
 
 def load_model(path):
-    """Load a train.py model zip; the algo is read from the run's config.json."""
+    """Load a train.py model zip; the algo is read from the run's config.json.
+
+    Models trained before scan stacking (spec.SINGLE_SCAN_N_OBS observations) are
+    wrapped to take current N_OBS observations, keeping only the newest scan.
+    """
     path = os.path.expanduser(path)
     directory = os.path.dirname(os.path.abspath(path))
     for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
         config = os.path.join(candidate, 'config.json')
         if os.path.isfile(config):
             with open(config) as f:
-                return ALGOS[json.load(f)['args']['algo']].load(path, device='cpu')
+                model = ALGOS[json.load(f)['args']['algo']].load(path, device='cpu')
+            if model.observation_space.shape == (spec.SINGLE_SCAN_N_OBS,):
+                return SingleScanModel(model)
+            return model
     raise FileNotFoundError(f'No config.json next to or above {path}')
+
+
+class SingleScanModel:
+    """Wrap a pre-scan-stacking model so predict() accepts N_OBS observations."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def predict(self, observation, **kwargs):
+        return self.model.predict(spec.single_scan_observation(observation), **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
 
 
 def algo_kwargs(algo, n_envs):

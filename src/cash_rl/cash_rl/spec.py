@@ -44,12 +44,17 @@ CONTROL_PERIOD = 0.1
 EPISODE_TIME_FACTOR = 2.0
 EPISODE_TIME_SLACK = 10.0
 
-# Goal-reaching task. Observation = [N_OBS_BEAMS ranges / MAX_RANGE,
-# goal distance / MAX_GOAL_DISTANCE, cos(goal bearing), sin(goal bearing),
-# previous action (2)], with the goal in the robot's base_footprint frame.
+# Goal-reaching task. Observation = [the last N_SCAN_STACK scans' N_OBS_BEAMS
+# ranges / MAX_RANGE, newest first, goal distance / MAX_GOAL_DISTANCE,
+# cos(goal bearing), sin(goal bearing), previous action (2)], with the goal in
+# the robot's base_footprint frame. One scan per control step; the stack lets the
+# policy see obstacles move. On reset the first scan fills every slot.
 GOAL_TOLERANCE = 0.3
 MAX_GOAL_DISTANCE = 30.0
-N_OBS = N_OBS_BEAMS + 3 + 2
+N_SCAN_STACK = 3
+N_OBS = N_SCAN_STACK * N_OBS_BEAMS + 3 + 2
+# Observation size before scan stacking (one scan), for models trained then.
+SINGLE_SCAN_N_OBS = N_OBS_BEAMS + 3 + 2
 
 # Reward per step: PROGRESS_WEIGHT * (decrease in geodesic goal distance, m)
 # - TIME_PENALTY, plus GOAL_REWARD on reaching the goal or - COLLISION_PENALTY
@@ -75,7 +80,7 @@ SPAWN_POSE = (0.0, 0.0, 0.0)  # sim.launch.py's default x, y, yaw
 
 
 def observation_space():
-    low = np.concatenate([np.zeros(N_OBS_BEAMS), [0.0, -1.0, -1.0], [-1.0, -1.0]])
+    low = np.concatenate([np.zeros(N_SCAN_STACK * N_OBS_BEAMS), [0.0, -1.0, -1.0], [-1.0, -1.0]])
     high = np.ones(N_OBS)
     return gym.spaces.Box(low=low.astype(np.float32), high=high.astype(np.float32),
                           dtype=np.float32)
@@ -104,14 +109,38 @@ def goal_in_robot_frame(pose, goal):
     return float(np.hypot(dx, dy)), float(np.arctan2(dy, dx) - pose[2])
 
 
-def build_observation(obs_ranges, pose, goal, prev_action):
-    """Assemble the N_OBS observation from sanitized N_OBS_BEAMS ranges."""
+def new_scan_stack(obs_ranges):
+    """(N_SCAN_STACK, N_OBS_BEAMS) stack with every slot set to the first scan."""
+    return np.tile(np.asarray(obs_ranges, dtype=np.float32), (N_SCAN_STACK, 1))
+
+
+def push_scan(scan_stack, obs_ranges):
+    """Return scan_stack with obs_ranges as the newest (first) row, oldest dropped."""
+    return np.concatenate([np.asarray(obs_ranges, dtype=np.float32)[None], scan_stack[:-1]])
+
+
+def build_observation(scan_stack, pose, goal, prev_action):
+    """Assemble the N_OBS observation from a stack of sanitized ranges.
+
+    scan_stack is (N_SCAN_STACK, N_OBS_BEAMS), newest first (see new_scan_stack
+    and push_scan).
+    """
     distance, bearing = goal_in_robot_frame(pose, goal)
     return np.concatenate([
-        np.asarray(obs_ranges, dtype=np.float32) / MAX_RANGE,
+        np.asarray(scan_stack, dtype=np.float32).reshape(-1) / MAX_RANGE,
         [min(distance / MAX_GOAL_DISTANCE, 1.0), np.cos(bearing), np.sin(bearing)],
         np.clip(prev_action, -1.0, 1.0),
     ]).astype(np.float32)
+
+
+def single_scan_observation(obs):
+    """Cut an N_OBS observation down to SINGLE_SCAN_N_OBS (newest scan only).
+
+    For policies trained before scan stacking.
+    """
+    obs = np.asarray(obs)
+    return np.concatenate([obs[..., :N_OBS_BEAMS], obs[..., N_SCAN_STACK * N_OBS_BEAMS:]],
+                          axis=-1)
 
 
 def scan_hits_footprint(ranges, angles):

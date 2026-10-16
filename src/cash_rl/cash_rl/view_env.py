@@ -4,11 +4,13 @@
     ros2 run cash_rl view_env --policy random --goal door_201
     ros2 run cash_rl view_env --goal all --save doors.gif
     ros2 run cash_rl view_env --policy ~/ros2_ws/runs/<run>/best_model.zip --goal all
+    ros2 run cash_rl view_env --pedestrians 4
 
 Shows the SLAM map to scale with the robot footprint (collision margin
 included), the 36 observed lidar beams, the goal tolerance circle, the path so
-far, and episode step/return/outcome. Episodes are simulated up front (the 2D
-env is fast), then played back at real time × --speed.
+far, any pedestrians (purple discs), and episode step/return/outcome.
+Episodes are simulated up front (the 2D env is fast), then played back at real
+time × --speed.
 """
 import argparse
 
@@ -30,8 +32,7 @@ def load_trained_policy(path):
     model = load_model(path)
 
     def policy(env):
-        obs = spec.build_observation(env._ranges, env.pose, env.goal, env._prev_action)
-        return model.predict(obs, deterministic=True)[0]
+        return model.predict(env.observation(), deterministic=True)[0]
     return policy
 
 
@@ -46,6 +47,7 @@ def run_episodes(env, policy, goals, seed):
         while True:
             frames.append({
                 'pose': env.pose.copy(), 'ranges': env._ranges.copy(),
+                'pedestrians': env.pedestrians.copy(),
                 'goal': env.goal.copy(), 'trail': np.array(trail), 'text': (
                     f'episode {i + 1}/{len(goals)}   goal: {goal_name}   '
                     f'step {step}/{env._max_steps}   return {total:+.1f}   {outcome}')})
@@ -74,11 +76,13 @@ class Scene:
     """Matplotlib drawing of the map, doors, robot, beams, goal and trail on `ax`.
 
     door_labels maps door name -> label text (default: the name). draw() with
-    pose None hides the robot and beams; goal None hides the goal.
+    pose None hides the robot and beams; goal None hides the goal; pedestrians is
+    an (n, 2) array of disc centers, or None for none.
     """
 
     def __init__(self, ax, env, door_labels=None):
-        from matplotlib.collections import LineCollection
+        from cash_rl.raycast_env import PEDESTRIAN_RADIUS
+        from matplotlib.collections import EllipseCollection, LineCollection
         from matplotlib.patches import Circle, Polygon
         m = env.map
         ax.imshow(m.pixels, cmap='gray', origin='lower', vmin=0, vmax=255, extent=[
@@ -98,9 +102,16 @@ class Scene:
         self.heading, = ax.plot([], [], color='white', lw=2)
         self.goal = ax.add_patch(Circle((0, 0), spec.GOAL_TOLERANCE, fc='orange',
                                         ec='darkorange', alpha=0.7))
+        size = 2 * PEDESTRIAN_RADIUS
+        self.pedestrians = ax.add_collection(EllipseCollection(
+            size, size, 0.0, units='xy', offsets=np.zeros((0, 2)),
+            offset_transform=ax.transData, facecolors='tab:purple', edgecolors='indigo',
+            alpha=0.8))
         self.title = ax.set_title('', fontsize=11, family='monospace')
 
-    def draw(self, pose, ranges, goal, trail, text):
+    def draw(self, pose, ranges, goal, trail, text, pedestrians=None):
+        self.pedestrians.set_offsets(np.zeros((0, 2)) if pedestrians is None
+                                     else np.asarray(pedestrians).reshape(-1, 2))
         self.robot.set_visible(pose is not None)
         self.heading.set_visible(pose is not None)
         self.beams.set_visible(pose is not None and ranges is not None)
@@ -121,7 +132,8 @@ class Scene:
         trail = np.zeros((0, 2)) if trail is None or len(trail) == 0 else np.asarray(trail)
         self.trail.set_data(trail[:, 0], trail[:, 1])
         self.title.set_text(text)
-        return self.beams, self.trail, self.robot, self.heading, self.goal, self.title
+        return (self.beams, self.trail, self.robot, self.heading, self.goal,
+                self.pedestrians, self.title)
 
 
 def main():
@@ -133,6 +145,8 @@ def main():
                              + ', '.join(sorted(spec.DOOR_GOALS)))
     parser.add_argument('--episodes', type=int, default=3,
                         help='number of episodes with --goal random')
+    parser.add_argument('--pedestrians', type=int, default=0,
+                        help='number of moving pedestrians in the hallway')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
@@ -153,7 +167,7 @@ def main():
     from matplotlib.animation import FuncAnimation, PillowWriter
     import matplotlib.pyplot as plt
 
-    env = HallwayRaycastEnv()
+    env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
     frames = run_episodes(env, policy, goals, args.seed)
 
@@ -163,7 +177,7 @@ def main():
 
     def draw(frame):
         return scene.draw(frame['pose'], frame['ranges'], frame['goal'], frame['trail'],
-                          frame['text'])
+                          frame['text'], frame['pedestrians'])
 
     interval_ms = 1000 * spec.CONTROL_PERIOD / args.speed
     anim = FuncAnimation(fig, draw, frames=frames, interval=interval_ms, blit=False,

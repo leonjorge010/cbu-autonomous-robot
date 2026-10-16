@@ -65,6 +65,7 @@ class HallwayEnv(gym.Env):
         self._goal_field = None
         self._goal_distance = 0.0
         self._prev_action = np.zeros(2, dtype=np.float32)
+        self._scan_stack = None
         self._step_count = 0
         self._max_steps = 0
 
@@ -108,10 +109,13 @@ class HallwayEnv(gym.Env):
         scan = self._latest_scan
         return scan.angle_min + np.arange(len(scan.ranges)) * scan.angle_increment
 
-    def _observation(self):
+    def _observation(self, new_episode=False):
+        """Push the latest scan onto the stack (or start one) and build the observation."""
+        obs_ranges = self._sanitized_ranges()[spec.OBS_BEAM_INDICES]
+        self._scan_stack = spec.new_scan_stack(obs_ranges) if new_episode \
+            else spec.push_scan(self._scan_stack, obs_ranges)
         return spec.build_observation(
-            self._sanitized_ranges()[spec.OBS_BEAM_INDICES], self._latest_pose, self.goal,
-            self._prev_action)
+            self._scan_stack, self._latest_pose, self.goal, self._prev_action)
 
     def _info(self, **extra):
         return {'pose': self._latest_pose.copy(), 'goal': self.goal.copy(),
@@ -161,7 +165,7 @@ class HallwayEnv(gym.Env):
         self._prev_action[:] = 0.0
         self._step_count = 0
         self._max_steps = spec.episode_step_limit(self._goal_distance)
-        return self._observation(), self._info()
+        return self._observation(new_episode=True), self._info()
 
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
