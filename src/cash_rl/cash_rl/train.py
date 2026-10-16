@@ -2,6 +2,7 @@
 
     ros2 run cash_rl train                                  # PPO, 3M steps
     ros2 run cash_rl train --algo sac --timesteps 1000000
+    ros2 run cash_rl train --pedestrians 4                  # moving pedestrians
     tensorboard --logdir ~/ros2_ws/runs                     # watch it
 
 Writes runs/<name>/ in the workspace (gitignored): config.json, TensorBoard
@@ -198,6 +199,8 @@ def main():
     parser.add_argument('--junction-prob', type=float, default=0.0,
                         help='share of training episodes that start and end on opposite '
                              'sides of the junction')
+    parser.add_argument('--pedestrians', type=int, default=0,
+                        help='moving pedestrians per episode, in training and eval')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
@@ -216,14 +219,16 @@ def main():
 
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
     env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range),
-                  'junction_prob': args.junction_prob}
+                  'junction_prob': args.junction_prob,
+                  'n_pedestrians': args.pedestrians}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
                              monitor_kwargs={'info_keywords': ('is_success',)})
     # Eval always uses the default goal range, so every run is scored on the same
-    # random spawn/goal pairs regardless of its training goal range.
-    eval_env = HallwayRaycastEnv()
+    # random spawn/goal pairs regardless of its training goal range. It does use
+    # the training pedestrian count: runs are comparable only at equal counts.
+    eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
 
     model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
                              tensorboard_log=run_dir, **kwargs)

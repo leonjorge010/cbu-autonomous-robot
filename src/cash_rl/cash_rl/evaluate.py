@@ -3,6 +3,7 @@
     ros2 run cash_rl evaluate ~/ros2_ws/runs/<run>/best_model.zip              # 2D, doors
     ros2 run cash_rl evaluate ~/ros2_ws/runs/<run>/best_model.zip --env gazebo
     ros2 run cash_rl evaluate runs/a/best_model.zip runs/b/best_model.zip --random 200
+    ros2 run cash_rl evaluate runs/a/best_model.zip --random 200 --pedestrians 4
 
 --env gazebo needs `ros2 launch cash_rl train_env.launch.py` running, and gives
 the most faithful result when nothing else is loading the CPU: HallwayEnv steps
@@ -46,16 +47,20 @@ def main():
     parser.add_argument('--repeats', type=int, default=1, help='episodes per door')
     parser.add_argument('--random', type=int, default=0,
                         help='held-out random spawn/goal pairs to add (2D only)')
+    parser.add_argument('--pedestrians', type=int, default=0,
+                        help='moving pedestrians per episode (2D only)')
     args = parser.parse_args()
     if args.random and args.env == 'gazebo':
         parser.error('--random is 2D only (HallwayEnv spawns from fixed poses)')
+    if args.pedestrians and args.env == 'gazebo':
+        parser.error('--pedestrians is 2D only (no pedestrians in Gazebo yet)')
 
     if args.env == 'gazebo':
         from cash_rl.hallway_env import HallwayEnv
         env = HallwayEnv()
     else:
         from cash_rl.raycast_env import HallwayRaycastEnv
-        env = HallwayRaycastEnv()
+        env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})
              for name, goal in sorted(spec.DOOR_GOALS.items())
              for repeat in range(args.repeats)]
@@ -88,12 +93,13 @@ def main():
                 f'{s["return"]:>+8.1f}')
     header = (f'{"":44} {"success":>7} {"collision":>9} {"timeout":>7} '
               f'{"time_s":>7} {"path":>6} {"reverse":>7} {"return":>8}')
-    print(f'\nDoors from spawn ({len(doors)} episodes per model, {args.env})')
+    setting = args.env + (f', {args.pedestrians} pedestrians' if args.pedestrians else '')
+    print(f'\nDoors from spawn ({len(doors)} episodes per model, {setting})')
     print(header)
     for label, door_summary, _ in summaries:
         print(row(label, door_summary))
     if randoms:
-        print(f'\nHeld-out random pairs ({len(randoms)} episodes per model, {args.env})')
+        print(f'\nHeld-out random pairs ({len(randoms)} episodes per model, {setting})')
         print(header)
         for label, _, random_summary in summaries:
             print(row(label, random_summary))
