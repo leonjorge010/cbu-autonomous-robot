@@ -5,6 +5,35 @@ for each session: what changed, results with numbers, and what's still open.
 
 ## 2026-10-16
 
+**Moving pedestrians and scan stacking** (`HallwayRaycastEnv`, Ashlyn; schedule week 8)
+- `HallwayRaycastEnv(n_pedestrians=N)`, default 0 so existing runs are unchanged: 0.25 m discs
+  walking the corridor axis at 0.8–1.4 m/s, turning back only at walls. They block beams (exact
+  ray/disc intersection, so the safety layer sees them too) and count as collisions. 2D only;
+  Gazebo has no pedestrians yet.
+- Pedestrians never turn back for the robot: with it ahead inside a 0.8 m gap they slow to 30%; if
+  it is in their path they sidestep away at 0.5 m/s (stopping inside 0.3 m until clear), then keep
+  walking the same way. A parked robot is never hit (0 hits, 100 episodes × 6 pedestrians).
+- Reward: up to −0.3 per pedestrian per step inside the 0.8 m gap, ramping to contact; hitting a
+  pedestrian costs −40 instead of a wall's −20. Step info adds `hit_pedestrian`,
+  `min_pedestrian_gap`.
+- Observation stacks the last 3 scans (41 → 113 values) so the policy can see motion; `HallwayEnv`
+  builds the same stack. 41-value models (all models so far, incl. `ppo_d800_prox`) still load:
+  `train.load_model` feeds them the newest scan only.
+- `train --pedestrians N` (training *and* periodic eval, so compare runs at equal counts),
+  `evaluate --pedestrians N`, `view_env --pedestrians N` (purple discs).
+- `downhill`, which ignores pedestrians, with 4 of them: 82/100 goals, 18 pedestrian hits.
+  Training speed with 4 pedestrians: 790 vs 855 steps/s without (~63 min per 3M steps measured
+  today, slower than the ~38 min seen 10-14).
+- Merged with this day's `main` (STL-27L LiDAR, wall proximity penalty, safety layer): pedestrian
+  and wall penalties apply side by side; `evaluate --pedestrians N --safety` works.
+
+**Open (pedestrians)**
+- Train a model on the new pedestrian env, e.g. `train --pedestrians 4 --goal-distance-range 1 25
+  --junction-prob 0.3 --timesteps 3000000 --name ppo_peds`, and compare against the 41-value
+  baselines with `evaluate --random 200 --pedestrians 4`.
+- Later: add a constant student following the robot, to model the user being escorted (keep them
+  within following distance; penalize losing them).
+
 **Real floor plan → sim world** (TEGR 2nd floor, from a phone photo of the printed plan, `docs/cbu_floorplan.jpg`)
 - `src/cash_sim/tools/trace_floorplan.py`: perspective-corrects the photo from the building's 4 outer
   corners, scales it with the plan's 0–40 ft bar (40 ft = 415 px, 2.94 cm/px; building 61 × 72 m),
