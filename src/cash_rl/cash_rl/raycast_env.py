@@ -10,9 +10,11 @@ The map frame is aligned with the Gazebo world frame (SLAM was started at the
 spawn pose), so poses here are world coordinates from hallway.sdf.
 
 Optional pedestrians (n_pedestrians, default 0) are discs that walk up and down
-the corridors, turning back at walls and obstacles. One heading toward the robot
-slows down once it is within spec.PEDESTRIAN_COMFORT_DISTANCE and turns back if
-it gets within PEDESTRIAN_TURN_DISTANCE; they ignore each other. They block
+the corridors, turning back at walls and obstacles. They never turn back for the
+robot: with the robot ahead and within spec.PEDESTRIAN_COMFORT_DISTANCE, one
+slows down, and if the robot is in its path it also sidesteps away from it (or
+waits, inside PEDESTRIAN_STOP_DISTANCE, until it has), then walks on in the same
+direction. They ignore each other. They block
 beams and count for collisions, and the robot is penalized for coming close
 (spec.step_outcome). They exist only here, not in Gazebo.
 """
@@ -40,11 +42,15 @@ PEDESTRIAN_SPEED_RANGE = (0.8, 1.4)
 PEDESTRIAN_WALL_CLEARANCE = PEDESTRIAN_RADIUS + 0.05
 # Pedestrians start at least this far from the robot's spawn.
 PEDESTRIAN_SPAWN_DISTANCE = 2.0
-# A pedestrian heading toward the robot walks at this fraction of its speed
-# inside spec.PEDESTRIAN_COMFORT_DISTANCE, and turns back inside
-# PEDESTRIAN_TURN_DISTANCE (both gaps to the margin-inflated footprint).
+# With the robot ahead and within spec.PEDESTRIAN_COMFORT_DISTANCE (gap to the
+# margin-inflated footprint), a pedestrian walks at PEDESTRIAN_SLOW_FACTOR of
+# its speed. If the robot is also in its path (lateral overlap plus
+# PEDESTRIAN_PATH_BUFFER) it sidesteps at PEDESTRIAN_SIDESTEP_SPEED, and inside
+# PEDESTRIAN_STOP_DISTANCE it stops walking forward until its path is clear.
 PEDESTRIAN_SLOW_FACTOR = 0.3
-PEDESTRIAN_TURN_DISTANCE = 0.3
+PEDESTRIAN_STOP_DISTANCE = 0.3
+PEDESTRIAN_SIDESTEP_SPEED = 0.5
+PEDESTRIAN_PATH_BUFFER = 0.1
 
 
 def _rectangle_perimeter(half_length, half_width, spacing):
@@ -255,23 +261,56 @@ class HallwayRaycastEnv(gym.Env):
         self.pedestrians = np.array(positions).reshape(-1, 2)
         self._pedestrian_velocities = np.array(velocities).reshape(-1, 2)
 
+    def _sidesteps(self, dt):
+        """Return (n, 2) sidestep displacements for pedestrians with the robot in their path.
+
+        Each one steps toward the side needing the shorter step to clear the
+        robot, or the other side if that is too close to a wall, or not at all.
+        """
+        steps = np.zeros_like(self.pedestrians)
+        speed = np.hypot(*self._pedestrian_velocities.T)
+        walking = speed > 0
+        forward = np.zeros_like(self._pedestrian_velocities)
+        forward[walking] = self._pedestrian_velocities[walking] / speed[walking, None]
+        lateral = np.stack([-forward[:, 1], forward[:, 0]], axis=1)
+        ahead = np.einsum('ij,ij->i', self.pose[:2] - self.pedestrians, forward) > 0
+        yielding = walking & ahead & (self.pedestrian_gaps() < spec.PEDESTRIAN_COMFORT_DISTANCE)
+        # Robot footprint corners relative to each pedestrian, along its lateral axis.
+        x, y, yaw = self.pose
+        c, s = np.cos(yaw), np.sin(yaw)
+        hl = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN
+        hw = spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN
+        local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+        corners = np.array([x, y]) + local @ np.array([[c, s], [-s, c]])
+        corner_lateral = np.einsum('nkj,nj->nk', corners[None] - self.pedestrians[:, None],
+                                   lateral)
+        reach = PEDESTRIAN_RADIUS + PEDESTRIAN_PATH_BUFFER
+        low, high = corner_lateral.min(axis=1), corner_lateral.max(axis=1)
+        in_path = yielding & (low < reach) & (high > -reach)
+        # Shift needed to clear the robot moving +lateral (past `high`) or -lateral.
+        prefer_plus = (high + reach) < (reach - low)
+        step = PEDESTRIAN_SIDESTEP_SPEED * dt
+        for i in np.flatnonzero(in_path):
+            for side in ((1.0, -1.0) if prefer_plus[i] else (-1.0, 1.0)):
+                target = self.pedestrians[i] + side * step * lateral[i]
+                if self._clearance_at(*target) >= PEDESTRIAN_WALL_CLEARANCE:
+                    steps[i] = target - self.pedestrians[i]
+                    break
+        return steps, yielding, in_path
+
     def _move_pedestrians(self, dt):
         """Advance pedestrians by dt, yielding to the robot and turning back at walls.
 
-        _pedestrian_velocities hold each one's walking velocity; a pedestrian
-        heading toward the robot turns back inside PEDESTRIAN_TURN_DISTANCE and
-        walks at PEDESTRIAN_SLOW_FACTOR of it inside the comfort distance.
+        _pedestrian_velocities hold each one's walking velocity, which only walls
+        reverse; the robot just slows a pedestrian down or sidesteps it (_sidesteps).
         """
         if len(self.pedestrians) == 0:
             return
-        gaps = self.pedestrian_gaps()
-        to_robot = self.pose[:2] - self.pedestrians
-        approaching = np.einsum('ij,ij->i', self._pedestrian_velocities, to_robot) > 0
-        turn = approaching & (gaps < PEDESTRIAN_TURN_DISTANCE)
-        self._pedestrian_velocities[turn] *= -1.0
-        slow = approaching & ~turn & (gaps < spec.PEDESTRIAN_COMFORT_DISTANCE)
-        speed_factor = np.where(slow, PEDESTRIAN_SLOW_FACTOR, 1.0)[:, None]
-        ahead = self.pedestrians + self._pedestrian_velocities * speed_factor * dt
+        sidesteps, yielding, in_path = self._sidesteps(dt)
+        self.pedestrians += sidesteps
+        stop = in_path & (self.pedestrian_gaps() < PEDESTRIAN_STOP_DISTANCE)
+        speed_factor = np.where(stop, 0.0, np.where(yielding, PEDESTRIAN_SLOW_FACTOR, 1.0))
+        ahead = self.pedestrians + self._pedestrian_velocities * speed_factor[:, None] * dt
         blocked = self._clearance_at(ahead[:, 0], ahead[:, 1]) < PEDESTRIAN_WALL_CLEARANCE
         self._pedestrian_velocities[blocked] *= -1.0
         self.pedestrians[~blocked] = ahead[~blocked]
