@@ -3,6 +3,46 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-16
+
+**Real floor plan → sim world** (TEGR 2nd floor, from a phone photo of the printed plan, `docs/cbu_floorplan.jpg`)
+- `src/cash_sim/tools/trace_floorplan.py`: perspective-corrects the photo from the building's 4 outer
+  corners, scales it with the plan's 0–40 ft bar (40 ft = 415 px, 2.94 cm/px; building 61 × 72 m),
+  extracts the thick wall lines, and keeps the walkable area inside hand-placed corridor rectangles
+  whose edges sit on the wall lines, so every doorway is closed. Label text is removed; three door
+  leaves drawn swung open into the corridor are cleared (modeled shut).
+- Measured corridor widths: south (201–205) ~2.3 m, west (228–230) ~3.0–3.2 m, north (221–226) ~2.3 m.
+  Narrower than the 3 m guessed by eye; the sim hallway is 2.4 m.
+- Result `src/cash_sim/worlds/cbu_floor2_layout.yaml`: 594 m² of free space (corridors, Gallery 2,
+  women's restroom vestibule, alcove outside 228, Elevator 2 lobby), the counter in Learning Zone 3,
+  keep-out rectangles for Learning Zones 2/3/4 (open to the corridor, so traced as open space), and
+  24 door goals on the corridor centerline facing each door.
+- Fixed the Gallery 2 corner (spotted against the plan): Stair 1 has no wall on the gallery side, so
+  its flights are now open space + keep-out (one flight goes down; a 2D LiDAR can't see a drop, so the
+  real robot must rely on the keep-out), the stair core is an obstacle, and `elevator_1`/`stair_1`
+  goals were added (26 total). Elevator 1's door faces the west end of the 201–205 corridor.
+- `src/cash_sim/tools/build_floorplan_world.py` turns the layout into `worlds/cbu_floor2.sdf`
+  (329 wall boxes, `gz sdf -k` valid), `maps/cbu_floor2.{pgm,yaml}` and the Nav2 keepout mask
+  `maps/cbu_floor2_keepout.{pgm,yaml}`. Wall boxes vs. traced polygon: 20 of 143k sample points
+  overlap (sharp corners); the map matches to within one 5 cm cell.
+- `sim.launch.py` has a `world` argument: `world:=cbu_floor2 x:=14.1 y:=30 yaw:=1.57` spawns in the
+  west corridor.
+- Checked with the existing code (`CASH_MAP_YAML=maps/cbu_floor2.yaml`): one connected traversable
+  area, every door ≥ 0.65 m from walls, geodesic field 36 ms/goal, `downhill` reaches 40/40 random
+  goals and crosses the building (west corridor → 221/205/elevator_2) with no collisions.
+
+**Open**
+- Not checked in Gazebo yet (needs a run: `ros2 launch cash_sim sim.launch.py world:=cbu_floor2
+  gui:=true rviz:=false x:=14.1 y:=30 yaw:=1.57`).
+- In person: tape one corridor width (fixes the ±2–5% photo scale); what the atrium edge is (glass
+  railing would give no LiDAR returns); whether TEGR 214/216 have corridor doors (their main doors
+  face Learning Zone 3, so their goals sit at the zone opening); restroom door positions; what the
+  "D2-x" wall items are.
+- Env support for this map: keep-out zones in spawn/goal sampling and the geodesic (a virtual wall),
+  per-map door goals and spawn instead of `spec.DOOR_GOALS`/`SPAWN_POSE`, and the hallway-specific
+  junction sampling (`BRANCH_MIN_Y`). Goals can now be up to ~85 m away, past
+  `MAX_GOAL_DISTANCE` (30 m), so long escorts should be chained through waypoints.
+
 ## 2026-10-15
 
 **Sharing with the team**
