@@ -62,6 +62,18 @@ for each session: what changed, results with numbers, and what's still open.
 - Restart the 3M + LR-decay experiment (above). Then try the robot's measured velocity and 72
   beams as inputs, and a larger time penalty for the final-approach stalls (seed 2).
 - Safety layer as a ROS node between the policy and `/cmd_vel` for the robot.
+- Generalize beyond this one hallway. The sim hallway is invented, so the real CBU building is
+  itself a new map.
+  - Carries over unchanged: the sensor model, reward, PPO settings, tools and the safety layer.
+  - Per new map: a SLAM map (~20–30 min drive), `CASH_MAP_YAML`, goal/door list, then retrain
+    (3 seeds) and evaluate.
+  - One-time code work: the junction-crossing episodes (`BRANCH_MIN_Y`, junction at x = 14 m),
+    `DOOR_GOALS`/`SPAWN_POSE` and some tests assume this map's layout.
+  - The policy only sees LiDAR + relative goal, but has trained on one map, so it's untested on a
+    layout it has never seen. Plan, after random obstacles: train on several maps or procedurally
+    generated hallways (varied widths, junctions, obstacles), and hold out one layout as the test.
+  - Deployment still needs a map for localization and room waypoints (milestone 2). The policy does
+    local driving to waypoints and the safety layer protects at the last moment.
 - Gazebo eval from varied start poses; 2–3 seeds per setup (cancelled today for time).
 - LiDAR mounting position and height on the real chassis.
 
