@@ -25,23 +25,68 @@ for each session: what changed, results with numbers, and what's still open.
   (329 wall boxes, `gz sdf -k` valid), `maps/cbu_floor2.{pgm,yaml}` and the Nav2 keepout mask
   `maps/cbu_floor2_keepout.{pgm,yaml}`. Wall boxes vs. traced polygon: 20 of 143k sample points
   overlap (sharp corners); the map matches to within one 5 cm cell.
-- `sim.launch.py` has a `world` argument: `world:=cbu_floor2 x:=14.1 y:=30 yaw:=1.57` spawns in the
-  west corridor.
+- `sim.launch.py` has a `world` argument: `world:=cbu_floor2 x:=9.6 y:=16.8 yaw:=0` spawns at the
+  default start (see below).
 - Checked with the existing code (`CASH_MAP_YAML=maps/cbu_floor2.yaml`): one connected traversable
   area, every door ≥ 0.65 m from walls, geodesic field 36 ms/goal, `downhill` reaches 40/40 random
   goals and crosses the building (west corridor → 221/205/elevator_2) with no collisions.
 
-**Open**
-- Not checked in Gazebo yet (needs a run: `ros2 launch cash_sim sim.launch.py world:=cbu_floor2
-  gui:=true rviz:=false x:=14.1 y:=30 yaw:=1.57`).
-- In person: tape one corridor width (fixes the ±2–5% photo scale); what the atrium edge is (glass
-  railing would give no LiDAR returns); whether TEGR 214/216 have corridor doors (their main doors
-  face Learning Zone 3, so their goals sit at the zone opening); restroom door positions; what the
-  "D2-x" wall items are.
-- Env support for this map: keep-out zones in spawn/goal sampling and the geodesic (a virtual wall),
-  per-map door goals and spawn instead of `spec.DOOR_GOALS`/`SPAWN_POSE`, and the hallway-specific
-  junction sampling (`BRANCH_MIN_Y`). Goals can now be up to ~85 m away, past
-  `MAX_GOAL_DISTANCE` (30 m), so long escorts should be chained through waypoints.
+**2D env support for any map** (`cash_rl`)
+- Per-map sidecars next to `MAP.yaml`: `MAP_goals.yaml` (spawn, named goals; `branch_min_y` for the
+  hallway's `--junction-prob`) and `MAP_keepout.yaml`. The hallway's goals moved out of `spec.py`
+  into `maps/hallway_goals.yaml`; `build_floorplan_world.py` writes `cbu_floor2_goals.yaml`.
+- Keep-out = virtual wall: never spawned in or used as a goal, not traversable for the geodesic, and
+  entering it with the robot's center ends the episode as a collision (`info['keepout']`). Same in
+  `HallwayEnv` (Gazebo), whose world name now follows the map (`train_env.launch.py world:=...`).
+- `lookahead`: the policy observes the route waypoint that far ahead instead of the goal, so 85 m
+  escorts stay inside the 30 m observation range. `train`/`evaluate`/`view_env`/`demo` take `--map`
+  and `--lookahead`; `config.json` records the map, and evaluate/view_env/demo default to it.
+- Tests: 43 pass, incl. new `test_floor_plan_map.py` (keep-out termination, sampling, waypoints,
+  far goals reachable). Old hallway model unchanged: `ppo_d800_prox` 7/7 doors, 98% on 50 held-out.
+- Zero-shot `ppo_d800_prox` on `cbu_floor2` (lookahead 10 m): 68% of 100 held-out random goals
+  (14% keep-out, 2% wall, 16% timeout); 5/26 named goals from the spawn. Most north-bound runs clip
+  the Learning Zone 3 counter at the zone's corridor opening (15.6, 36.3). It handles the real
+  corridors but has never been penalized for keep-out, which its LiDAR can't see.
+
+
+**Start pose, launch and RViz**
+- Default start on `cbu_floor2` is the `stair_1` stop in Gallery 2, facing east (9.6, 16.8, 0) — the
+  robot's starting point for now. Named-goal evals skip goals at the start pose.
+- `sim.launch.py`/`train_env.launch.py`: unset `x`/`y`/`yaw` take the world's spawn from its goals
+  file, so `world:=cbu_floor2` alone starts at `stair_1`.
+- RViz: `sim.launch.py map:=cbu_floor2` adds `map_view.launch.py` — `nav2_map_server` for `/map` and
+  `/keepout_mask`, `goal_markers` (labeled arrows per goal, green spawn arrow) and a static map→odom
+  equal to the spawn pose (no localization; odometry drift uncorrected; not with SLAM). Checked
+  headless on a separate ROS domain; not yet looked at in RViz.
+- Lookahead waypoints use a per-goal downhill-pointer array instead of a 3×3 search per cell:
+  env with lookahead 978 → 1455 steps/s (2002 without).
+
+**First policy on the real floor:** `ppo_floor2_s0` (PPO, 3M steps, 45 min, `--lookahead 10
+  --goal-distance-range 1 25`). Periodic eval swung 76% → 42% → 91% (best, 2.75M). Held-out 200:
+  best 90.0% success / 9% wall / 1% keep-out (zero-shot hallway model: 60.5% / 5.5% / 16%),
+  23/25 named goals; with the safety layer 92.0% / 0% wall / 1% keep-out / 7% timeout, 24/25.
+  Wall hits are inside corners at full speed (Gallery 2 → south corridor at the men's restroom
+  block, west → north corridor). `evaluate` now reports keep-out entries separately. Details in
+  `docs/MODELS.md`. Model weights are local only (`runs/`, not released yet).
+
+**Next** (paused here; in suggested order)
+1. Seeds 1 and 2 of `ppo_floor2` (one at a time, ~45 min each; same command with `--seed 1/2`,
+   see `docs/MODELS.md` → Reproducing). Consider `--lr-schedule linear` for the eval swings. Then
+   release the weights like `models-2026-10-15`.
+2. Gazebo check of this world: `ros2 launch cash_rl train_env.launch.py world:=cbu_floor2`, then
+   `CASH_MAP_YAML=~/ros2_ws/maps/cbu_floor2.yaml ros2 run cash_rl evaluate
+   runs/ppo_floor2_s0/best_model.zip --env gazebo` (training stopped). Also look at the world in
+   the Gazebo GUI and the `map:=cbu_floor2` RViz view.
+3. Escort node in ROS: localize on `cbu_floor2` (Nav2 AMCL), "escort to TEGR X" → route →
+   10 m waypoints → numpy-exported policy → safety layer + keep-out check → `/cmd_vel`. Test end to
+   end in Gazebo; the same node goes on the Jetson (milestones 2, 4 and the numpy export).
+4. Inside-corner crashes: more corner-crossing training episodes (generalize `--junction-prob`
+   beyond the hallway) or a stronger near-wall route cost, so the safety layer has less to catch.
+5. Obstacles, then pedestrians, in the 2D env (main open item for the CSCI 4220 report).
+6. In person: tape one corridor width (fixes the ±2–5% photo scale); what the atrium edge is (glass
+   railing would give no LiDAR returns); whether TEGR 214/216 have corridor doors (their main doors
+   face Learning Zone 3, so their goals sit at the zone opening); restroom door positions; what the
+   "D2-x" wall items are; whether Stair 1 has a railing or gate.
 
 ## 2026-10-15
 

@@ -213,6 +213,32 @@ Where the 2D collisions happen on the 200-goal test:
 - **The water fountain** sticks out into the corridor and now causes as many hits as the corners.
   Training with random obstacles, the next planned step, should help with it.
 
+## TEGR 2nd floor (`cbu_floor2`)
+
+The first map traced from the real building (`maps/cbu_floor2.yaml`, from the plan photo): a U of
+2.3–3.2 m corridors around the atrium, ~140 m long, with keep-out zones (three learning zones and
+Stair 1, open to the corridor) and 26 named goals. Trips run up to ~85 m, so these models observe
+a waypoint 10 m along the route (`--lookahead 10`) instead of the goal. Entering a keep-out zone
+ends the episode as a collision. Same PPO settings, reward and sensor model as `ppo_d800_prox`.
+
+`ppo_floor2_s0`: one seed, 3M steps (45 min), `--goal-distance-range 1 25`. Its periodic eval
+(45 episodes) swung from 76% at 0.75M down to 42% and back to 91% at 2.75M (`best_model.zip`).
+
+Held-out: 200 random trips (1–15 m) plus the 25 named goals from the start (Stair 1), 2D:
+
+| Model | Random: success | collision | (of which keep-out) | timeout | Named goals |
+|---|---|---|---|---|---|
+| `ppo_d800_prox` final (hallway model, no retraining) | 60.5% | 21.5% | 16.0% | 18.0% | 20% |
+| `ppo_floor2_s0` final | 88.0% | 12.0% | 2.0% | 0% | 72% |
+| `ppo_floor2_s0` best | **90.0%** | 10.0% | 1.0% | 0% | **92%** |
+| `ppo_floor2_s0` best + safety layer | **92.0%** | **1.0%** | 1.0% | 7.0% | **96%** |
+
+- Wall hits (18 of 200, best) are inside corners at full speed: Gallery 2 into the south corridor
+  at the men's restroom block (4), the west→north corridor corner (2), the Elevator 2 lobby and
+  restroom vestibule corners. The safety layer stops all of them (override 7.9% of steps); they
+  become timeouts. It can't stop keep-out entries, which have no LiDAR return.
+- One seed only: per the seed variation above, expect ±3% between seeds. Not yet run in Gazebo.
+
 ## Caveats
 
 - **Only `ppo_d800_prox` has multiple seeds.** It spreads ±2.8% in success and ±1.6% in
@@ -236,6 +262,7 @@ every setting.
 | `ppo_d800` | `14351b5` | same as `ppo_junction` |
 | `ppo_d800_wallcost` | `b333324` to `4081d99` | same as `ppo_junction` |
 | `ppo_d800_prox` | `5f4369e` or later | same as `ppo_junction` |
+| `ppo_floor2_s0` | this commit or later | `ros2 run cash_rl train --name ppo_floor2_s0 --map maps/cbu_floor2.yaml --lookahead 10 --goal-distance-range 1 25 --timesteps 3000000 --eval-freq 250000 --seed 0` |
 
 Evaluate any model with
 `ros2 run cash_rl evaluate runs/<name>/best_model.zip --random 200`. Run the old models' code
