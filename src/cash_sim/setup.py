@@ -25,5 +25,5 @@ setup(
     description='Gazebo hallway simulation and robot model for the CBU Autonomous Robot',
     license='MIT',
     extras_require={'test': ['pytest']},
-    entry_points={'console_scripts': []},
+    entry_points={'console_scripts': ['goal_markers = cash_sim.goal_markers:main']},
 )

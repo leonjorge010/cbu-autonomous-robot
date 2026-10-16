@@ -2,13 +2,24 @@
 import os
 
 from ament_index_python.packages import get_package_share_directory
+from cash_sim.maps import default_spawn
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction,
+                            SetLaunchConfiguration)
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (Command, LaunchConfiguration, PathJoinSubstitution,
+                                  PythonExpression)
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+
+def fill_spawn_defaults(context):
+    """Unset x/y/yaw take the world's default spawn (maps/<world>_goals.yaml)."""
+    spawn = default_spawn(LaunchConfiguration('world').perform(context))
+    return [SetLaunchConfiguration(name, str(value))
+            for name, value in zip(('x', 'y', 'yaw'), spawn)
+            if not LaunchConfiguration(name).perform(context)]
 
 
 def generate_launch_description():
@@ -63,6 +74,13 @@ def generate_launch_description():
         output='screen',
     )
 
+    # map:=<name>: show that saved map, its keep-out zones and named goals (map_view.launch.py).
+    map_view = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(pkg, 'launch', 'map_view.launch.py')),
+        launch_arguments={'map': LaunchConfiguration('map'), 'x': x, 'y': y, 'yaw': yaw}.items(),
+        condition=IfCondition(PythonExpression(["'", LaunchConfiguration('map'), "' != ''"])),
+    )
+
     rviz = Node(
         package='rviz2',
         executable='rviz2',
@@ -79,13 +97,22 @@ def generate_launch_description():
         DeclareLaunchArgument('gui', default_value='true',
                               description='Open the Gazebo window (false = headless)'),
         DeclareLaunchArgument('rviz', default_value='true', description='Open RViz'),
-        DeclareLaunchArgument('x', default_value='0.0', description='Spawn x (m)'),
-        DeclareLaunchArgument('y', default_value='0.0', description='Spawn y (m)'),
-        DeclareLaunchArgument('yaw', default_value='0.0', description='Spawn yaw (rad)'),
+        DeclareLaunchArgument('x', default_value='',
+                              description="Spawn x (m) (default: the world's spawn in "
+                                          'maps/<world>_goals.yaml, else 0)'),
+        DeclareLaunchArgument('y', default_value='', description='Spawn y (m) (same default)'),
+        DeclareLaunchArgument('yaw', default_value='',
+                              description='Spawn yaw (rad) (same default)'),
+        DeclareLaunchArgument('map', default_value='',
+                              description='Saved map in <workspace>/maps to show in RViz with '
+                                          'its keep-out zones and goals (e.g. cbu_floor2); '
+                                          'not with SLAM'),
+        OpaqueFunction(function=fill_spawn_defaults),
         gazebo_gui,
         gazebo_headless,
         robot_state_publisher,
         spawn_robot,
         bridge,
+        map_view,
         rviz,
     ])
