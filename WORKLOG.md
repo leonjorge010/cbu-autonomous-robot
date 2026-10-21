@@ -3,6 +3,48 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-21
+
+**Pedestrians that don't yield; lane penalty** (`HallwayRaycastEnv`, Ashlyn; schedule week 8). Branch
+`pedestrians-no-yield`, not merged yet.
+- `ppo_peds` had learned to rely on pedestrians stepping around it: against pedestrians that walk
+  straight on, its success fell from 90.5% to 36% (100 held-out goals, 4 pedestrians).
+- Pedestrians now ignore the robot and walk into it if it stays in their path; the old behavior is
+  `pedestrians_yield=True` / `--yielding-pedestrians` (`train`, `evaluate`, `view_env`, `demo`),
+  to reproduce runs from before today. Speed lowered from 0.8–1.4 to 0.5–0.9 m/s.
+- Waiting is free: stopped (< 0.05 m/s) with a pedestrian within 0.8 m, the robot pays no time or
+  pedestrian proximity penalty (`spec.waiting_for_pedestrian`). Being walked into still costs −40.
+- Lane penalty (`PEDESTRIAN_LANE_*`, `spec.pedestrian_lane_penalty`): up to −0.3 per pedestrian per
+  step while the footprint is in a pedestrian's lane and they would reach it within 3 s at their
+  closing speed, waiting or not. Reason: the 0.8 m proximity penalty starts only 0.6–0.8 s before
+  contact, too late for a diff-drive robot to turn and get clear. Costs ~10% env speed.
+- `demo --pedestrians N` (new pedestrians placed at the start of each leg).
+
+**Results** (200 held-out goals, 4 pedestrians, one seed each)
+
+| Model | Success | Collision | Timeout | Reversing |
+|---|---|---|---|---|
+| `ppo_peds_noyield` (3M) | 48.0% | 50.0% | 2.0% | 14.5% |
+| `ppo_peds_lane` final (6M, lane penalty) | 28.5% | 61.0% | 10.5% | 28.1% |
+| `ppo_peds_lane` best_model | 51.5% | 48.0% | 0.5% | 14.1% |
+
+- Neither model avoids pedestrians: `downhill`, which ignores them entirely, gets 57% success / 43%
+  pedestrian collisions on the same episodes. Most collisions are the robot driving into a
+  pedestrian walking toward it (front or side), mid-episode; few happen while it is stopped.
+- The lane penalty taught backing away (reverse doubled; 0.15 m/s reverse can't outrun a
+  pedestrian) instead of stepping aside.
+- On the TEGR map (`CASH_MAP_YAML=maps/cbu_floor2.yaml`) `ppo_peds_noyield` reached 6/30 random
+  goals, mostly timing out. `view_env`/`demo` still draw the hallway's door labels there (they sit
+  outside the building), and pedestrians assume the hallway's corridor directions.
+
+**Open (pedestrians)**
+- Find out whether avoidance is possible at all here (36-beam view sees a pedestrian reliably only
+  within ~2.9 m; getting clear takes ~2.5–3 s) or PPO just doesn't find it (`ent_coef` is 0):
+  1. curriculum: `train --pedestrians 1 ...` — does it beat `downhill` with 1 pedestrian?
+  2. a scripted avoider that knows the pedestrians' positions, as an upper bound.
+- Then revert or rework the lane penalty, or try an entropy bonus — one change at a time.
+- Seed-1 repeat of `ppo_peds_noyield` was queued but never started.
+
 ## 2026-10-16
 
 **Moving pedestrians and scan stacking** (`HallwayRaycastEnv`, Ashlyn; schedule week 8)
