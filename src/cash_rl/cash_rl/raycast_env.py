@@ -303,6 +303,57 @@ class HallwayRaycastEnv(gym.Env):
         self.pedestrians = np.array(positions).reshape(-1, 2)
         self._pedestrian_velocities = np.array(velocities).reshape(-1, 2)
 
+    def _pedestrian_lanes(self):
+        """Return the robot footprint in each pedestrian's walking frame.
+
+        Returns (speed, forward, lateral, along, low, high): each pedestrian's
+        walking speed (n,), unit walking direction and its left normal (n, 2), the
+        margin-inflated footprint corners' offsets from it along `forward` (n, 4),
+        and their min/max offsets along `lateral` (n,).
+        """
+        speed = np.hypot(*self._pedestrian_velocities.T)
+        walking = speed > 0
+        forward = np.zeros_like(self._pedestrian_velocities)
+        forward[walking] = self._pedestrian_velocities[walking] / speed[walking, None]
+        lateral = np.stack([-forward[:, 1], forward[:, 0]], axis=1)
+        x, y, yaw = self.pose
+        c, s = np.cos(yaw), np.sin(yaw)
+        hl = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN
+        hw = spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN
+        local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+        offsets = (np.array([x, y]) + local @ np.array([[c, s], [-s, c]]))[None] \
+            - self.pedestrians[:, None]
+        along = np.einsum('nkj,nj->nk', offsets, forward)
+        corner_lateral = np.einsum('nkj,nj->nk', offsets, lateral)
+        return speed, forward, lateral, along, corner_lateral.min(axis=1), \
+            corner_lateral.max(axis=1)
+
+    @staticmethod
+    def _in_lane(low, high):
+        """Footprint overlaps the lane: the disc plus PEDESTRIAN_PATH_BUFFER each side."""
+        reach = PEDESTRIAN_RADIUS + PEDESTRIAN_PATH_BUFFER
+        return (low < reach) & (high > -reach)
+
+    def pedestrian_lane_times(self):
+        """Return the seconds until each pedestrian would reach the robot walking its lane.
+
+        inf where the robot's footprint isn't in that pedestrian's lane ahead of
+        it, or isn't being closed on: the closing speed is the pedestrian's
+        walking speed minus the robot's velocity along the same direction.
+        """
+        times = np.full(len(self.pedestrians), np.inf)
+        if len(self.pedestrians) == 0:
+            return times
+        speed, forward, _, along, low, high = self._pedestrian_lanes()
+        robot_velocity = self._velocity[0] * np.array([np.cos(self.pose[2]),
+                                                       np.sin(self.pose[2])])
+        closing = speed - forward @ robot_velocity
+        ahead = along.max(axis=1) > 0
+        lane = self._in_lane(low, high) & ahead & (closing > 0)
+        gap = np.maximum(along.min(axis=1) - PEDESTRIAN_RADIUS, 0.0)
+        times[lane] = gap[lane] / closing[lane]
+        return times
+
     def _sidesteps(self, dt):
         """Return (n, 2) sidestep displacements for pedestrians with the robot in their path.
 
@@ -310,25 +361,12 @@ class HallwayRaycastEnv(gym.Env):
         robot, or the other side if that is too close to a wall, or not at all.
         """
         steps = np.zeros_like(self.pedestrians)
-        speed = np.hypot(*self._pedestrian_velocities.T)
+        speed, forward, lateral, _, low, high = self._pedestrian_lanes()
         walking = speed > 0
-        forward = np.zeros_like(self._pedestrian_velocities)
-        forward[walking] = self._pedestrian_velocities[walking] / speed[walking, None]
-        lateral = np.stack([-forward[:, 1], forward[:, 0]], axis=1)
         ahead = np.einsum('ij,ij->i', self.pose[:2] - self.pedestrians, forward) > 0
         yielding = walking & ahead & (self.pedestrian_gaps() < spec.PEDESTRIAN_COMFORT_DISTANCE)
-        # Robot footprint corners relative to each pedestrian, along its lateral axis.
-        x, y, yaw = self.pose
-        c, s = np.cos(yaw), np.sin(yaw)
-        hl = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN
-        hw = spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN
-        local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
-        corners = np.array([x, y]) + local @ np.array([[c, s], [-s, c]])
-        corner_lateral = np.einsum('nkj,nj->nk', corners[None] - self.pedestrians[:, None],
-                                   lateral)
         reach = PEDESTRIAN_RADIUS + PEDESTRIAN_PATH_BUFFER
-        low, high = corner_lateral.min(axis=1), corner_lateral.max(axis=1)
-        in_path = yielding & (low < reach) & (high > -reach)
+        in_path = yielding & self._in_lane(low, high)
         # Shift needed to clear the robot moving +lateral (past `high`) or -lateral.
         prefer_plus = (high + reach) < (reach - low)
         step = PEDESTRIAN_SIDESTEP_SPEED * dt
@@ -438,6 +476,7 @@ class HallwayRaycastEnv(gym.Env):
         self._prev_action = action
 
         gaps = self.pedestrian_gaps()
+        lane_times = self.pedestrian_lane_times()
         hit_pedestrian = bool(np.any(gaps < 0.0))
         collided = hit_pedestrian or self._outline_hits(self._collision_outline, self.pose)
         clearance = self.clearance()
@@ -445,7 +484,8 @@ class HallwayRaycastEnv(gym.Env):
         reward, reached = spec.step_outcome(
             self._goal_distance, goal_distance, self.pose, self.goal, collided, clearance,
             pedestrian_gaps=gaps, hit_pedestrian=hit_pedestrian,
-            waiting=spec.waiting_for_pedestrian(self._velocity[0], gaps))
+            waiting=spec.waiting_for_pedestrian(self._velocity[0], gaps),
+            pedestrian_lane_times=lane_times)
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observe()
@@ -454,7 +494,9 @@ class HallwayRaycastEnv(gym.Env):
         info = self._info(min_range=float(np.min(self._ranges)), clearance=clearance,
                           collided=collided, hit_pedestrian=hit_pedestrian,
                           is_success=reached,
-                          min_pedestrian_gap=float(gaps.min()) if len(gaps) else np.inf)
+                          min_pedestrian_gap=float(gaps.min()) if len(gaps) else np.inf,
+                          min_pedestrian_lane_time=float(lane_times.min())
+                          if len(lane_times) else np.inf)
         return obs, reward, terminated, truncated, info
 
     def render(self):

@@ -289,8 +289,9 @@ def test_pedestrian_walks_into_parked_robot_by_default():
         if terminated:
             break
     assert info['collided'] and info['hit_pedestrian']
-    # Waiting is free, but being walked into still costs the collision.
-    assert reward == pytest.approx(-spec.PEDESTRIAN_COLLISION_PENALTY)
+    # Waiting is free, but not in its lane, and being walked into costs the collision.
+    assert reward == pytest.approx(
+        -spec.PEDESTRIAN_COLLISION_PENALTY - spec.PEDESTRIAN_LANE_PENALTY)
 
 
 def test_pedestrian_steps_around_parked_robot_without_turning_back():
@@ -308,8 +309,8 @@ def test_pedestrian_steps_around_parked_robot_without_turning_back():
         assert steps < 100, 'pedestrian never got past the robot'
     assert min(gaps) > 0.0
     assert abs(env.pedestrians[0, 1]) > 0.3  # passed beside the robot, not through it
-    # Parked while it passed: no proximity penalty, and no time penalty while close.
-    assert -spec.TIME_PENALTY * steps < total <= 0.0
+    # Parked in its lane until it stepped aside: the lane penalty applied.
+    assert total < -spec.TIME_PENALTY * steps
 
 
 def test_pedestrian_waits_when_it_cannot_step_aside():
@@ -391,6 +392,49 @@ def test_stopping_for_a_pedestrian_is_not_penalized():
     assert spec.step_outcome(4.0, 4.0, pose, goal, True, pedestrian_gaps=[-0.1],
                              hit_pedestrian=True, waiting=True)[0] \
         == pytest.approx(-spec.PEDESTRIAN_COLLISION_PENALTY)
+
+
+def test_lane_time_counts_only_pedestrians_closing_on_the_robot_in_their_lane():
+    spawn = (10.0, 0.0, 0.0)  # parked, facing +x
+    front = spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN
+    # Walking -x at 1 m/s straight at the robot from 3 m: reaches its front edge
+    # after (3 - front - radius) s.
+    env, _ = pedestrian_env((13.0, 0.0), velocity=(-1.0, 0.0), spawn=spawn)
+    assert env.pedestrian_lane_times()[0] == pytest.approx(3.0 - front - PEDESTRIAN_RADIUS)
+    # Same, but in a lane beside the robot, or walking away from it: no lane time.
+    env, _ = pedestrian_env((13.0, 0.9), velocity=(-1.0, 0.0), spawn=spawn)
+    assert env.pedestrian_lane_times()[0] == np.inf
+    env, _ = pedestrian_env((13.0, 0.0), velocity=(1.0, 0.0), spawn=spawn)
+    assert env.pedestrian_lane_times()[0] == np.inf
+    # Coming up from behind: timed at the closing speed, and never if the robot
+    # drives away faster than the pedestrian walks.
+    env, _ = pedestrian_env((8.0, 0.0), velocity=(0.9, 0.0), spawn=spawn)
+    gap = 2.0 - front - PEDESTRIAN_RADIUS
+    env._velocity[0] = 0.5
+    assert env.pedestrian_lane_times()[0] == pytest.approx(gap / 0.4)
+    env._pedestrian_velocities[0] = (0.4, 0.0)
+    assert env.pedestrian_lane_times()[0] == np.inf
+
+
+def test_lane_penalty_ramps_up_to_contact_and_rewards_stepping_aside():
+    horizon, full = spec.PEDESTRIAN_LANE_HORIZON, spec.PEDESTRIAN_LANE_PENALTY
+    assert spec.pedestrian_lane_penalty([]) == 0.0
+    assert spec.pedestrian_lane_penalty([np.inf, horizon, horizon + 1]) == 0.0
+    assert spec.pedestrian_lane_penalty([horizon / 2]) == pytest.approx(full / 2)
+    assert spec.pedestrian_lane_penalty([0.0, 0.0]) == pytest.approx(2 * full)
+    # Waiting doesn't excuse it.
+    pose, goal = (0.0, 0.0, 0.0), (5.0, 0.0)
+    reward, _ = spec.step_outcome(4.0, 4.0, pose, goal, False, waiting=True,
+                                  pedestrian_lane_times=[0.0])
+    assert reward == pytest.approx(-full)
+    # In the env: in the lane of an oncoming pedestrian costs, beside it doesn't.
+    env, _ = pedestrian_env((13.0, 0.0), velocity=(-0.5, 0.0), spawn=(11.0, 0.0, 0.0))
+    _, in_lane, _, _, info = env.step(np.zeros(2))
+    assert info['min_pedestrian_lane_time'] < horizon
+    env, _ = pedestrian_env((13.0, 0.9), velocity=(-0.5, 0.0), spawn=(11.0, 0.0, 0.0))
+    _, beside, _, _, info = env.step(np.zeros(2))
+    assert info['min_pedestrian_lane_time'] == np.inf
+    assert in_lane < beside
 
 
 def test_wall_collision_is_not_a_pedestrian_hit():

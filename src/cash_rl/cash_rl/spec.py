@@ -100,6 +100,16 @@ PROXIMITY_WEIGHT = 0.5
 # let someone pass costs nothing (being walked into still costs the collision).
 PEDESTRIAN_COMFORT_DISTANCE = 0.8
 PEDESTRIAN_WAIT_SPEED = 0.05
+# Lane penalty: pedestrians don't yield, and the proximity penalty above starts
+# under a second before contact, too late for the robot to turn and get clear.
+# So while the robot's footprint is in a pedestrian's walking lane and that
+# pedestrian would reach it within PEDESTRIAN_LANE_HORIZON (s, at their closing
+# speed), the robot pays up to PEDESTRIAN_LANE_PENALTY per pedestrian per step,
+# rising linearly from 0 at the horizon to the full amount at contact. Leaving
+# the lane ends it, so stepping aside early pays off. It applies while waiting
+# too: waiting beside the lane is free, waiting in it is not.
+PEDESTRIAN_LANE_HORIZON = 3.0
+PEDESTRIAN_LANE_PENALTY = 0.3
 PEDESTRIAN_PROXIMITY_PENALTY = 0.3
 PEDESTRIAN_COLLISION_PENALTY = 40.0
 
@@ -245,9 +255,20 @@ def waiting_for_pedestrian(linear_speed, pedestrian_gaps):
         and bool(np.any(np.asarray(pedestrian_gaps) < PEDESTRIAN_COMFORT_DISTANCE))
 
 
+def pedestrian_lane_penalty(lane_times):
+    """Return the step's total penalty for standing in pedestrians' lanes.
+
+    lane_times are the seconds until each pedestrian would reach the robot's
+    footprint walking its lane (inf if the robot isn't in that lane ahead of it).
+    """
+    times = np.asarray(lane_times, dtype=np.float64)
+    urgency = np.clip(1.0 - times / PEDESTRIAN_LANE_HORIZON, 0.0, 1.0)
+    return PEDESTRIAN_LANE_PENALTY * float(urgency.sum())
+
+
 def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
                  clearance=float('inf'), pedestrian_gaps=(), hit_pedestrian=False,
-                 waiting=False):
+                 waiting=False, pedestrian_lane_times=()):
     """Return (reward, reached) for one step.
 
     goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
@@ -257,12 +278,14 @@ def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
     pedestrian_gaps adds the pedestrian proximity penalty; a collision with
     hit_pedestrian set costs PEDESTRIAN_COLLISION_PENALTY instead of
     COLLISION_PENALTY. waiting (waiting_for_pedestrian) drops TIME_PENALTY and
-    the pedestrian proximity penalty.
+    the pedestrian proximity penalty. pedestrian_lane_times adds the lane
+    penalty (pedestrian_lane_penalty), waiting or not.
     """
     progress = goal_distance - prev_goal_distance
     progress = 0.0 if not np.isfinite(progress) else -progress
     reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
-    reward = PROGRESS_WEIGHT * progress - proximity_penalty(clearance)
+    reward = PROGRESS_WEIGHT * progress - proximity_penalty(clearance) \
+        - pedestrian_lane_penalty(pedestrian_lane_times)
     if not waiting:
         reward -= TIME_PENALTY + pedestrian_proximity_penalty(pedestrian_gaps)
     if reached:
