@@ -10,13 +10,16 @@ The map frame is aligned with the Gazebo world frame (SLAM was started at the
 spawn pose), so poses here are world coordinates from hallway.sdf.
 
 Optional pedestrians (n_pedestrians, default 0) are discs that walk up and down
-the corridors, turning back at walls and obstacles. They never turn back for the
-robot: with the robot ahead and within spec.PEDESTRIAN_COMFORT_DISTANCE, one
-slows down, and if the robot is in its path it also sidesteps away from it (or
-waits, inside PEDESTRIAN_STOP_DISTANCE, until it has), then walks on in the same
-direction. They ignore each other. They block
-beams and count for collisions, and the robot is penalized for coming close
-(spec.step_outcome). They exist only here, not in Gazebo.
+the corridors, turning back at walls and obstacles. By default they ignore the
+robot and walk straight into it if it stays in their path, so getting out of
+their way is the robot's job. With pedestrians_yield=True (how pedestrian runs
+before 2026-10-21 were trained) they never turn back for the robot either, but
+with the robot ahead and within spec.PEDESTRIAN_COMFORT_DISTANCE one slows down,
+and if the robot is in its path it also sidesteps away from it (or waits, inside
+PEDESTRIAN_STOP_DISTANCE, until it has), then walks on in the same direction.
+They ignore each other. They block beams and count for collisions, and the robot
+is penalized for coming close (spec.step_outcome). They exist only here, not in
+Gazebo.
 """
 from cash_rl import spec
 from cash_rl.occupancy_map import OccupancyMap
@@ -38,16 +41,17 @@ MAX_SAMPLE_TRIES = 1000
 # Pedestrians: discs walking along the corridor axis (x in the main corridor, y
 # in the branch), at a speed drawn per episode.
 PEDESTRIAN_RADIUS = 0.25
-PEDESTRIAN_SPEED_RANGE = (0.8, 1.4)
+PEDESTRIAN_SPEED_RANGE = (0.5, 0.9)
 # Pedestrian centers keep at least this much map clearance (radius + a gap).
 PEDESTRIAN_WALL_CLEARANCE = PEDESTRIAN_RADIUS + 0.05
 # Pedestrians start at least this far from the robot's spawn.
 PEDESTRIAN_SPAWN_DISTANCE = 2.0
-# With the robot ahead and within spec.PEDESTRIAN_COMFORT_DISTANCE (gap to the
-# margin-inflated footprint), a pedestrian walks at PEDESTRIAN_SLOW_FACTOR of
-# its speed. If the robot is also in its path (lateral overlap plus
-# PEDESTRIAN_PATH_BUFFER) it sidesteps at PEDESTRIAN_SIDESTEP_SPEED, and inside
-# PEDESTRIAN_STOP_DISTANCE it stops walking forward until its path is clear.
+# With pedestrians_yield, and the robot ahead and within
+# spec.PEDESTRIAN_COMFORT_DISTANCE (gap to the margin-inflated footprint), a
+# pedestrian walks at PEDESTRIAN_SLOW_FACTOR of its speed. If the robot is also
+# in its path (lateral overlap plus PEDESTRIAN_PATH_BUFFER) it sidesteps at
+# PEDESTRIAN_SIDESTEP_SPEED, and inside PEDESTRIAN_STOP_DISTANCE it stops walking
+# forward until its path is clear.
 PEDESTRIAN_SLOW_FACTOR = 0.3
 PEDESTRIAN_STOP_DISTANCE = 0.3
 PEDESTRIAN_SIDESTEP_SPEED = 0.5
@@ -82,13 +86,15 @@ class HallwayRaycastEnv(gym.Env):
     noise and spec.BEAM_DROPOUT_PROB missing returns; render_mode is None or 'rgb_array'.
     n_pedestrians adds that many pedestrians (see the module docstring), placed at
     random on every reset; their positions are in `pedestrians` (n, 2) after
-    reset/step.
+    reset/step. pedestrians_yield makes them slow down and step around the robot
+    instead of walking into it.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
 
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
-                 range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0):
+                 range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0,
+                 pedestrians_yield=False):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
@@ -98,6 +104,7 @@ class HallwayRaycastEnv(gym.Env):
         self.range_noise = range_noise
         self.render_mode = render_mode
         self.n_pedestrians = int(n_pedestrians)
+        self.pedestrians_yield = pedestrians_yield
 
         self.observation_space = spec.observation_space()
         self.action_space = spec.action_space()
@@ -334,17 +341,20 @@ class HallwayRaycastEnv(gym.Env):
         return steps, yielding, in_path
 
     def _move_pedestrians(self, dt):
-        """Advance pedestrians by dt, yielding to the robot and turning back at walls.
+        """Advance pedestrians by dt, turning back at walls (and yielding, if enabled).
 
         _pedestrian_velocities hold each one's walking velocity, which only walls
-        reverse; the robot just slows a pedestrian down or sidesteps it (_sidesteps).
+        reverse; with pedestrians_yield the robot also slows a pedestrian down or
+        sidesteps it (_sidesteps), otherwise it walks on regardless.
         """
         if len(self.pedestrians) == 0:
             return
-        sidesteps, yielding, in_path = self._sidesteps(dt)
-        self.pedestrians += sidesteps
-        stop = in_path & (self.pedestrian_gaps() < PEDESTRIAN_STOP_DISTANCE)
-        speed_factor = np.where(stop, 0.0, np.where(yielding, PEDESTRIAN_SLOW_FACTOR, 1.0))
+        speed_factor = np.ones(len(self.pedestrians))
+        if self.pedestrians_yield:
+            sidesteps, yielding, in_path = self._sidesteps(dt)
+            self.pedestrians += sidesteps
+            stop = in_path & (self.pedestrian_gaps() < PEDESTRIAN_STOP_DISTANCE)
+            speed_factor = np.where(stop, 0.0, np.where(yielding, PEDESTRIAN_SLOW_FACTOR, 1.0))
         ahead = self.pedestrians + self._pedestrian_velocities * speed_factor[:, None] * dt
         blocked = self._clearance_at(ahead[:, 0], ahead[:, 1]) < PEDESTRIAN_WALL_CLEARANCE
         self._pedestrian_velocities[blocked] *= -1.0
@@ -434,7 +444,8 @@ class HallwayRaycastEnv(gym.Env):
         goal_distance = self._goal_field(*self.pose[:2])
         reward, reached = spec.step_outcome(
             self._goal_distance, goal_distance, self.pose, self.goal, collided, clearance,
-            pedestrian_gaps=gaps, hit_pedestrian=hit_pedestrian)
+            pedestrian_gaps=gaps, hit_pedestrian=hit_pedestrian,
+            waiting=spec.waiting_for_pedestrian(self._velocity[0], gaps))
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observe()

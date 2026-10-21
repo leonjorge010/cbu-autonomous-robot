@@ -50,6 +50,8 @@ def main():
                         help='held-out random spawn/goal pairs to add (2D only)')
     parser.add_argument('--pedestrians', type=int, default=0,
                         help='moving pedestrians per episode (2D only)')
+    parser.add_argument('--yielding-pedestrians', action='store_true',
+                        help='pedestrians step around the robot instead of walking into it')
     parser.add_argument('--safety', action='store_true',
                         help='run the policy behind the LiDAR safety layer (cash_rl.safety)')
     args = parser.parse_args()
@@ -63,11 +65,13 @@ def main():
         env = HallwayEnv()
     else:
         from cash_rl.raycast_env import HallwayRaycastEnv
-        env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
+        env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                                pedestrians_yield=args.yielding_pedestrians)
     if args.safety:
         from cash_rl.safety import SafetyWrapper
         env = SafetyWrapper(env)
     mode = args.env + (f', {args.pedestrians} pedestrians' if args.pedestrians else '') \
+        + (' (yielding)' if args.pedestrians and args.yielding_pedestrians else '') \
         + (', safety layer' if args.safety else '')
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})
              for name, goal in sorted(spec.DOOR_GOALS.items())

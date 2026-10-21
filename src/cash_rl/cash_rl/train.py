@@ -3,6 +3,7 @@
     ros2 run cash_rl train                                  # PPO, 3M steps
     ros2 run cash_rl train --algo sac --timesteps 1000000
     ros2 run cash_rl train --pedestrians 4                  # moving pedestrians
+    ros2 run cash_rl train --pedestrians 4 --yielding-pedestrians  # that step around it
     tensorboard --logdir ~/ros2_ws/runs                     # watch it
 
 Writes runs/<name>/ in the workspace (gitignored): config.json, TensorBoard
@@ -203,6 +204,9 @@ def main():
                              'sides of the junction')
     parser.add_argument('--pedestrians', type=int, default=0,
                         help='moving pedestrians per episode, in training and eval')
+    parser.add_argument('--yielding-pedestrians', action='store_true',
+                        help='pedestrians slow down and step around the robot instead of '
+                             'walking into it (how pedestrian runs before 2026-10-21 trained)')
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
@@ -224,15 +228,17 @@ def main():
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
     env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range),
                   'junction_prob': args.junction_prob,
-                  'n_pedestrians': args.pedestrians}
+                  'n_pedestrians': args.pedestrians,
+                  'pedestrians_yield': args.yielding_pedestrians}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
                              monitor_kwargs={'info_keywords': ('is_success',)})
     # Eval always uses the default goal range, so every run is scored on the same
     # random spawn/goal pairs regardless of its training goal range. It does use
-    # the training pedestrian count: runs are comparable only at equal counts.
-    eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
+    # the training pedestrians: runs are comparable only at equal counts and behavior.
+    eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                                 pedestrians_yield=args.yielding_pedestrians)
 
     model_kwargs = dict(kwargs)
     if args.lr_schedule == 'linear':

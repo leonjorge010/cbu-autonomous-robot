@@ -90,12 +90,16 @@ COLLISION_PENALTY = 20.0
 PROXIMITY_DISTANCE = 0.30
 PROXIMITY_WEIGHT = 0.5
 # Pedestrians (HallwayRaycastEnv only). Within PEDESTRIAN_COMFORT_DISTANCE (gap
-# between the disc and the margin-inflated footprint) a pedestrian yields to the
-# robot, and the robot pays up to PEDESTRIAN_PROXIMITY_PENALTY per pedestrian per
-# step, rising linearly from 0 at the edge of that zone to the full amount at
-# contact. Hitting a pedestrian costs PEDESTRIAN_COLLISION_PENALTY instead of
-# COLLISION_PENALTY. Pedestrians don't count toward the wall clearance above.
+# between the disc and the margin-inflated footprint) the robot pays up to
+# PEDESTRIAN_PROXIMITY_PENALTY per pedestrian per step, rising linearly from 0
+# at the edge of that zone to the full amount at contact. Hitting a pedestrian
+# costs PEDESTRIAN_COLLISION_PENALTY instead of COLLISION_PENALTY. Pedestrians
+# don't count toward the wall clearance above. A robot stopped (forward speed
+# below PEDESTRIAN_WAIT_SPEED) with a pedestrian inside the comfort zone is
+# waiting for it: it pays neither that penalty nor TIME_PENALTY, so stopping to
+# let someone pass costs nothing (being walked into still costs the collision).
 PEDESTRIAN_COMFORT_DISTANCE = 0.8
+PEDESTRIAN_WAIT_SPEED = 0.05
 PEDESTRIAN_PROXIMITY_PENALTY = 0.3
 PEDESTRIAN_COLLISION_PENALTY = 40.0
 
@@ -235,8 +239,15 @@ def pedestrian_proximity_penalty(pedestrian_gaps):
     return PEDESTRIAN_PROXIMITY_PENALTY * float(closeness.sum())
 
 
+def waiting_for_pedestrian(linear_speed, pedestrian_gaps):
+    """Return True if the robot is stopped with a pedestrian inside the comfort zone."""
+    return abs(linear_speed) < PEDESTRIAN_WAIT_SPEED \
+        and bool(np.any(np.asarray(pedestrian_gaps) < PEDESTRIAN_COMFORT_DISTANCE))
+
+
 def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
-                 clearance=float('inf'), pedestrian_gaps=(), hit_pedestrian=False):
+                 clearance=float('inf'), pedestrian_gaps=(), hit_pedestrian=False,
+                 waiting=False):
     """Return (reward, reached) for one step.
 
     goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
@@ -245,13 +256,15 @@ def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
     footprint's gap to the nearest obstacle (m), for the proximity penalty.
     pedestrian_gaps adds the pedestrian proximity penalty; a collision with
     hit_pedestrian set costs PEDESTRIAN_COLLISION_PENALTY instead of
-    COLLISION_PENALTY.
+    COLLISION_PENALTY. waiting (waiting_for_pedestrian) drops TIME_PENALTY and
+    the pedestrian proximity penalty.
     """
     progress = goal_distance - prev_goal_distance
     progress = 0.0 if not np.isfinite(progress) else -progress
     reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
-    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY - proximity_penalty(clearance) \
-        - pedestrian_proximity_penalty(pedestrian_gaps)
+    reward = PROGRESS_WEIGHT * progress - proximity_penalty(clearance)
+    if not waiting:
+        reward -= TIME_PENALTY + pedestrian_proximity_penalty(pedestrian_gaps)
     if reached:
         reward += GOAL_REWARD
     if collided:

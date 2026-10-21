@@ -249,9 +249,10 @@ def test_no_pedestrians_by_default():
         assert info_a['pedestrians'].shape == (0, 2)
 
 
-def pedestrian_env(xy, velocity=(0.0, 0.0), spawn=spec.SPAWN_POSE):
+def pedestrian_env(xy, velocity=(0.0, 0.0), spawn=spec.SPAWN_POSE, pedestrians_yield=False):
     """Env at spawn with its one pedestrian moved to xy; returns (env, obs)."""
-    env = HallwayRaycastEnv(range_noise=False, n_pedestrians=1)
+    env = HallwayRaycastEnv(range_noise=False, n_pedestrians=1,
+                            pedestrians_yield=pedestrians_yield)
     env.reset(seed=0, options={'spawn': spawn, 'goal': DOOR_101})
     env.pedestrians[0] = xy
     env._pedestrian_velocities[0] = velocity
@@ -277,9 +278,25 @@ def test_pedestrian_touching_footprint_is_a_collision():
     assert not env.collides()
 
 
+def test_pedestrian_walks_into_parked_robot_by_default():
+    # Robot parked at x=10 on the centerline; pedestrian walking -x straight at it
+    # neither slows, sidesteps nor turns back, so the robot has to move.
+    env, _ = pedestrian_env((13.0, 0.0), velocity=(-1.0, 0.0), spawn=(10.0, 0.0, 0.0))
+    for steps in range(1, 30):
+        before = env.pedestrians[0].copy()
+        _, reward, terminated, _, info = env.step(np.zeros(2))
+        np.testing.assert_allclose(env.pedestrians[0] - before, (-spec.CONTROL_PERIOD, 0.0))
+        if terminated:
+            break
+    assert info['collided'] and info['hit_pedestrian']
+    # Waiting is free, but being walked into still costs the collision.
+    assert reward == pytest.approx(-spec.PEDESTRIAN_COLLISION_PENALTY)
+
+
 def test_pedestrian_steps_around_parked_robot_without_turning_back():
     # Robot parked at x=10 on the centerline; pedestrian walking -x straight at it.
-    env, _ = pedestrian_env((13.0, 0.0), velocity=(-1.0, 0.0), spawn=(10.0, 0.0, 0.0))
+    env, _ = pedestrian_env((13.0, 0.0), velocity=(-1.0, 0.0), spawn=(10.0, 0.0, 0.0),
+                            pedestrians_yield=True)
     total, gaps, steps = 0.0, [], 0
     while env.pedestrians[0, 0] > 8.5:
         _, reward, terminated, _, info = env.step(np.zeros(2))
@@ -291,14 +308,15 @@ def test_pedestrian_steps_around_parked_robot_without_turning_back():
         assert steps < 100, 'pedestrian never got past the robot'
     assert min(gaps) > 0.0
     assert abs(env.pedestrians[0, 1]) > 0.3  # passed beside the robot, not through it
-    # Passing close cost the robot more than the time penalty alone.
-    assert total < -spec.TIME_PENALTY * steps - 0.5
+    # Parked while it passed: no proximity penalty, and no time penalty while close.
+    assert -spec.TIME_PENALTY * steps < total <= 0.0
 
 
 def test_pedestrian_waits_when_it_cannot_step_aside():
     # Robot parked across the corridor near the west end, where there is no room
     # to pass: the pedestrian stops short instead of walking into it or turning back.
-    env, _ = pedestrian_env((3.0, 0.0), velocity=(-1.0, 0.0), spawn=(0.0, 0.0, np.pi / 2))
+    env, _ = pedestrian_env((3.0, 0.0), velocity=(-1.0, 0.0), spawn=(0.0, 0.0, np.pi / 2),
+                            pedestrians_yield=True)
     env.map.clearance = env.map.clearance.copy()
     row, _ = env.map.to_cell(np.array([0.0]), np.array([0.0]))
     corridor = np.abs(env.map.origin[1] + (np.arange(env.map.height) + 0.5)
@@ -318,7 +336,8 @@ def test_pedestrian_slows_only_with_robot_ahead_inside_comfort_zone():
     spawn = (10.0, 0.0, 0.0)
     for velocity, expected_speed in (((-1.0, 0.0), PEDESTRIAN_SLOW_FACTOR),  # toward
                                      ((1.0, 0.0), 1.0)):                     # away
-        env, _ = pedestrian_env((10.0 + inside, 0.0), velocity=velocity, spawn=spawn)
+        env, _ = pedestrian_env((10.0 + inside, 0.0), velocity=velocity, spawn=spawn,
+                                pedestrians_yield=True)
         before = env.pedestrians[0].copy()
         env.step(np.zeros(2))
         moved = env.pedestrians[0] - before
@@ -327,7 +346,8 @@ def test_pedestrian_slows_only_with_robot_ahead_inside_comfort_zone():
         assert (moved[1] != 0) == (velocity[0] < 0)
     # Approaching but still outside the comfort zone: full speed, straight on.
     far = 10.0 + front + spec.PEDESTRIAN_COMFORT_DISTANCE + 0.5
-    env, _ = pedestrian_env((far, 0.0), velocity=(-1.0, 0.0), spawn=spawn)
+    env, _ = pedestrian_env((far, 0.0), velocity=(-1.0, 0.0), spawn=spawn,
+                            pedestrians_yield=True)
     env.step(np.zeros(2))
     np.testing.assert_allclose(env.pedestrians[0], (far - spec.CONTROL_PERIOD, 0.0))
 
@@ -335,7 +355,8 @@ def test_pedestrian_slows_only_with_robot_ahead_inside_comfort_zone():
 def test_pedestrian_beside_robot_path_only_slows():
     # Walking -x in a lane 0.7 m to the side of the robot's centerline: inside the
     # comfort zone but clear of its footprint, so it slows without a sidestep.
-    env, _ = pedestrian_env((10.9, 0.7), velocity=(-1.0, 0.0), spawn=(10.0, 0.0, 0.0))
+    env, _ = pedestrian_env((10.9, 0.7), velocity=(-1.0, 0.0), spawn=(10.0, 0.0, 0.0),
+                            pedestrians_yield=True)
     assert env.pedestrian_gaps()[0] < spec.PEDESTRIAN_COMFORT_DISTANCE
     env.step(np.zeros(2))
     assert env.pedestrians[0, 1] == pytest.approx(0.7)
@@ -350,6 +371,26 @@ def test_driving_into_pedestrian_costs_more_than_a_wall():
     # Progress (< 2 m) can't offset the penalty; the proximity penalty adds to it.
     assert total < -spec.PEDESTRIAN_COLLISION_PENALTY + spec.PROGRESS_WEIGHT * 2.0
     assert spec.PEDESTRIAN_COLLISION_PENALTY > spec.COLLISION_PENALTY
+
+
+def test_stopping_for_a_pedestrian_is_not_penalized():
+    pose, goal = (0.0, 0.0, 0.0), (5.0, 0.0)
+    gaps = [0.2]  # inside the comfort zone
+    moving_slowly = spec.PEDESTRIAN_WAIT_SPEED * 2
+    assert spec.waiting_for_pedestrian(0.0, gaps)
+    assert not spec.waiting_for_pedestrian(moving_slowly, gaps)
+    assert not spec.waiting_for_pedestrian(0.0, [spec.PEDESTRIAN_COMFORT_DISTANCE + 0.1])
+    waiting, _ = spec.step_outcome(4.0, 4.0, pose, goal, False, pedestrian_gaps=gaps,
+                                   waiting=True)
+    assert waiting == 0.0
+    creeping, _ = spec.step_outcome(4.0, 4.0, pose, goal, False, pedestrian_gaps=gaps)
+    assert creeping == pytest.approx(
+        -spec.TIME_PENALTY - spec.pedestrian_proximity_penalty(gaps))
+    # Still pays the wall proximity penalty, and a collision is never excused.
+    assert spec.step_outcome(4.0, 4.0, pose, goal, False, clearance=0.0, waiting=True)[0] < 0
+    assert spec.step_outcome(4.0, 4.0, pose, goal, True, pedestrian_gaps=[-0.1],
+                             hit_pedestrian=True, waiting=True)[0] \
+        == pytest.approx(-spec.PEDESTRIAN_COLLISION_PENALTY)
 
 
 def test_wall_collision_is_not_a_pedestrian_hit():

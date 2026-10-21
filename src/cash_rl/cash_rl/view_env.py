@@ -147,6 +147,8 @@ def main():
                         help='number of episodes with --goal random')
     parser.add_argument('--pedestrians', type=int, default=0,
                         help='number of moving pedestrians in the hallway')
+    parser.add_argument('--yielding-pedestrians', action='store_true',
+                        help='pedestrians step around the robot instead of walking into it')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
@@ -167,7 +169,8 @@ def main():
     from matplotlib.animation import FuncAnimation, PillowWriter
     import matplotlib.pyplot as plt
 
-    env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
+    env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                            pedestrians_yield=args.yielding_pedestrians)
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
     frames = run_episodes(env, policy, goals, args.seed)
 
