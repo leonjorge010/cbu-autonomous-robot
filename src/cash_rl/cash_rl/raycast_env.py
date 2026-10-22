@@ -56,6 +56,12 @@ PEDESTRIAN_SLOW_FACTOR = 0.3
 PEDESTRIAN_STOP_DISTANCE = 0.3
 PEDESTRIAN_SIDESTEP_SPEED = 0.5
 PEDESTRIAN_PATH_BUFFER = 0.1
+# Encounter episodes (encounter_prob): the first pedestrian starts this far (m)
+# along the robot's geodesic route to the goal, within ENCOUNTER_LATERAL of the
+# route's centerline, walking back along it toward the robot.
+ENCOUNTER_DISTANCE_RANGE = (4.0, 10.0)
+ENCOUNTER_LATERAL = 0.3
+ROUTE_STEP = 0.1  # m between traced route points
 
 
 def _rectangle_perimeter(half_length, half_width, spacing):
@@ -87,14 +93,19 @@ class HallwayRaycastEnv(gym.Env):
     n_pedestrians adds that many pedestrians (see the module docstring), placed at
     random on every reset; their positions are in `pedestrians` (n, 2) after
     reset/step. pedestrians_yield makes them slow down and step around the robot
-    instead of walking into it.
+    instead of walking into it. With probability encounter_prob the first
+    pedestrian instead starts on the robot's route to the goal,
+    ENCOUNTER_DISTANCE_RANGE ahead in the robot's corridor, walking toward it
+    (falling back to a random start if that stretch of route is too short or has
+    no room); without that, over half of random starts never come within 2 m of
+    the robot. Drawn only when > 0, like junction_prob.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
 
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
                  range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0,
-                 pedestrians_yield=False):
+                 pedestrians_yield=False, lane_penalty=True, encounter_prob=0.0):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
@@ -105,6 +116,8 @@ class HallwayRaycastEnv(gym.Env):
         self.render_mode = render_mode
         self.n_pedestrians = int(n_pedestrians)
         self.pedestrians_yield = pedestrians_yield
+        self.lane_penalty = lane_penalty
+        self.encounter_prob = encounter_prob
 
         self.observation_space = spec.observation_space()
         self.action_space = spec.action_space()
@@ -286,7 +299,13 @@ class HallwayRaycastEnv(gym.Env):
     def _sample_pedestrians(self):
         """Place n_pedestrians clear of walls and the robot, with corridor-axis velocities."""
         positions, velocities = [], []
-        for _ in range(self.n_pedestrians):
+        if self.n_pedestrians and self.encounter_prob > 0 \
+                and self.np_random.random() < self.encounter_prob:
+            encounter = self._sample_encounter()
+            if encounter is not None:
+                positions.append(encounter[0])
+                velocities.append(encounter[1])
+        for _ in range(self.n_pedestrians - len(positions)):
             for _ in range(MAX_SAMPLE_TRIES):
                 row, col = self._pedestrian_cells[
                     self.np_random.integers(len(self._pedestrian_cells))]
@@ -302,6 +321,76 @@ class HallwayRaycastEnv(gym.Env):
             velocities.append(sign * speed * axis)
         self.pedestrians = np.array(positions).reshape(-1, 2)
         self._pedestrian_velocities = np.array(velocities).reshape(-1, 2)
+
+    def route(self):
+        """(n, 2) points every ROUTE_STEP m down the goal's geodesic field from the robot.
+
+        Steepest descent over 16 headings on the field's cell values, so it follows
+        the same wall-shy route the progress reward pays for. Ends at the goal, or
+        where no step lowers the field.
+        """
+        field = self._goal_field.grid
+        headings = np.linspace(-np.pi, np.pi, 16, endpoint=False)
+        steps = ROUTE_STEP * np.stack([np.cos(headings), np.sin(headings)], axis=1)
+        point, points = self.pose[:2].copy(), [self.pose[:2].copy()]
+
+        def value(xy):
+            row, col = self.map.to_cell(xy[:, 0], xy[:, 1])
+            ok = (row >= 0) & (row < self.map.height) & (col >= 0) & (col < self.map.width)
+            out = np.full(len(xy), np.inf)
+            out[ok] = field[row[ok], col[ok]]
+            return np.where(np.isfinite(out), out, np.inf)
+
+        current = value(point[None])[0]
+        limit = int(4 * spec.MAX_GOAL_DISTANCE / ROUTE_STEP)
+        while len(points) < limit and np.hypot(*(self.goal - point)) > ROUTE_STEP:
+            candidates = point + steps
+            values = value(candidates)
+            best = int(np.argmin(values))
+            # Cells are 0.05 m, so allow ties within a cell; stop only on a rise.
+            if not values[best] <= current + 1e-9:
+                break
+            point, current = candidates[best], values[best]
+            points.append(point.copy())
+        return np.array(points)
+
+    def _sample_encounter(self):
+        """(position, velocity) of a pedestrian on the route ahead walking at the robot.
+
+        None if the route has no valid start ENCOUNTER_DISTANCE_RANGE along it.
+        """
+        route = self.route()
+        if len(route) < 2:
+            return None
+        travelled = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(route, axis=0).T))])
+        # Pedestrians walk only along their own corridor's axis, so one placed past
+        # the junction would walk off down the other corridor before the robot
+        # turns the corner: keep to the route's first stretch in the robot's corridor.
+        in_branch = route[:, 1] >= BRANCH_MIN_Y
+        leaves = np.nonzero(in_branch != in_branch[0])[0]
+        end = travelled[leaves[0] - 1] if len(leaves) else travelled[-1]
+        lo, hi = ENCOUNTER_DISTANCE_RANGE
+        hi = min(hi, end)
+        if hi < lo:
+            return None
+        for _ in range(20):
+            i = int(np.searchsorted(travelled, self.np_random.uniform(lo, hi)))
+            i = min(max(i, 1), len(route) - 1)
+            direction = route[i] - route[i - 1]
+            direction /= np.linalg.norm(direction)
+            normal = np.array([-direction[1], direction[0]])
+            xy = route[i] + self.np_random.uniform(-ENCOUNTER_LATERAL, ENCOUNTER_LATERAL) * normal
+            if self._clearance_at(*xy) < PEDESTRIAN_WALL_CLEARANCE \
+                    or np.hypot(*(xy - self.pose[:2])) < PEDESTRIAN_SPAWN_DISTANCE:
+                continue
+            axis = np.array([0.0, 1.0]) if xy[1] >= BRANCH_MIN_Y else np.array([1.0, 0.0])
+            along = float(direction @ axis)
+            if abs(along) < 0.5:  # route crosses the walking axis here (the junction)
+                continue
+            # Walk against the route, i.e. back toward the robot.
+            speed = self.np_random.uniform(*PEDESTRIAN_SPEED_RANGE)
+            return xy, -np.sign(along) * speed * axis
+        return None
 
     def _pedestrian_lanes(self):
         """Return the robot footprint in each pedestrian's walking frame.
@@ -448,9 +537,9 @@ class HallwayRaycastEnv(gym.Env):
             raise RuntimeError(f'Spawn pose {pose} is in collision')
 
         self.pose, self.goal = pose, goal_xy
+        self._goal_field = self.map.distance_field(*self.goal)
         # Drawn after spawn/goal (and only when enabled), so those stay seeded the same.
         self._sample_pedestrians()
-        self._goal_field = self.map.distance_field(*self.goal)
         self._goal_distance = self._goal_field(*self.pose[:2])
         if not np.isfinite(self._goal_distance):
             raise RuntimeError(f'Goal {self.goal} unreachable from spawn {self.pose}')
@@ -485,7 +574,7 @@ class HallwayRaycastEnv(gym.Env):
             self._goal_distance, goal_distance, self.pose, self.goal, collided, clearance,
             pedestrian_gaps=gaps, hit_pedestrian=hit_pedestrian,
             waiting=spec.waiting_for_pedestrian(self._velocity[0], gaps),
-            pedestrian_lane_times=lane_times)
+            pedestrian_lane_times=lane_times if self.lane_penalty else ())
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
         obs = self._observe()

@@ -16,12 +16,13 @@ import argparse
 
 from cash_rl import spec
 from cash_rl.raycast_env import HallwayRaycastEnv
-from cash_rl.scripted import downhill
+from cash_rl.scripted import avoider, downhill
 import numpy as np
 
 HOLD_FRAMES = 15  # Pause on each episode's last frame.
 POLICIES = {
     'downhill': downhill,
+    'avoider': avoider,
     'random': lambda env: env.action_space.sample(),
 }
 
@@ -149,6 +150,9 @@ def main():
                         help='number of moving pedestrians in the hallway')
     parser.add_argument('--yielding-pedestrians', action='store_true',
                         help='pedestrians step around the robot instead of walking into it')
+    parser.add_argument('--encounter-prob', type=float, default=0.0,
+                        help="share of episodes whose first pedestrian starts on the robot's "
+                             'route, walking toward it')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
@@ -170,7 +174,8 @@ def main():
     import matplotlib.pyplot as plt
 
     env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
-                            pedestrians_yield=args.yielding_pedestrians)
+                            pedestrians_yield=args.yielding_pedestrians,
+                            encounter_prob=args.encounter_prob)
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
     frames = run_episodes(env, policy, goals, args.seed)
 

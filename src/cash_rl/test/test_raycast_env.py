@@ -1,5 +1,6 @@
 from cash_rl import spec
-from cash_rl.raycast_env import BRANCH_MIN_Y, HallwayRaycastEnv
+from cash_rl.raycast_env import BRANCH_MIN_Y, ENCOUNTER_DISTANCE_RANGE, ENCOUNTER_LATERAL
+from cash_rl.raycast_env import HallwayRaycastEnv, ROUTE_STEP
 from cash_rl.raycast_env import PEDESTRIAN_RADIUS, PEDESTRIAN_SLOW_FACTOR
 from cash_rl.raycast_env import PEDESTRIAN_SPEED_RANGE, PEDESTRIAN_STOP_DISTANCE
 from cash_rl.raycast_env import PEDESTRIAN_WALL_CLEARANCE
@@ -493,6 +494,90 @@ def test_pedestrian_episodes_are_seeded():
         _, info_b = env_b.reset(seed=seed)
         np.testing.assert_array_equal(info_a['pedestrians'], info_b['pedestrians'])
         assert len(info_a['pedestrians']) == 3
+
+
+def test_route_follows_the_field_to_the_goal_clear_of_walls(env):
+    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_202})
+    route = env.route()
+    assert np.hypot(*(route[-1] - DOOR_202)) <= ROUTE_STEP
+    np.testing.assert_allclose(np.hypot(*np.diff(route, axis=0).T), ROUTE_STEP)
+    # Same wall-shy route as the progress reward: around the junction corner.
+    clearance = env._clearance_at(route[:, 0], route[:, 1])
+    assert clearance.min() > spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + 0.1
+    length = ROUTE_STEP * (len(route) - 1)
+    assert length == pytest.approx(env._goal_distance, rel=0.15)
+
+
+def route_in_own_corridor(env):
+    """(route, travelled) up to where the robot's route first leaves its corridor."""
+    route = env.route()
+    in_branch = route[:, 1] >= BRANCH_MIN_Y
+    leaves = np.nonzero(in_branch != in_branch[0])[0]
+    route = route[:leaves[0]] if len(leaves) else route
+    return route, np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(route, axis=0).T))])
+
+
+def test_encounter_pedestrian_starts_on_the_route_walking_at_the_robot():
+    env = HallwayRaycastEnv(n_pedestrians=2, encounter_prob=1.0, goal_distance_range=(8, 25))
+    lo, hi = ENCOUNTER_DISTANCE_RANGE
+    checked = 0
+    for seed in range(20):
+        _, info = env.reset(seed=seed)
+        route, travelled = route_in_own_corridor(env)
+        if travelled[-1] < lo:
+            continue  # no room: a random start (test_short_routes_fall_back...)
+        checked += 1
+        ped, velocity = env.pedestrians[0], env._pedestrian_velocities[0]
+        offsets = np.hypot(*(route - ped).T)
+        i = int(np.argmin(offsets))
+        assert offsets[i] <= ENCOUNTER_LATERAL + ROUTE_STEP
+        assert lo - ROUTE_STEP <= travelled[i] <= hi + ROUTE_STEP
+        direction = route[min(i + 1, len(route) - 1)] - route[max(i - 1, 0)]
+        assert velocity @ direction < 0  # walking back along the route
+        assert np.hypot(*(ped - info['pose'][:2])) >= 2.0
+        assert env._clearance_at(*ped) >= PEDESTRIAN_WALL_CLEARANCE
+        assert len(env.pedestrians) == 2  # the rest start at random as usual
+    assert checked >= 14
+
+
+def test_robot_ignoring_an_encounter_pedestrian_meets_it():
+    # Over half of random pedestrian starts never come within 2 m of the robot;
+    # encounter starts should nearly always reach the comfort zone.
+    env = HallwayRaycastEnv(n_pedestrians=1, encounter_prob=1.0, goal_distance_range=(8, 25))
+    met = checked = 0
+    for seed in range(20):
+        env.reset(seed=seed)
+        if route_in_own_corridor(env)[1][-1] < ENCOUNTER_DISTANCE_RANGE[0]:
+            continue
+        checked += 1
+        closest = np.inf
+        while True:
+            _, _, terminated, truncated, info = env.step(downhill(env))
+            closest = min(closest, info['min_pedestrian_gap'])
+            if terminated or truncated:
+                break
+        met += closest < spec.PEDESTRIAN_COMFORT_DISTANCE
+    assert checked >= 14 and met == checked
+
+
+@pytest.mark.parametrize('spawn, goal', [
+    (spec.SPAWN_POSE, (2.0, 0.0)),  # route too short
+    ((14.0, 4.0, -np.pi / 2), (24.0, 0.0)),  # only 2.8 m of branch before the corner
+])
+def test_short_routes_fall_back_to_random_pedestrian_starts(spawn, goal):
+    env = HallwayRaycastEnv(n_pedestrians=1, encounter_prob=1.0)
+    _, info = env.reset(seed=0, options={'spawn': spawn, 'goal': goal})
+    assert env._sample_encounter() is None
+    assert len(info['pedestrians']) == 1
+    assert np.hypot(*(info['pedestrians'][0] - info['pose'][:2])) >= 2.0
+
+
+def test_encounter_prob_zero_keeps_seeded_episodes():
+    plain = HallwayRaycastEnv(n_pedestrians=2)
+    zero = HallwayRaycastEnv(n_pedestrians=2, encounter_prob=0.0)
+    for seed in range(5):
+        np.testing.assert_array_equal(plain.reset(seed=seed)[1]['pedestrians'],
+                                      zero.reset(seed=seed)[1]['pedestrians'])
 
 
 def test_gymnasium_api_with_pedestrians():

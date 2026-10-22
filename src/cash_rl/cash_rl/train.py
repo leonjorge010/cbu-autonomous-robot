@@ -207,8 +207,15 @@ def main():
     parser.add_argument('--yielding-pedestrians', action='store_true',
                         help='pedestrians slow down and step around the robot instead of '
                              'walking into it (how pedestrian runs before 2026-10-21 trained)')
+    parser.add_argument('--encounter-prob', type=float, default=0.0,
+                        help='share of training episodes whose first pedestrian starts on '
+                             "the robot's route, walking toward it (eval keeps random starts)")
+    parser.add_argument('--no-lane-penalty', action='store_true',
+                        help='train without the pedestrian lane penalty (spec.PEDESTRIAN_LANE_*)')
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
+    parser.add_argument('--ent-coef', type=float, default=None,
+                        help='PPO entropy bonus (default 0.0, from algo_kwargs)')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
@@ -219,6 +226,10 @@ def main():
     os.makedirs(run_dir, exist_ok=False)
 
     kwargs = algo_kwargs(args.algo, n_envs)
+    if args.ent_coef is not None:
+        if args.algo != 'ppo':
+            parser.error('--ent-coef is PPO only')
+        kwargs['ent_coef'] = args.ent_coef
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         json.dump({'args': vars(args), 'n_envs': n_envs, 'algo_kwargs': kwargs,
                    'spec': {k: v for k, v in vars(spec).items()
@@ -229,7 +240,9 @@ def main():
     env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range),
                   'junction_prob': args.junction_prob,
                   'n_pedestrians': args.pedestrians,
-                  'pedestrians_yield': args.yielding_pedestrians}
+                  'pedestrians_yield': args.yielding_pedestrians,
+                  'lane_penalty': not args.no_lane_penalty,
+                  'encounter_prob': args.encounter_prob}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
@@ -237,8 +250,10 @@ def main():
     # Eval always uses the default goal range, so every run is scored on the same
     # random spawn/goal pairs regardless of its training goal range. It does use
     # the training pedestrians: runs are comparable only at equal counts and behavior.
+    # Pedestrian starts stay random (no encounter_prob), for the same reason.
     eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
-                                 pedestrians_yield=args.yielding_pedestrians)
+                                 pedestrians_yield=args.yielding_pedestrians,
+                                 lane_penalty=not args.no_lane_penalty)
 
     model_kwargs = dict(kwargs)
     if args.lr_schedule == 'linear':
