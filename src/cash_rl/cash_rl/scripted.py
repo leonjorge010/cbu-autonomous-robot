@@ -31,7 +31,8 @@ def downhill(env, lookahead=0.6, wall_clearance=0.7, wall_weight=3.0):
 
 
 def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
-            pedestrian_weight=4.0, contact_cost=20.0, wall_clearance=0.7, wall_weight=1.0):
+            pedestrian_weight=4.0, contact_cost=20.0, wall_clearance=0.7, wall_weight=1.0,
+            side_weight=1.0, side_distance=1.0):
     """Downhill plus pedestrian avoidance from their true future positions; return an action.
 
     Cheats more than downhill: besides the geodesic field it reads the pedestrians'
@@ -42,7 +43,15 @@ def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
     contact). It skips actions that hit a wall within wall_horizon or a pedestrian
     within hard_horizon, and charges contact_cost for a pedestrian hit later in the
     horizon plus pedestrian_weight per second within `comfort` of one (both in
-    metres of geodesic, converted to time at full speed). An upper-bound reference
+    metres of geodesic, converted to time at full speed). It keeps right: each
+    second spent within side_distance of a pedestrian on the wrong side costs
+    side_weight. The side is judged in the pedestrian's walking direction, which
+    (unlike the robot's heading) doesn't swing round at the junction: the robot
+    belongs on an oncoming pedestrian's left and on the right of one walking its
+    way, so either passes on the robot's left; crossing ones (more than 45 deg off
+    the robot's descent direction) don't count. Without the rule it picked a side
+    by tiny cost differences (left 53% of close passes), labels a student policy
+    can only average into driving straight. side_weight 0 turns it off. An upper-bound reference
     for what avoidance is achievable with this robot, not something a policy could
     copy from its observation.
     """
@@ -60,17 +69,20 @@ def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
     velocity = np.tile(base._velocity, (len(actions), 1))
     pose = np.tile(base.pose, (len(actions), 1))
     poses = np.empty((n_steps, len(actions), 3))
+    speeds = np.empty((n_steps, len(actions)))
     for t in range(n_steps):
         velocity += np.clip(targets - velocity, -max_delta, max_delta)
         pose[:, 0] += velocity[:, 0] * np.cos(pose[:, 2]) * dt
         pose[:, 1] += velocity[:, 0] * np.sin(pose[:, 2]) * dt
         pose[:, 2] += velocity[:, 1] * dt
         poses[t] = pose
+        speeds[t] = velocity[:, 0]
 
     reached = np.hypot(poses[..., 0] - base.goal[0],
                        poses[..., 1] - base.goal[1]) < spec.GOAL_TOLERANCE
     active = np.cumsum(reached, axis=0) == 0  # (T, K): before reaching the goal
-    gaps = _pedestrian_gaps(poses, future).min(axis=2)  # (T, K)
+    pedestrian_gaps = _pedestrian_gaps(poses, future)  # (T, K, N)
+    gaps = pedestrian_gaps.min(axis=2)  # (T, K)
     wall_steps = int(round(wall_horizon / dt))
     hits_wall = np.zeros((n_steps, len(actions)), dtype=bool)
     for t in range(wall_steps):
@@ -83,7 +95,10 @@ def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
 
     # Estimated arrival time if the robot switched back to heading downhill after
     # each rollout step: time so far + geodesic distance at full speed + the turn
-    # still needed toward the descent direction. Each candidate scores its best.
+    # still needed toward the descent direction + the time lost accelerating back
+    # to full speed (without it, stopping ties with driving on and wins by action
+    # order, so a robot at rest facing its goal never starts). Each candidate
+    # scores its best.
     field = base._goal_field.grid
     row, col = base.map.to_cell(poses[..., 0], poses[..., 1])
     inside = (row >= 0) & (row < base.map.height) & (col >= 0) & (col < base.map.width)
@@ -91,16 +106,31 @@ def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
     to_go[inside] = field[row[inside], col[inside]]
     to_go = np.where(np.isfinite(to_go), to_go, 1e3)
     heading = _descent_heading(base)
+    # Keep right, in each pedestrian's walking frame: unit walking direction, and
+    # sense +1 if it walks the robot's way, -1 if oncoming, 0 if crossing.
+    walk = np.diff(np.concatenate([base.pedestrians[None], future]), axis=0)  # (T, N, 2)
+    walk /= np.maximum(np.linalg.norm(walk, axis=2, keepdims=True), 1e-9)
+    along = np.cos(heading) * walk[..., 0] + np.sin(heading) * walk[..., 1]
+    sense = np.where(np.abs(along) > np.cos(np.pi / 4), np.sign(along), 0.0)  # (T, N)
+    rel_x = poses[..., 0, None] - future[:, None, :, 0]  # robot relative to pedestrian
+    rel_y = poses[..., 1, None] - future[:, None, :, 1]
+    robot_on_left = walk[:, None, :, 0] * rel_y - walk[:, None, :, 1] * rel_x  # (T, K, N)
+    # Oncoming: the robot belongs on its left; walking the robot's way: on its right.
+    wrong = sense[:, None, :] * robot_on_left > 0.0
+    wrong_side = np.any(wrong & (pedestrian_gaps < side_distance), axis=2)  # (T, K)
+    wrong_side_time = np.sum(active & wrong_side, axis=0) * dt
     turn = np.abs((heading - poses[..., 2] + np.pi) % (2 * np.pi) - np.pi)
     clearance = base._clearance_at(poses[..., 0], poses[..., 1])
     times = (np.arange(n_steps) + 1)[:, None] * dt
-    eta = times + to_go / spec.MAX_LINEAR_VEL + turn / spec.MAX_ANGULAR_VEL \
+    speed_up = (spec.MAX_LINEAR_VEL - speeds) ** 2 \
+        / (2 * spec.MAX_LINEAR_ACCEL * spec.MAX_LINEAR_VEL)
+    eta = times + to_go / spec.MAX_LINEAR_VEL + turn / spec.MAX_ANGULAR_VEL + speed_up \
         + wall_weight * np.maximum(0.0, wall_clearance - clearance) / spec.MAX_LINEAR_VEL
     eta = np.where(reached, times, eta)
     before_contact = np.arange(n_steps)[:, None] < first
     eta = np.where((active | reached) & before_contact, eta, np.inf)
-    cost = eta.min(axis=0) + (pedestrian_weight * discomfort
-                              + contact_cost * later_contact) / spec.MAX_LINEAR_VEL
+    cost = eta.min(axis=0) + (pedestrian_weight * discomfort + contact_cost * later_contact
+                              + side_weight * wrong_side_time) / spec.MAX_LINEAR_VEL
     if np.all(blocked):
         # Nothing is safe: take the action whose first contact comes latest.
         return actions[np.argmax(first - 0.01 * cost)]

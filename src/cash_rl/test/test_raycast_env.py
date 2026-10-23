@@ -582,3 +582,65 @@ def test_encounter_prob_zero_keeps_seeded_episodes():
 
 def test_gymnasium_api_with_pedestrians():
     check_env(HallwayRaycastEnv(n_pedestrians=3), skip_render_check=True)
+
+
+def test_avoider_starts_from_rest_facing_the_goal():
+    # Regression: its arrival estimate ignored acceleration, so stopping tied with
+    # driving on and a robot at rest facing its goal never left the spawn.
+    from cash_rl.scripted import avoider
+    env = HallwayRaycastEnv(n_pedestrians=1)
+    env.reset(seed=0, options={'spawn': spec.SPAWN_POSE, 'goal': DOOR_101})
+    for _ in range(20):
+        env.step(avoider(env))
+    assert env.pose[0] > 0.5
+
+
+def test_dagger_numpy_actor_matches_sb3_predict():
+    from cash_rl.dagger import actor_action, actor_weights
+    from stable_baselines3 import PPO
+    env = HallwayRaycastEnv()
+    model = PPO('MlpPolicy', env, policy_kwargs={'net_arch': [256, 256]}, seed=0,
+                device='cpu')
+    weights = actor_weights(model.policy)
+    obs, _ = env.reset(seed=0)
+    for _ in range(5):
+        expected, _ = model.predict(obs, deterministic=True)
+        assert np.allclose(actor_action(weights, obs), expected, atol=1e-5)
+        obs, *_ = env.step(expected)
+
+
+def test_dagger_collect_labels_every_step_with_the_teacher():
+    from cash_rl import dagger
+    from cash_rl.scripted import avoider
+    dagger._init_worker({'n_pedestrians': 1, 'encounter_prob': 1.0})
+    observations, labels, _ = dagger.collect((7, 30, 1.0, None))
+    assert observations.shape == (30, spec.N_OBS) and labels.shape == (30, 2)
+    # beta 1 / no student: the teacher drives, so replaying its labels retraces the episode.
+    env = HallwayRaycastEnv(n_pedestrians=1, encounter_prob=1.0)
+    obs, _ = env.reset(seed=7)
+    for i in range(30):
+        assert np.allclose(obs, observations[i]) and np.allclose(avoider(env), labels[i])
+        obs, _, terminated, truncated, _ = env.step(labels[i])
+        if terminated or truncated:
+            break
+
+
+@pytest.mark.parametrize('offset', [-0.15, 0.15])
+def test_avoider_keeps_right_of_an_oncoming_pedestrian(offset):
+    # Whichever side of the robot's line the pedestrian walks, it passes on the
+    # robot's left, so a student policy sees one consistent answer.
+    from cash_rl.scripted import avoider
+    env = HallwayRaycastEnv(n_pedestrians=1, range_noise=False)
+    env.reset(seed=0, options={'spawn': (3.0, 0.0, 0.0), 'goal': (12.0, 0.0)})
+    env.pedestrians[:] = [[8.0, offset]]
+    env._pedestrian_velocities[:] = [[-0.7, 0.0]]
+    closest = (np.inf, 0.0)
+    for _ in range(150):
+        dx, dy = env.pedestrians[0] - env.pose[:2]
+        if np.hypot(dx, dy) < closest[0]:
+            closest = (np.hypot(dx, dy), dy)
+        _, _, terminated, truncated, info = env.step(avoider(env))
+        assert not info['collided']
+        if terminated or truncated or env.pedestrians[0, 0] < env.pose[0] - 1.0:
+            break
+    assert closest[1] > 0.0  # pedestrian on the robot's left (+y while heading +x)
