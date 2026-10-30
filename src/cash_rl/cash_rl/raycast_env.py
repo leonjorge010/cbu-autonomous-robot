@@ -66,6 +66,32 @@ PEDESTRIAN_PATH_BUFFER = 0.1
 ENCOUNTER_DISTANCE_RANGE = (4.0, 10.0)
 ENCOUNTER_LATERAL = 0.3
 ROUTE_STEP = 0.1  # m between traced route points
+# Lane offsets (subgoal_offset): the offset subgoal sits this far sideways from
+# the corridor's center, measured across the route. The cross-section is scanned
+# up to LANE_SCAN_DISTANCE each side; wider than LANE_MAX_WIDTH (an open area or
+# a junction), the center is LANE_OPEN_HALF_WIDTH from the nearer wall, and with
+# no wall in reach the route point stands in (that one moves with the robot).
+# The offset is cut back to keep LANE_MIN_CLEARANCE from any obstacle: the
+# clearance the geodesic route keeps, so the teachers' wall costs don't hold the
+# robot short of the lane. Random offsets are held for LANE_HOLD_RANGE seconds;
+# LANE_ZERO_PROB of draws are 0 (the corridor center).
+LANE_SCAN_DISTANCE = 2.5
+LANE_MAX_WIDTH = 4.0
+LANE_OPEN_HALF_WIDTH = 1.2
+LANE_MIN_CLEARANCE = spec.SAFE_CLEARANCE
+LANE_HOLD_RANGE = (2.0, 6.0)
+LANE_ZERO_PROB = 0.3
+# The lane the robot is held to (near_lane: teachers, info['lane_error']) is
+# taken this far ahead on the route; the observed subgoal's lane lies around
+# the next corner before a turn.
+LANE_NEAR_DISTANCE = 1.0
+# The lane penalty (spec.subgoal_lane_penalty) holds the robot to the lane
+# across the route at its own position (robot_lane), and only where "left/right
+# of center" is well defined: a bounded corridor (no wider than LANE_MAX_WIDTH)
+# with the route turning less than LANE_TURN_ANGLE between there and
+# LANE_NEAR_DISTANCE ahead. In turns, junctions and open areas the lane ahead
+# swings round before the robot can follow, so following it would be penalized.
+LANE_TURN_ANGLE = np.radians(30.0)
 # Non-hallway maps: neighborhood (m) whose majority sets a cell's walking axis.
 WALK_AXIS_WINDOW = 1.5
 
@@ -125,6 +151,25 @@ class HallwayRaycastEnv(gym.Env):
     closer than that, or if the route stalls). Only the observation changes;
     reward, success and the step limit still use the real goal. The subgoal is
     in `subgoal` and info['subgoal'] (equal to the goal when this is None).
+
+    subgoal_offset (m, needs subgoal_lookahead) moves the subgoal sideways into a
+    lane: `lane_offset` m left (+) or right (-) of the corridor's center, across
+    the route at the lookahead point (see LANE_*). The center comes from the
+    walls, not the route, so the lane doesn't drift with the robot. lane_offset
+    is redrawn uniformly within +-subgoal_offset every LANE_HOLD_RANGE seconds
+    (0 with LANE_ZERO_PROB). reset(options={'lane_offset': x}) turns lanes on
+    for the episode (subgoal_offset or not) with lane_offset pinned to x, so a
+    decision layer can then set `lane_offset` itself between steps. `lane` is
+    the subgoal's lane, `near_lane` the same offset LANE_NEAR_DISTANCE ahead and
+    `robot_lane` at the robot, each (point, unit direction, offset as applied
+    after clipping) or None (lanes off, or the goal is the subgoal; robot_lane
+    also in turns, junctions and open areas, see LANE_TURN_ANGLE). The reward
+    adds spec.subgoal_lane_penalty for the robot's sideways distance from the
+    robot_lane it was shown, so following the lane is never penalized, wherever
+    it leads relative to the goal. scripted.downhill and scripted.avoider follow
+    near_lane. info adds 'lane_offset' (the subgoal's, as applied) and
+    'lane_error', the signed sideways distance (m, + = left) the step's penalty
+    was charged on, NaN where none was.
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
@@ -132,12 +177,14 @@ class HallwayRaycastEnv(gym.Env):
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
                  range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0,
                  pedestrians_yield=False, lane_penalty=True, encounter_prob=0.0,
-                 subgoal_lookahead=None):
+                 subgoal_lookahead=None, subgoal_offset=0.0):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
         self.map = OccupancyMap(map_yaml)
         self.is_hallway = is_hallway_map(self.map.yaml_path)
+        if subgoal_offset and not subgoal_lookahead:
+            raise ValueError('subgoal_offset needs subgoal_lookahead')
         if junction_prob > 0 and not self.is_hallway:
             raise ValueError('junction_prob needs the hallway map (its junction is hard-coded)')
         self.spawn_pose = spec.SPAWN_POSE if self.is_hallway else None
@@ -202,6 +249,14 @@ class HallwayRaycastEnv(gym.Env):
         self.goal = np.zeros(2)
         self.subgoal = np.zeros(2)
         self.subgoal_lookahead = subgoal_lookahead
+        self.subgoal_offset = subgoal_offset
+        self.lane_offset = 0.0
+        self._lane_steps_left = np.inf
+        self._lanes = False  # this episode's subgoal sits in a lane
+        # Lanes as (point, unit direction along the route, applied offset), or None.
+        self.lane = None
+        self.near_lane = None
+        self.robot_lane = None
         self._goal_field = None
         self._goal_distance = 0.0
         self._velocity = np.zeros(2)
@@ -573,17 +628,108 @@ class HallwayRaycastEnv(gym.Env):
                                       self._prev_action)
 
     def _find_subgoal(self):
-        """Return the point subgoal_lookahead m along route(), else the goal."""
+        """Return the point subgoal_lookahead m along route() (in its lane), else the goal."""
+        self.lane = self.near_lane = self.robot_lane = None
         if not self.subgoal_lookahead:
             return self.goal.copy()
         route = self.route(max_length=self.subgoal_lookahead)
         if len(route) > int(round(self.subgoal_lookahead / ROUTE_STEP)):
-            return route[-1].copy()
+            if not self._lanes:
+                return route[-1].copy()
+            self.lane = self._lane_at(route, len(route) - 1)[0]
+            near = int(round(LANE_NEAR_DISTANCE / ROUTE_STEP))
+            self.near_lane = self._lane_at(route, near)[0]
+            # At the robot: route direction over its first 0.5 m.
+            robot_lane, bounded = self._lane_at(route, 0, ahead=5)
+            turn = float(robot_lane[1] @ self.near_lane[1])
+            if bounded and turn >= np.cos(LANE_TURN_ANGLE):
+                self.robot_lane = robot_lane
+            return self.lane[0].copy()
         return self.goal.copy()
 
+    def _lane_at(self, route, i, ahead=0):
+        """((point, direction, offset), bounded) of the lane across route[i] at lane_offset.
+
+        The direction runs from route[i - 5 + ahead] to route[i + ahead];
+        bounded is False where the cross-section is open (see _lane_point).
+        """
+        direction = route[min(i + ahead, len(route) - 1)] - route[max(i + ahead - 5, 0)]
+        direction /= max(np.linalg.norm(direction), 1e-9)
+        point, offset, bounded = self._lane_point(route[i], direction, self.lane_offset)
+        return (point, direction, offset), bounded
+
+    def _lane_point(self, point, direction, offset):
+        """Return (lane point, offset used, bounded) across `direction` at `point`.
+
+        The lane point is `offset` m left of the corridor center.
+
+        The center is midway between the walls on either side of `point`, or
+        LANE_OPEN_HALF_WIDTH from the nearer one where the cross-section is wider
+        than LANE_MAX_WIDTH, or `point` itself with no wall in reach; the offset
+        is cut back until the point keeps LANE_MIN_CLEARANCE from everything.
+        bounded is True when walls on both sides are within LANE_MAX_WIDTH.
+        """
+        normal = np.array([-direction[1], direction[0]])
+        ts = np.arange(1, int(LANE_SCAN_DISTANCE / self._ray_step) + 1) * self._ray_step
+        reach = []
+        for side in (1.0, -1.0):
+            xy = point + side * ts[:, None] * normal
+            blocked = ~self.map.is_free(xy[:, 0], xy[:, 1])
+            reach.append(ts[blocked.argmax()] if blocked.any() else np.inf)
+        left, right = reach
+        bounded = left + right <= LANE_MAX_WIDTH
+        if bounded:
+            shift = (left - right) / 2
+        elif left < right:
+            shift = left - LANE_OPEN_HALF_WIDTH
+        elif np.isfinite(right):
+            shift = LANE_OPEN_HALF_WIDTH - right
+        else:
+            shift = 0.0
+        # Room each side of the center, keeping LANE_MIN_CLEARANCE from the walls.
+        room_left = max(left - shift - LANE_MIN_CLEARANCE, 0.0)
+        room_right = max(right + shift - LANE_MIN_CLEARANCE, 0.0)
+        offset = float(np.clip(offset, -room_right, room_left))
+        # Obstacles off the cross-section (door frames, furniture) can still be
+        # closer: back off toward the center until the point itself is clear.
+        candidates = np.linspace(offset, 0.0, int(abs(offset) / self.map.resolution) + 2)
+        xy = point + (shift + candidates)[:, None] * normal
+        clear = self._clearance_at(xy[:, 0], xy[:, 1]) >= LANE_MIN_CLEARANCE
+        offset = float(candidates[clear.argmax()]) if clear.any() else 0.0
+        return point + (shift + offset) * normal, offset, bounded
+
+    def lane_error(self, xy=None, lane=None):
+        """Signed sideways distance (m, + = left) of xy (default: the robot) from a lane.
+
+        lane defaults to near_lane; 0 when it is None. xy may be (..., 2).
+        """
+        xy = self.pose[:2] if xy is None else np.asarray(xy)
+        lane = self.near_lane if lane is None else lane
+        if lane is None:
+            return np.zeros(np.shape(xy)[:-1]) if np.ndim(xy) > 1 else 0.0
+        point, direction, _ = lane
+        rel = xy - point
+        return direction[0] * rel[..., 1] - direction[1] * rel[..., 0]
+
+    def _draw_lane_offset(self):
+        """Draw a new random lane offset and how many steps to hold it."""
+        self.lane_offset = 0.0 if self.np_random.random() < LANE_ZERO_PROB \
+            else float(self.np_random.uniform(-self.subgoal_offset, self.subgoal_offset))
+        self._lane_steps_left = int(round(self.np_random.uniform(*LANE_HOLD_RANGE)
+                                          / spec.CONTROL_PERIOD))
+
+    def _robot_lane_error(self):
+        """Signed sideways distance (m) from robot_lane, NaN without one."""
+        if self.robot_lane is None:
+            return float('nan')
+        return float(self.lane_error(lane=self.robot_lane))
+
     def _info(self, **extra):
+        lane = {} if not self._lanes else {
+            'lane_offset': self.lane[2] if self.lane is not None else 0.0,
+            'lane_error': self._robot_lane_error()}
         return {'pose': self.pose.copy(), 'goal': self.goal.copy(),
-                'subgoal': self.subgoal.copy(),
+                'subgoal': self.subgoal.copy(), **lane,
                 'goal_distance': self._goal_distance,
                 'pedestrians': self.pedestrians.copy(), **extra}
 
@@ -616,6 +762,16 @@ class HallwayRaycastEnv(gym.Env):
         self._goal_field = self.map.distance_field(*self.goal)
         # Drawn after spawn/goal (and only when enabled), so those stay seeded the same.
         self._sample_pedestrians()
+        # Also after the pedestrians, and only when enabled, for the same reason.
+        self._lanes = bool(self.subgoal_offset) or 'lane_offset' in options
+        if self._lanes and not self.subgoal_lookahead:
+            raise ValueError('lane offsets need subgoal_lookahead')
+        if 'lane_offset' in options:
+            self.lane_offset, self._lane_steps_left = float(options['lane_offset']), np.inf
+        elif self.subgoal_offset:
+            self._draw_lane_offset()
+        else:
+            self.lane_offset, self._lane_steps_left = 0.0, np.inf
         self._goal_distance = self._goal_field(*self.pose[:2])
         if not np.isfinite(self._goal_distance):
             raise RuntimeError(f'Goal {self.goal} unreachable from spawn {self.pose}')
@@ -646,13 +802,19 @@ class HallwayRaycastEnv(gym.Env):
         collided = hit_pedestrian or self._outline_hits(self._collision_outline, self.pose)
         clearance = self.clearance()
         goal_distance = self._goal_field(*self.pose[:2])
+        # Against the lane the action was chosen from (the last observation's).
+        lane_error = self._robot_lane_error()
         reward, reached = spec.step_outcome(
             self._goal_distance, goal_distance, self.pose, self.goal, collided, clearance,
             pedestrian_gaps=gaps, hit_pedestrian=hit_pedestrian,
             waiting=spec.waiting_for_pedestrian(self._velocity[0], gaps),
-            pedestrian_lane_times=lane_times if self.lane_penalty else ())
+            pedestrian_lane_times=lane_times if self.lane_penalty else (),
+            lane_error=lane_error if np.isfinite(lane_error) else 0.0)
         if np.isfinite(goal_distance):
             self._goal_distance = goal_distance
+        self._lane_steps_left -= 1
+        if self._lane_steps_left <= 0:
+            self._draw_lane_offset()
         obs = self._observe()
         terminated = collided or reached
         truncated = self._step_count >= self._max_steps
@@ -662,6 +824,8 @@ class HallwayRaycastEnv(gym.Env):
                           min_pedestrian_gap=float(gaps.min()) if len(gaps) else np.inf,
                           min_pedestrian_lane_time=float(lane_times.min())
                           if len(lane_times) else np.inf)
+        if self._lanes:
+            info['lane_error'] = lane_error  # what this step was charged on
         return obs, reward, terminated, truncated, info
 
     def render(self):

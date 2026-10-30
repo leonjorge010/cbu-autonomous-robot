@@ -7,6 +7,8 @@
     ros2 run cash_rl evaluate downhill avoider --random 200 --pedestrians 4  # 2D only
     ros2 run cash_rl evaluate runs/a/final_model.zip --map cbu_floor2 --random 200 \
         --subgoal-lookahead 3                     # policy sees a point 3 m ahead on the route
+    ros2 run cash_rl evaluate runs/a/final_model.zip avoider --random 200 --lane-offset 0.5
+                                                  # subgoal pinned 0.5 m left of center
 
 --env gazebo needs `ros2 launch cash_rl train_env.launch.py` running, and gives
 the most faithful result when nothing else is loading the CPU: HallwayEnv steps
@@ -24,7 +26,7 @@ import os
 from cash_rl import scripted, spec
 from cash_rl.occupancy_map import default_map_yaml, default_map_yaml_in_workspace, use_map
 from cash_rl.train import EVAL_SEED_BASE, evaluate, load_model, model_map_yaml
-from cash_rl.train import model_subgoal_lookahead
+from cash_rl.train import model_subgoal_lookahead, model_subgoal_offset
 import numpy as np
 
 # Held-out random pairs: past train.py's periodic-eval seeds (EVAL_SEED_BASE + i).
@@ -47,6 +49,7 @@ def summarize(results):
     def mean(key, subset):
         return float(np.mean([r[key] for r in subset])) if subset else float('nan')
     ok = [r for r in results if r['success']]
+    lane_errors = [e for r in results for e in r['lane_errors']]
     return {
         'success': mean('success', results),
         'collision': mean('collision', results),
@@ -56,6 +59,7 @@ def summarize(results):
         if ok else float('nan'),
         'reverse': mean('reverse', results),
         'override': mean('override', results),
+        'lane_error': float(np.mean(lane_errors)) if lane_errors else float('nan'),
         'return': mean('return', results),
     }
 
@@ -82,6 +86,13 @@ def main():
                         help='observe a subgoal M m ahead on the geodesic route instead '
                              'of the goal (2D only; reward and success still use the goal; '
                              "default: the first model zip's training setting; 0 = off)")
+    parser.add_argument('--subgoal-offset', type=float, default=None, metavar='W',
+                        help='subgoal in a random lane up to W m left/right of the corridor '
+                             "center (2D only; default: the first model zip's training "
+                             'setting; 0 = off)')
+    parser.add_argument('--lane-offset', type=float, default=None, metavar='X',
+                        help='pin the subgoal lane X m left (+) / right (-) of center for '
+                             'every episode (2D only; needs a subgoal lookahead)')
     parser.add_argument('--safety', action='store_true',
                         help='run the policy behind the LiDAR safety layer (cash_rl.safety)')
     args = parser.parse_args()
@@ -96,6 +107,13 @@ def main():
                   f'evaluating with {args.subgoal_lookahead or None}', flush=True)
     if args.subgoal_lookahead and args.env == 'gazebo':
         parser.error("--subgoal-lookahead is 2D only (it reads the 2D map's route)")
+    trained_offset = [model_subgoal_offset(p) for p in args.models if p not in SCRIPTED]
+    if args.subgoal_offset is None:
+        args.subgoal_offset = trained_offset[0] if trained_offset and args.env == '2d' else 0.0
+    if args.lane_offset is not None:
+        args.subgoal_offset = 0.0  # pinned instead of drawn
+    if (args.subgoal_offset or args.lane_offset is not None) and not args.subgoal_lookahead:
+        parser.error('--subgoal-offset / --lane-offset need a subgoal lookahead')
     if args.pedestrians and args.env == 'gazebo':
         parser.error('--pedestrians is 2D only (no pedestrians in Gazebo yet)')
     if args.env == 'gazebo' and any(path in SCRIPTED for path in args.models):
@@ -120,7 +138,8 @@ def main():
         env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                                 pedestrians_yield=args.yielding_pedestrians,
                                 encounter_prob=args.encounter_prob,
-                                subgoal_lookahead=args.subgoal_lookahead)
+                                subgoal_lookahead=args.subgoal_lookahead,
+                                subgoal_offset=args.subgoal_offset)
     if args.safety:
         from cash_rl.safety import SafetyWrapper
         env = SafetyWrapper(env)
@@ -131,6 +150,8 @@ def main():
         + (f', encounters {args.encounter_prob:g}' if args.pedestrians and args.encounter_prob
            else '') \
         + (f', subgoals {args.subgoal_lookahead:g} m' if args.subgoal_lookahead else '') \
+        + (f', lanes +-{args.subgoal_offset:g} m' if args.subgoal_offset else '') \
+        + (f', lane {args.lane_offset:+g} m' if args.lane_offset is not None else '') \
         + (', safety layer' if args.safety else '')
     door_goals = spec.DOOR_GOALS if args.env == 'gazebo' else env.unwrapped.door_goals
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})
@@ -139,6 +160,9 @@ def main():
     if not doors and not args.random:
         parser.error('this map has no door episodes; pass --random N')
     randoms = [(f'random_{i}', HELD_OUT_SEED_BASE + i, None) for i in range(args.random)]
+    if args.lane_offset is not None:
+        doors = [(n, r, dict(o, lane_offset=args.lane_offset)) for n, r, o in doors]
+        randoms = [(n, s, {'lane_offset': args.lane_offset}) for n, s, _ in randoms]
 
     summaries = []
     try:
@@ -164,13 +188,17 @@ def main():
     finally:
         env.close()
 
+    lanes = bool(args.subgoal_offset) or args.lane_offset is not None
+
     def row(name, s):
         return (f'{name:44} {s["success"]:>7.1%} {s["collision"]:>9.1%} {s["timeout"]:>7.1%} '
                 f'{s["time_s"]:>7.1f} {s["path_ratio"]:>6.2f} {s["reverse"]:>7.1%} '
-                f'{s["return"]:>+8.1f}' + (f' {s["override"]:>8.1%}' if args.safety else ''))
+                f'{s["return"]:>+8.1f}' + (f' {s["override"]:>8.1%}' if args.safety else '')
+                + (f' {s["lane_error"]:>6.2f}' if lanes else ''))
     header = (f'{"":44} {"success":>7} {"collision":>9} {"timeout":>7} '
               f'{"time_s":>7} {"path":>6} {"reverse":>7} {"return":>8}'
-              + (f' {"override":>8}' if args.safety else ''))
+              + (f' {"override":>8}' if args.safety else '')
+              + (f' {"lane":>6}' if lanes else ''))
     if doors:
         print(f'\nDoors from spawn ({len(doors)} episodes per model, {mode})')
         print(header)
@@ -183,8 +211,10 @@ def main():
             print(row(label, random_summary))
     print('\ntime_s and path (driven / geodesic start distance) average successful '
           'episodes only; reverse = share of steps commanding reverse'
-          + ('; override = share of steps the safety layer changed the command.'
-             if args.safety else '.'))
+          + ('; override = share of steps the safety layer changed the command'
+             if args.safety else '')
+          + ('; lane = mean |sideways distance| (m) from the subgoal lane' if lanes else '')
+          + '.')
 
 
 if __name__ == '__main__':

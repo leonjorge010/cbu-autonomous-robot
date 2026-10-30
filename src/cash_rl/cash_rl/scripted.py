@@ -10,8 +10,15 @@ from cash_rl import spec
 import numpy as np
 
 
-def downhill(env, lookahead=0.6, wall_clearance=0.7, wall_weight=3.0):
-    """Head down the geodesic goal distance, keeping clear of walls; return an action."""
+def downhill(env, lookahead=0.6, wall_clearance=0.7, wall_weight=3.0, lane_weight=2.0,
+             lane_deadband=0.05):
+    """Head down the geodesic goal distance, keeping clear of walls; return an action.
+
+    With a subgoal lane active (HallwayRaycastEnv subgoal_offset / lane_offset),
+    each metre the lookahead point sits outside the lane (beyond lane_deadband)
+    costs lane_weight metres of geodesic, so it steers into the lane and follows it.
+    """
+    env = env.unwrapped
     x, y, yaw = env.pose
     to_goal = env.goal - env.pose[:2]
     if np.hypot(*to_goal) < lookahead:
@@ -25,6 +32,9 @@ def downhill(env, lookahead=0.6, wall_clearance=0.7, wall_weight=3.0):
         clearance = env.map.clearance[np.clip(row, 0, env.map.height - 1),
                                       np.clip(col, 0, env.map.width - 1)]
         cost = cost + wall_weight * np.maximum(0.0, wall_clearance - clearance)
+        if env.near_lane is not None:
+            error = np.abs(env.lane_error(np.stack([px, py], axis=1)))
+            cost = cost + lane_weight * np.maximum(0.0, error - lane_deadband)
         heading = dirs[np.argmin(cost)]
     error = (heading - yaw + np.pi) % (2 * np.pi) - np.pi
     return np.array([1.0 if abs(error) < 0.4 else 0.1, np.clip(2 * error, -1, 1)])
@@ -32,7 +42,8 @@ def downhill(env, lookahead=0.6, wall_clearance=0.7, wall_weight=3.0):
 
 def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
             pedestrian_weight=4.0, contact_cost=20.0, wall_clearance=0.7, wall_weight=1.0,
-            side_weight=1.0, side_distance=1.0):
+            side_weight=1.0, side_distance=1.0, lane_weight=0.5, lane_deadband=0.05,
+            lane_release=2.0):
     """Downhill plus pedestrian avoidance from their true future positions; return an action.
 
     Cheats more than downhill: besides the geodesic field it reads the pedestrians'
@@ -51,7 +62,13 @@ def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
     way, so either passes on the robot's left; crossing ones (more than 45 deg off
     the robot's descent direction) don't count. Without the rule it picked a side
     by tiny cost differences (left 53% of close passes), labels a student policy
-    can only average into driving straight. side_weight 0 turns it off. An upper-bound reference
+    can only average into driving straight. side_weight 0 turns it off. With a
+    subgoal lane active (HallwayRaycastEnv subgoal_offset / lane_offset), each
+    second spent outside the lane costs lane_weight per metre (beyond
+    lane_deadband), except within lane_release of a pedestrian, where it has to
+    leave the lane to pass. An off-center lane also replaces keep-right: the
+    robot belongs on the lane's side of the pedestrian (left of it for a lane
+    left of center), whichever way it walks. An upper-bound reference
     for what avoidance is achievable with this robot, not something a policy could
     copy from its observation.
     """
@@ -117,6 +134,19 @@ def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
     robot_on_left = walk[:, None, :, 0] * rel_y - walk[:, None, :, 1] * rel_x  # (T, K, N)
     # Oncoming: the robot belongs on its left; walking the robot's way: on its right.
     wrong = sense[:, None, :] * robot_on_left > 0.0
+    lane_cost = 0.0
+    if base.near_lane is not None:
+        _, direction, offset = base.near_lane
+        if offset != 0.0:
+            # The lane picks the side: the robot belongs left of the pedestrian
+            # (across the lane's direction) for a lane left of center.
+            normal = np.array([-direction[1], direction[0]])
+            across = (poses[..., None, :2] - future[:, None]) @ normal  # (T, K, N)
+            wrong = np.sign(offset) * across < 0.0
+        released = np.any(pedestrian_gaps < lane_release, axis=2)  # (T, K)
+        lane_error = np.abs(base.lane_error(poses[..., :2]))  # (T, K)
+        lane_cost = lane_weight * np.sum(
+            (active & ~released) * np.maximum(0.0, lane_error - lane_deadband), axis=0) * dt
     wrong_side = np.any(wrong & (pedestrian_gaps < side_distance), axis=2)  # (T, K)
     wrong_side_time = np.sum(active & wrong_side, axis=0) * dt
     turn = np.abs((heading - poses[..., 2] + np.pi) % (2 * np.pi) - np.pi)
@@ -130,7 +160,7 @@ def avoider(env, horizon=4.0, wall_horizon=1.0, hard_horizon=1.5, comfort=0.4,
     before_contact = np.arange(n_steps)[:, None] < first
     eta = np.where((active | reached) & before_contact, eta, np.inf)
     cost = eta.min(axis=0) + (pedestrian_weight * discomfort + contact_cost * later_contact
-                              + side_weight * wrong_side_time) / spec.MAX_LINEAR_VEL
+                              + side_weight * wrong_side_time + lane_cost) / spec.MAX_LINEAR_VEL
     if np.all(blocked):
         # Nothing is safe: take the action whose first contact comes latest.
         return actions[np.argmax(first - 0.01 * cost)]

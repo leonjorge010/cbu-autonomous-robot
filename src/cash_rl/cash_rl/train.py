@@ -84,6 +84,11 @@ def model_subgoal_lookahead(path):
     return _model_config(path).get('args', {}).get('subgoal_lookahead')
 
 
+def model_subgoal_offset(path):
+    """--subgoal-offset a train.py/dagger.py model was trained with, or 0."""
+    return _model_config(path).get('args', {}).get('subgoal_offset') or 0.0
+
+
 class SingleScanModel:
     """Wrap a pre-scan-stacking model so predict() accepts N_OBS observations."""
 
@@ -115,13 +120,15 @@ def evaluate(model, env, episodes):
 
     Besides outcome and return: 'path' = distance driven (m), 'start_distance' =
     geodesic start distance (m), 'reverse' = share of steps commanding reverse,
-    'override' = share of steps a safety.SafetyWrapper changed the action.
+    'override' = share of steps a safety.SafetyWrapper changed the action,
+    'lane_errors' = |info['lane_error']| on steps charged a lane penalty (m, a list).
     """
     results = []
     for name, seed, options in episodes:
         obs, info = env.reset(seed=seed, options=options)
         start_distance, prev = info['goal_distance'], info['pose'][:2].copy()
         total, steps, path, reversing, overrides = 0.0, 0, 0.0, 0, 0
+        lane_errors = []
         while True:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -129,6 +136,8 @@ def evaluate(model, env, episodes):
             steps += 1
             reversing += action[0] < 0
             overrides += bool(info.get('safety_override', False))
+            if np.isfinite(info.get('lane_error', np.nan)):
+                lane_errors.append(abs(info['lane_error']))
             path += float(np.hypot(*(info['pose'][:2] - prev)))
             prev = info['pose'][:2].copy()
             if terminated or truncated:
@@ -137,7 +146,8 @@ def evaluate(model, env, episodes):
                         'collision': bool(info['collided']),
                         'timeout': not terminated, 'return': total, 'steps': steps,
                         'path': path, 'start_distance': start_distance,
-                        'reverse': reversing / steps, 'override': overrides / steps})
+                        'reverse': reversing / steps, 'override': overrides / steps,
+                        'lane_errors': lane_errors})
     return results
 
 
@@ -240,6 +250,10 @@ def main():
     parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
                         help='observe a subgoal M m ahead on the geodesic route instead of the '
                              'goal, in training and eval (reward still uses the goal)')
+    parser.add_argument('--subgoal-offset', type=float, default=0.0, metavar='W',
+                        help='put the subgoal in a random lane up to W m left/right of the '
+                             'corridor center and pay for staying in it (needs '
+                             '--subgoal-lookahead), in training and eval')
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--ent-coef', type=float, default=None,
@@ -249,6 +263,8 @@ def main():
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
+    if args.subgoal_offset and not args.subgoal_lookahead:
+        parser.error('--subgoal-offset needs --subgoal-lookahead')
 
     # Set before any env exists, so SubprocVecEnv workers load the same map.
     map_yaml = use_map(args.map) if args.map else os.path.abspath(default_map_yaml())
@@ -276,7 +292,8 @@ def main():
                   'pedestrians_yield': args.yielding_pedestrians,
                   'lane_penalty': not args.no_lane_penalty,
                   'encounter_prob': args.encounter_prob,
-                  'subgoal_lookahead': args.subgoal_lookahead}
+                  'subgoal_lookahead': args.subgoal_lookahead,
+                  'subgoal_offset': args.subgoal_offset}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
@@ -288,7 +305,8 @@ def main():
     eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                                  pedestrians_yield=args.yielding_pedestrians,
                                  lane_penalty=not args.no_lane_penalty,
-                                 subgoal_lookahead=args.subgoal_lookahead)
+                                 subgoal_lookahead=args.subgoal_lookahead,
+                                 subgoal_offset=args.subgoal_offset)
 
     model_kwargs = dict(kwargs)
     if args.lr_schedule == 'linear':

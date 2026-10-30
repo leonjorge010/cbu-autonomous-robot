@@ -4,11 +4,11 @@ from cash_rl import spec
 from cash_rl.occupancy_map import default_map_yaml_in_workspace, keepout_yaml_for
 from cash_rl.occupancy_map import load_free_mask
 from cash_rl.raycast_env import BRANCH_MIN_Y, ENCOUNTER_DISTANCE_RANGE, ENCOUNTER_LATERAL
-from cash_rl.raycast_env import HallwayRaycastEnv, ROUTE_STEP
+from cash_rl.raycast_env import HallwayRaycastEnv, LANE_HOLD_RANGE, ROUTE_STEP
 from cash_rl.raycast_env import PEDESTRIAN_RADIUS, PEDESTRIAN_SLOW_FACTOR
 from cash_rl.raycast_env import PEDESTRIAN_SPEED_RANGE, PEDESTRIAN_STOP_DISTANCE
 from cash_rl.raycast_env import PEDESTRIAN_WALL_CLEARANCE
-from cash_rl.scripted import downhill
+from cash_rl.scripted import avoider, downhill
 from gymnasium.utils.env_checker import check_env
 import numpy as np
 import pytest
@@ -723,3 +723,112 @@ def test_subgoal_is_the_goal_once_it_is_closer_than_the_lookahead():
     _, info = HallwayRaycastEnv().reset(seed=0, options={'spawn': spec.SPAWN_POSE,
                                                          'goal': DOOR_202})
     np.testing.assert_array_equal(info['subgoal'], info['goal'])
+
+
+def test_lane_subgoal_sits_offset_from_the_corridor_center_and_pays_for_following():
+    plain = HallwayRaycastEnv(subgoal_lookahead=3.0)
+    lanes = HallwayRaycastEnv(subgoal_lookahead=3.0)
+    # x 8-13 m: no door frames or furniture narrowing the corridor.
+    options = {'spawn': (8.0, -0.6, 0.0), 'goal': (20.0, 0.0)}
+    _, plain_info = plain.reset(seed=0, options=options)
+    obs, info = lanes.reset(seed=0, options=dict(options, lane_offset=0.5))
+    # Main corridor |y| <= 1.2: the lane is 0.5 m left of y = 0 wherever the robot is.
+    assert info['lane_offset'] == 0.5 and abs(info['subgoal'][1] - 0.5) < 0.1
+    assert info['lane_error'] == pytest.approx(-1.1, abs=0.1)
+    _, info = lanes.reset(seed=0, options=dict(options, lane_offset=-0.5))
+    assert abs(info['subgoal'][1] + 0.5) < 0.1
+    assert 'lane_offset' not in plain_info
+    # Same actions, same outcome; the reward differs only by the lane penalty,
+    # measured from the lane the robot was shown when it acted.
+    penalties = []
+    while True:
+        action = downhill(plain)
+        shown = lanes.robot_lane
+        _, r_plain, term_plain, trunc_plain, _ = plain.step(action)
+        _, r_lane, term_lane, trunc_lane, info = lanes.step(action)
+        error = lanes.lane_error(lane=shown) if shown is not None else 0.0
+        assert info['lane_error'] == pytest.approx(error) or shown is None
+        penalties.append(spec.subgoal_lane_penalty(error))
+        assert r_lane == pytest.approx(r_plain - penalties[-1])
+        assert (term_lane, trunc_lane) == (term_plain, trunc_plain)
+        if term_plain or trunc_plain:
+            break
+    # downhill drives the route, not the lane: it pays.
+    assert sum(penalties) > 1.0
+
+
+def test_lane_offset_is_clipped_to_keep_clear_of_walls():
+    env = HallwayRaycastEnv(subgoal_lookahead=3.0)
+    for offset in (3.0, -3.0):
+        _, info = env.reset(seed=0, options={'spawn': (8.0, 0.0, 0.0), 'goal': (20.0, 0.0),
+                                             'lane_offset': offset})
+        assert 0.45 < abs(info['lane_offset']) < 0.65
+        assert env._clearance_at(*info['subgoal']) >= spec.SAFE_CLEARANCE - env.map.resolution
+
+
+def test_random_lane_offsets_are_bounded_held_and_seeded():
+    def offsets(seed):
+        env = HallwayRaycastEnv(subgoal_lookahead=3.0, subgoal_offset=0.6)
+        env.reset(seed=seed, options={'spawn': (2.0, 0.0, 0.0), 'goal': (25.0, 0.0)})
+        drawn = [env.lane_offset]
+        for _ in range(300):
+            env.step(np.array([0.0, 0.0]))
+            drawn.append(env.lane_offset)
+        return np.array(drawn)
+    drawn = offsets(3)
+    assert np.all(np.abs(drawn) <= 0.6) and len(np.unique(drawn)) > 2
+    changes = np.flatnonzero(np.diff(drawn))
+    assert np.all(np.diff(changes) >= int(LANE_HOLD_RANGE[0] / spec.CONTROL_PERIOD) - 1)
+    np.testing.assert_array_equal(drawn, offsets(3))
+    with pytest.raises(ValueError):
+        HallwayRaycastEnv(subgoal_offset=0.5)
+
+
+def test_downhill_follows_a_pinned_lane():
+    env = HallwayRaycastEnv(subgoal_lookahead=3.0, range_noise=False)
+    for offset in (0.5, -0.5):
+        env.reset(seed=0, options={'spawn': (8.0, 0.0, 0.0), 'goal': (20.0, 0.0),
+                                   'lane_offset': offset})
+        errors = []
+        for _ in range(90):  # to x ~ 12 m, before the junction moves the lane
+            _, _, terminated, _, info = env.step(downhill(env))
+            errors.append(info['lane_error'])
+            assert not terminated
+        errors = np.nan_to_num(errors)
+        assert np.max(np.abs(errors[60:])) < 0.1
+        assert env.pose[1] == pytest.approx(offset, abs=0.1)
+
+
+def test_avoider_passes_a_pedestrian_on_the_lanes_side():
+    env = HallwayRaycastEnv(subgoal_lookahead=3.0, n_pedestrians=1, range_noise=False)
+    for offset in (0.5, -0.5):
+        env.reset(seed=0, options={'spawn': (2.0, 0.0, 0.0), 'goal': (20.0, 0.0),
+                                   'lane_offset': offset})
+        # Oncoming down the middle of the corridor.
+        env.pedestrians = np.array([[9.0, 0.0]])
+        env._pedestrian_velocities = np.array([[-0.7, 0.0]])
+        sides = []
+        while env.pedestrians[0, 0] > env.pose[0] - 1.0:
+            _, _, terminated, _, info = env.step(avoider(env))
+            assert not terminated
+            if info['min_pedestrian_gap'] < 0.8:
+                sides.append(np.sign(env.pose[1] - env.pedestrians[0, 1]))
+        assert sides and np.all(np.array(sides) == np.sign(offset))
+
+
+def test_following_a_lane_away_from_the_goal_is_not_penalized():
+    # Goal up the branch (a left turn) or at a door ahead-left: following a right
+    # lane (around the outside of the turn, or away from the door) earns at least about
+    # what following a left one does. The progress reward telescopes, so a detour
+    # only costs its extra time; the lane penalty is waived where the lane
+    # swings round in turns and junctions.
+    env = HallwayRaycastEnv(subgoal_lookahead=3.0, range_noise=False)
+    for goal in ((14.0, 5.0), (16.0, 0.6)):
+        returns = {}
+        for offset in (0.5, -0.5):
+            env.reset(seed=0, options={'spawn': (6.0, 0.0, 0.0), 'goal': goal,
+                                       'lane_offset': offset})
+            total, info = drive(env, downhill)
+            assert info['is_success']
+            returns[offset] = total
+        assert returns[-0.5] > returns[0.5] - 3.0, (goal, returns)

@@ -152,9 +152,16 @@ def main():
     parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
                         help='student observes a subgoal M m ahead on the geodesic route '
                              'instead of the goal, in collection and eval')
+    parser.add_argument('--subgoal-offset', type=float, default=0.0, metavar='W',
+                        help='move the subgoal into a random lane up to W m left/right of the '
+                             'corridor center (needs --subgoal-lookahead; the teacher follows '
+                             'the lane and passes pedestrians on its side), in collection and '
+                             'eval')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--name', help='run name (default: dagger_<timestamp>)')
     args = parser.parse_args()
+    if args.subgoal_offset and not args.subgoal_lookahead:
+        parser.error('--subgoal-offset needs --subgoal-lookahead')
 
     import torch
     from stable_baselines3 import PPO
@@ -166,7 +173,8 @@ def main():
     run_dir = os.path.join(runs_dir(), name)
     os.makedirs(os.path.join(run_dir, 'checkpoints'), exist_ok=False)
     env_kwargs = {'n_pedestrians': args.pedestrians, 'encounter_prob': args.encounter_prob,
-                  'subgoal_lookahead': args.subgoal_lookahead}
+                  'subgoal_lookahead': args.subgoal_lookahead,
+                  'subgoal_offset': args.subgoal_offset}
     # load_model reads args.algo; the student is an ordinary PPO MlpPolicy.
     config_args = dict(vars(args), algo='ppo')
     kwargs = algo_kwargs('ppo', 12)
@@ -188,7 +196,8 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians, encounter_prob=1.0,
-                                 subgoal_lookahead=args.subgoal_lookahead)
+                                 subgoal_lookahead=args.subgoal_lookahead,
+                                 subgoal_offset=args.subgoal_offset)
     eval_episodes = [(f'encounter_{i}', EVAL_SEED_BASE + i, None)
                      for i in range(args.eval_episodes)]
     fields = ['round', 'beta', 'labels', 'mse', 'rollout_success', 'rollout_collision',
@@ -200,7 +209,9 @@ def main():
     print(f'DAgger: {args.rounds + 1} rounds x {args.steps_per_round:,} labelled steps, '
           f'{workers} workers, {os.path.basename(map_yaml)}, {args.pedestrians} pedestrian(s), '
           'encounters '
-          f'{args.encounter_prob:g} -> {run_dir}', flush=True)
+          f'{args.encounter_prob:g}'
+          + (f', lanes +-{args.subgoal_offset:g} m' if args.subgoal_offset else '')
+          + f' -> {run_dir}', flush=True)
     observations, labels = [], []
     best = (-1.0, 0.0)
     start = time.time()

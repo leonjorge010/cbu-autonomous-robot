@@ -112,6 +112,13 @@ PEDESTRIAN_LANE_HORIZON = 3.0
 PEDESTRIAN_LANE_PENALTY = 0.3
 PEDESTRIAN_PROXIMITY_PENALTY = 0.3
 PEDESTRIAN_COLLISION_PENALTY = 40.0
+# Subgoal lanes (HallwayRaycastEnv subgoal_offset / lane_offset only): the robot
+# pays SUBGOAL_LANE_WEIGHT per step per metre it sits sideways beyond
+# SUBGOAL_LANE_DEADBAND from the lane it was shown, so it is paid to follow the
+# subgoals, not just to reach the goal. Full-speed progress earns 0.5 per step;
+# 0.5 m off the lane costs 0.2, so following stays worth more than stopping.
+SUBGOAL_LANE_DEADBAND = 0.1
+SUBGOAL_LANE_WEIGHT = 0.5
 
 # Fixed evaluation goals: the corridor centerline in front of each door in
 # cash_sim/worlds/hallway.sdf (world frame == map frame).
@@ -266,9 +273,14 @@ def pedestrian_lane_penalty(lane_times):
     return PEDESTRIAN_LANE_PENALTY * float(urgency.sum())
 
 
+def subgoal_lane_penalty(lane_error):
+    """Per-step penalty for a sideways distance (m) from the subgoal lane."""
+    return SUBGOAL_LANE_WEIGHT * max(0.0, abs(lane_error) - SUBGOAL_LANE_DEADBAND)
+
+
 def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
                  clearance=float('inf'), pedestrian_gaps=(), hit_pedestrian=False,
-                 waiting=False, pedestrian_lane_times=()):
+                 waiting=False, pedestrian_lane_times=(), lane_error=0.0):
     """Return (reward, reached) for one step.
 
     goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
@@ -279,13 +291,14 @@ def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
     hit_pedestrian set costs PEDESTRIAN_COLLISION_PENALTY instead of
     COLLISION_PENALTY. waiting (waiting_for_pedestrian) drops TIME_PENALTY and
     the pedestrian proximity penalty. pedestrian_lane_times adds the lane
-    penalty (pedestrian_lane_penalty), waiting or not.
+    penalty (pedestrian_lane_penalty), waiting or not. lane_error (m from the
+    subgoal lane) adds subgoal_lane_penalty.
     """
     progress = goal_distance - prev_goal_distance
     progress = 0.0 if not np.isfinite(progress) else -progress
     reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
     reward = PROGRESS_WEIGHT * progress - proximity_penalty(clearance) \
-        - pedestrian_lane_penalty(pedestrian_lane_times)
+        - pedestrian_lane_penalty(pedestrian_lane_times) - subgoal_lane_penalty(lane_error)
     if not waiting:
         reward -= TIME_PENALTY + pedestrian_proximity_penalty(pedestrian_gaps)
     if reached:
