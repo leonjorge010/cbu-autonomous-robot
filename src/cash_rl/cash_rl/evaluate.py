@@ -4,6 +4,7 @@
     ros2 run cash_rl evaluate ~/ros2_ws/runs/<run>/best_model.zip --env gazebo
     ros2 run cash_rl evaluate runs/a/best_model.zip runs/b/best_model.zip --random 200
     ros2 run cash_rl evaluate runs/a/best_model.zip --random 200 --pedestrians 4
+    ros2 run cash_rl evaluate downhill avoider --random 200 --pedestrians 4  # 2D only
 
 --env gazebo needs `ros2 launch cash_rl train_env.launch.py` running, and gives
 the most faithful result when nothing else is loading the CPU: HallwayEnv steps
@@ -11,17 +12,32 @@ on wall-clock time, so a slow simulation changes the sim time per step.
 Door episodes start at spec.SPAWN_POSE. --random N adds N random spawn/goal
 pairs (2D only) on seeds held out from both training and train.py's periodic
 eval, which picks best_model.zip and so would flatter it. Several models are
-scored on identical episodes and summarized side by side.
+scored on identical episodes and summarized side by side. The scripted
+controllers `downhill` and `avoider` (cash_rl.scripted) can be named in place of
+a model zip as references; they read the 2D env's state, so 2D only.
 """
 import argparse
 import os
 
-from cash_rl import spec
-from cash_rl.train import EVAL_SEED_BASE, evaluate, load_model
+from cash_rl import scripted, spec
+from cash_rl.occupancy_map import default_map_yaml, default_map_yaml_in_workspace, use_map
+from cash_rl.train import EVAL_SEED_BASE, evaluate, load_model, model_map_yaml
 import numpy as np
 
 # Held-out random pairs: past train.py's periodic-eval seeds (EVAL_SEED_BASE + i).
 HELD_OUT_SEED_BASE = EVAL_SEED_BASE + 100_000
+SCRIPTED = {'downhill': scripted.downhill, 'avoider': scripted.avoider}
+
+
+class ScriptedModel:
+    """predict() adapter for a cash_rl.scripted controller reading the env's state."""
+
+    def __init__(self, controller, env):
+        self.controller = controller
+        self.env = env.unwrapped
+
+    def predict(self, observation, **kwargs):
+        return self.controller(self.env), None
 
 
 def summarize(results):
@@ -43,13 +59,22 @@ def summarize(results):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('models', nargs='+', help='train.py model .zip files')
+    parser.add_argument('models', nargs='+',
+                        help=f"train.py model .zip files, or {' / '.join(SCRIPTED)}")
     parser.add_argument('--env', choices=['2d', 'gazebo'], default='2d')
     parser.add_argument('--repeats', type=int, default=1, help='episodes per door')
     parser.add_argument('--random', type=int, default=0,
                         help='held-out random spawn/goal pairs to add (2D only)')
     parser.add_argument('--pedestrians', type=int, default=0,
                         help='moving pedestrians per episode (2D only)')
+    parser.add_argument('--yielding-pedestrians', action='store_true',
+                        help='pedestrians step around the robot instead of walking into it')
+    parser.add_argument('--encounter-prob', type=float, default=0.0,
+                        help="share of episodes whose first pedestrian starts on the robot's "
+                             'route walking toward it; 1 = an avoidance test (2D only)')
+    parser.add_argument('--map', help='map name in maps/ or .yaml path (default: the map the '
+                        'first model zip was trained on, else $CASH_MAP_YAML / hallway); '
+                        'door episodes are hallway only')
     parser.add_argument('--safety', action='store_true',
                         help='run the policy behind the LiDAR safety layer (cash_rl.safety)')
     args = parser.parse_args()
@@ -57,28 +82,54 @@ def main():
         parser.error('--random is 2D only (HallwayEnv spawns from fixed poses)')
     if args.pedestrians and args.env == 'gazebo':
         parser.error('--pedestrians is 2D only (no pedestrians in Gazebo yet)')
+    if args.env == 'gazebo' and any(path in SCRIPTED for path in args.models):
+        parser.error(f"{' / '.join(SCRIPTED)} are 2D only (they read the 2D env's state)")
+
+    trained_on = [model_map_yaml(p) for p in args.models if p not in SCRIPTED]
+    if args.map:
+        use_map(args.map)
+    elif trained_on and trained_on[0]:
+        use_map(trained_on[0])
+    map_yaml = os.path.abspath(default_map_yaml())
+    for path, on in zip([p for p in args.models if p not in SCRIPTED], trained_on):
+        if os.path.realpath(on or default_map_yaml_in_workspace()) != os.path.realpath(map_yaml):
+            print(f'WARNING: {path} was trained on {on or "the hallway"}, '
+                  f'evaluating on {map_yaml}', flush=True)
 
     if args.env == 'gazebo':
         from cash_rl.hallway_env import HallwayEnv
         env = HallwayEnv()
     else:
         from cash_rl.raycast_env import HallwayRaycastEnv
-        env = HallwayRaycastEnv(n_pedestrians=args.pedestrians)
+        env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                                pedestrians_yield=args.yielding_pedestrians,
+                                encounter_prob=args.encounter_prob)
     if args.safety:
         from cash_rl.safety import SafetyWrapper
         env = SafetyWrapper(env)
-    mode = args.env + (f', {args.pedestrians} pedestrians' if args.pedestrians else '') \
+    mode = args.env + ('' if args.env == 'gazebo'
+                       else f', {os.path.splitext(os.path.basename(map_yaml))[0]}') \
+        + (f', {args.pedestrians} pedestrians' if args.pedestrians else '') \
+        + (' (yielding)' if args.pedestrians and args.yielding_pedestrians else '') \
+        + (f', encounters {args.encounter_prob:g}' if args.pedestrians and args.encounter_prob
+           else '') \
         + (', safety layer' if args.safety else '')
+    door_goals = spec.DOOR_GOALS if args.env == 'gazebo' else env.unwrapped.door_goals
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})
-             for name, goal in sorted(spec.DOOR_GOALS.items())
+             for name, goal in sorted(door_goals.items())
              for repeat in range(args.repeats)]
+    if not doors and not args.random:
+        parser.error('this map has no door episodes; pass --random N')
     randoms = [(f'random_{i}', HELD_OUT_SEED_BASE + i, None) for i in range(args.random)]
 
     summaries = []
     try:
         for path in args.models:
-            model = load_model(path)
-            label = os.path.relpath(os.path.expanduser(path))
+            if path in SCRIPTED:
+                model, label = ScriptedModel(SCRIPTED[path], env), path
+            else:
+                model = load_model(path)
+                label = os.path.relpath(os.path.expanduser(path))
             print(f'\n== {label} ({mode})', flush=True)
             print(f'{"door":10} {"outcome":10} {"steps":>6} {"return":>8}', flush=True)
             door_results = []
@@ -102,10 +153,11 @@ def main():
     header = (f'{"":44} {"success":>7} {"collision":>9} {"timeout":>7} '
               f'{"time_s":>7} {"path":>6} {"reverse":>7} {"return":>8}'
               + (f' {"override":>8}' if args.safety else ''))
-    print(f'\nDoors from spawn ({len(doors)} episodes per model, {mode})')
-    print(header)
-    for label, door_summary, _ in summaries:
-        print(row(label, door_summary))
+    if doors:
+        print(f'\nDoors from spawn ({len(doors)} episodes per model, {mode})')
+        print(header)
+        for label, door_summary, _ in summaries:
+            print(row(label, door_summary))
     if randoms:
         print(f'\nHeld-out random pairs ({len(randoms)} episodes per model, {mode})')
         print(header)

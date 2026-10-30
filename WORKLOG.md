@@ -3,6 +3,135 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-29
+
+**Merged `pedestrians-no-yield` into `main`** (Ashlyn). Committed the map-generic TEGR code
+(`14b094d`: `--map`, keepout zones, per-map pedestrian axes, limited Dijkstra), then merged the
+branch. `main` now has non-yielding pedestrians, the lane penalty, `--encounter-prob`, the
+privileged `avoider`, `dagger` and TEGR training. 63 tests pass. No new training or results.
+
+**Open:** unchanged from 10-23 (DAgger seeds/rounds, TEGR wall collisions, `--init-from`,
+subgoal agent).
+
+## 2026-10-23
+
+**Training on the real TEGR 2nd floor** (`cbu_floor2`, Ashlyn; schedule weeks 8–9). Branch
+`pedestrians-no-yield`; the map-generic code below is **uncommitted** (last commit `eead4e9`).
+- `--map cbu_floor2` (name in `maps/` or a path) on `train`, `dagger`, `evaluate`, `view_env`;
+  `train`/`dagger` record `map_yaml` in `config.json`, and `evaluate`/`view_env` default to the
+  model's map (warning on a mismatch). Hallway-only: door evals (`env.door_goals` is empty
+  elsewhere, so `evaluate` needs `--random N`) and `--junction-prob` (raises on other maps).
+- `<map>_keepout.yaml` keeps spawns, goals and pedestrians out of Stair 1 and the learning zones
+  (the robot can still drive in: nothing penalizes it there).
+- Pedestrians walk along the longer open stretch through their cell, majority-voted over 1.5 m
+  (before: y if y ≥ 1.5 m, so every TEGR pedestrian walked north–south). The hallway keeps its old
+  rule: hallway seeded rollouts verified bit-identical before/after.
+- Spawn-side distance field stops at the goal range (`distance_field(limit=)`): TEGR reset
+  213 → 111 ms. `view_env` labels the layout's room goals (`landmarks_for`) and fits the map.
+- Room-goal check: `trace_floorplan --overlay` + a labelled render; all 26 look right, except
+  `elevator_2` (43.0, 57.4) may sit ~2 m east of the elevator door (check on site).
+- 7 new tests; 63 pass.
+
+**Overnight queue** (`runs/queue_tegr.txt`, all 10 jobs OK, 01:52–10:56). 200 held-out goals
+(1–15 m) on TEGR; files `runs/eval_tegr_*.txt`.
+
+| Encounter test, 1 pedestrian | Success | Collision | Reversing |
+|---|---|---|---|
+| avoider (keep-right teacher) | 89.0% | 10.5% | 5.2% |
+| **`tegr_dagger_p1`** | **61.5%** | 38.5% | 6.1% |
+| `tegr_ppo_p1` (enc 0.7, no lane, ent 0.001) | 52.0% | 45.5% | 21.4% |
+| `downhill` | 50.5% | 49.5% | 0% |
+| `tegr_ppo` (no pedestrians) | 42.0% | 56.5% | 13.1% |
+
+- First learned model clearly above `downhill` (+11 points, one seed). DAgger per-round eval was
+  still rising at round 10 (44% → 57% → 61% at rounds 5, 8, 10); imitation MSE 0.115.
+- No pedestrians: `tegr_ppo` seeds 0/1/2 final 86.5/79.5/87.0% (mean 84.3%), best checkpoints
+  87.0/89.5/89.0% (mean 88.5%); `downhill` 100%. Failures are mostly wall collisions (10–14%),
+  vs 96.5% for `ppo_d800_prox` on the hallway. Hallway models zero-shot on TEGR: 57–60% (~35%
+  timeouts).
+- 4 random pedestrians: `tegr_ppo_p4` 78.0%, `tegr_dagger_p1` 76.5%, `downhill` 91.5%, avoider
+  96.0%. Random pedestrians rarely meet the robot here, so this gap is the wall-collision weakness.
+- The student still almost never swerves hard near a pedestrian: 5% of steps vs the teacher's 43%
+  (hallway student before keep-right: 13%). Its gain did not come from fixing the left/right
+  averaging.
+- Reports: progress update https://claude.ai/artifact/BiPTYtyuFbgmBCrZxjjmK3 and results-with-charts
+  doc https://claude.ai/artifact/VsfudV5hPgKR2pYEggH6VL (both private until shared). Representative
+  demo: `view_env --pedestrians 1 --encounter-prob 1 --seed 1100000 --episodes 10` for `downhill`
+  (`--map cbu_floor2`), `tegr_ppo_p1`, `tegr_dagger_p1` (4/6/7 of 10).
+
+**Open**
+- Commit the map-generic code.
+- DAgger: 2 more seeds and more rounds (`--rounds 20` or `--steps-per-round 120000`) to confirm
+  61.5% and find the plateau.
+- `--init-from` warm start for `train`/`dagger` (postponed): PPO fine-tune from the student.
+- Student that picks among the teacher's 54 discrete actions, if averaging stays the limit.
+- TEGR wall collisions: longer training and/or `evaluate --safety`.
+- Keep-right teacher with 4 pedestrians drops to 78% on the hallway (84.5% without the rule).
+- Long routes on TEGR need subgoals (goal obs is straight-line): the planned subgoal agent.
+- Hallway `dagger_p1_kr` rerun never done (superseded by TEGR). `demo` still assumes hallway doors.
+- `runs/queue.txt` still lists 4 stale ent-0.01 runs.
+
+## 2026-10-22
+
+**Encounters, privileged avoider, teacher-student training** (hallway, 1 pedestrian, Ashlyn).
+- `HallwayRaycastEnv(encounter_prob)` / `--encounter-prob`: the first pedestrian starts 4–10 m
+  ahead on the robot's route walking at it. The *encounter test* (`--encounter-prob 1`) separates
+  avoidance far better than random starts.
+- `scripted.avoider`: privileged upper bound (true future pedestrian positions). Limited to
+  pedestrians visible in the 36 beams it scores the same, so the observation is sufficient; the
+  problem is learning. Fixed a bug where it froze at rest facing its goal (3/7 doors → 7/7;
+  encounter test 84.5% → 88.5%). Added keep-right (`side_weight`, judged in the pedestrian's
+  walking frame): keeps right on 72% of close passes (was 53%), encounter 86.5%, 4 peds 78.0%.
+- `train --ent-coef`: 0.01 blew the action std up to 4.6; 0.001 is stable but changed nothing.
+- Sweep (1 ped, standard test): lane penalty + encounters 60.0% / 22.8% reversing; lane penalty off
+  73–79.5% / ~11%; `downhill` 85%, avoider 94%. Encounter test: PPO 35.5–41%, `downhill` 43.5%.
+- `dagger` (new console script, `eead4e9`): DAgger with the avoider as teacher, student = PPO
+  MlpPolicy, saves PPO zips. `dagger_p1`: 44.5% on the encounter test (`downhill` 43.5%);
+  behavior cloning alone 8.5%. Near a pedestrian the teacher swerves hard on 43% of steps split
+  left/right; the student averages them to straight (13%).
+
+## 2026-10-21
+
+**Pedestrians that don't yield; lane penalty** (`HallwayRaycastEnv`, Ashlyn; schedule week 8). Branch
+`pedestrians-no-yield`, not merged yet.
+- `ppo_peds` had learned to rely on pedestrians stepping around it: against pedestrians that walk
+  straight on, its success fell from 90.5% to 36% (100 held-out goals, 4 pedestrians).
+- Pedestrians now ignore the robot and walk into it if it stays in their path; the old behavior is
+  `pedestrians_yield=True` / `--yielding-pedestrians` (`train`, `evaluate`, `view_env`, `demo`),
+  to reproduce runs from before today. Speed lowered from 0.8–1.4 to 0.5–0.9 m/s.
+- Waiting is free: stopped (< 0.05 m/s) with a pedestrian within 0.8 m, the robot pays no time or
+  pedestrian proximity penalty (`spec.waiting_for_pedestrian`). Being walked into still costs −40.
+- Lane penalty (`PEDESTRIAN_LANE_*`, `spec.pedestrian_lane_penalty`): up to −0.3 per pedestrian per
+  step while the footprint is in a pedestrian's lane and they would reach it within 3 s at their
+  closing speed, waiting or not. Reason: the 0.8 m proximity penalty starts only 0.6–0.8 s before
+  contact, too late for a diff-drive robot to turn and get clear. Costs ~10% env speed.
+- `demo --pedestrians N` (new pedestrians placed at the start of each leg).
+
+**Results** (200 held-out goals, 4 pedestrians, one seed each)
+
+| Model | Success | Collision | Timeout | Reversing |
+|---|---|---|---|---|
+| `ppo_peds_noyield` (3M) | 48.0% | 50.0% | 2.0% | 14.5% |
+| `ppo_peds_lane` final (6M, lane penalty) | 28.5% | 61.0% | 10.5% | 28.1% |
+| `ppo_peds_lane` best_model | 51.5% | 48.0% | 0.5% | 14.1% |
+
+- Neither model avoids pedestrians: `downhill`, which ignores them entirely, gets 57% success / 43%
+  pedestrian collisions on the same episodes. Most collisions are the robot driving into a
+  pedestrian walking toward it (front or side), mid-episode; few happen while it is stopped.
+- The lane penalty taught backing away (reverse doubled; 0.15 m/s reverse can't outrun a
+  pedestrian) instead of stepping aside.
+- On the TEGR map (`CASH_MAP_YAML=maps/cbu_floor2.yaml`) `ppo_peds_noyield` reached 6/30 random
+  goals, mostly timing out. `view_env`/`demo` still draw the hallway's door labels there (they sit
+  outside the building), and pedestrians assume the hallway's corridor directions.
+
+**Open (pedestrians)**
+- Find out whether avoidance is possible at all here (36-beam view sees a pedestrian reliably only
+  within ~2.9 m; getting clear takes ~2.5–3 s) or PPO just doesn't find it (`ent_coef` is 0):
+  1. curriculum: `train --pedestrians 1 ...` — does it beat `downhill` with 1 pedestrian?
+  2. a scripted avoider that knows the pedestrians' positions, as an upper bound.
+- Then revert or rework the lane penalty, or try an entropy bonus — one change at a time.
+- Seed-1 repeat of `ppo_peds_noyield` was queued but never started.
+
 ## 2026-10-16
 
 **Moving pedestrians and scan stacking** (`HallwayRaycastEnv`, Ashlyn; schedule week 8)

@@ -2,6 +2,7 @@
 
     ros2 run cash_rl demo                                   # newest runs/*/best_model.zip
     ros2 run cash_rl demo --policy ~/ros2_ws/runs/<run>/best_model.zip
+    ros2 run cash_rl demo --pedestrians 4                   # with moving pedestrians
 
 In the window:
   left-click            place the robot (facing +x, down the corridor)
@@ -12,7 +13,9 @@ In the window:
   Esc                   clear the robot
 After an episode ends, right-click (or 1-7) again to continue from where the
 robot stopped (an escort with several legs), or left-click to place it anew.
-Runs HallwayRaycastEnv (the 2D simulator); no ROS or Gazebo needed.
+Runs HallwayRaycastEnv (the 2D simulator); no ROS or Gazebo needed. With
+--pedestrians, a new set is placed at random (at least 2 m from the robot) at
+the start of every leg.
 """
 import argparse
 import glob
@@ -42,13 +45,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--policy', help='train.py model .zip (default: newest best_model.zip)')
     parser.add_argument('--speed', type=float, default=1.5, help='playback speed multiplier')
+    parser.add_argument('--pedestrians', type=int, default=0,
+                        help='number of moving pedestrians in the hallway')
+    parser.add_argument('--yielding-pedestrians', action='store_true',
+                        help='pedestrians step around the robot instead of walking into it')
     args = parser.parse_args()
 
     import matplotlib.pyplot as plt
 
     model_path = os.path.expanduser(args.policy or newest_best_model())
     policy = load_trained_policy(model_path)
-    env = HallwayRaycastEnv()
+    env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                            pedestrians_yield=args.yielding_pedestrians)
     model_name = os.path.relpath(model_path, os.path.dirname(runs_dir()))
 
     fig, ax = plt.subplots(figsize=(14, 6.6))
@@ -64,19 +72,26 @@ def main():
           'text': 'Left-click to place the robot (drag to aim it)'}
 
     def redraw():
-        scene.draw(st['pose'], st['ranges'], st['goal'], st['trail'], st['text'])
+        scene.draw(st['pose'], st['ranges'], st['goal'], st['trail'], st['text'],
+                   env.pedestrians)
         fig.canvas.draw_idle()
 
     def preview(pose):
         st['pose'] = np.asarray(pose, dtype=float)
         st['ranges'] = spec.sanitize_ranges(env.raycast(st['pose']))
 
+    def clear_pedestrians():
+        # Last leg's pedestrians aren't shown or checked until the next leg places new ones.
+        env.pedestrians = np.zeros((0, 2))
+
     def start_over(text='Left-click to place the robot (drag to aim it)'):
+        clear_pedestrians()
         st.update(mode='place', pose=None, ranges=None, goal=None, trail=[], text=text)
 
     def drive_to(goal, name):
         if st['mode'] not in ('ready', 'done'):
             return
+        clear_pedestrians()
         if env.collides(st['pose']):
             start_over('The robot is touching a wall — left-click to place it again')
             return
