@@ -37,12 +37,17 @@ def load_trained_policy(path):
     return policy
 
 
-def run_episodes(env, policy, goals, seed):
-    """Simulate episodes; return a list of per-step snapshots for playback."""
+def run_episodes(env, policy, goals, seed, stepper=None):
+    """Simulate episodes; return a list of per-step snapshots for playback.
+
+    stepper (default env) is what reset/step are called on, e.g. a wrapper; the
+    snapshots read the unwrapped env.
+    """
+    stepper = stepper or env
     frames = []
     for i, (goal_name, goal) in enumerate(goals):
         options = {'spawn': env.spawn_pose, 'goal': goal} if goal is not None else None
-        _, info = env.reset(seed=seed + i, options=options)
+        _, info = stepper.reset(seed=seed + i, options=options)
         goal_name = goal_name or f'random ({info["goal"][0]:.1f}, {info["goal"][1]:.1f})'
         trail, total, step, outcome = [env.pose[:2].copy()], 0.0, 0, ''
         while True:
@@ -55,7 +60,7 @@ def run_episodes(env, policy, goals, seed):
             if outcome:
                 frames.extend([frames[-1]] * HOLD_FRAMES)
                 break
-            _, reward, terminated, truncated, info = env.step(policy(env))
+            _, reward, terminated, truncated, info = stepper.step(policy(env))
             total += reward
             step += 1
             trail.append(env.pose[:2].copy())
@@ -172,6 +177,9 @@ def main():
     parser.add_argument('--subgoal-offset', type=float, default=None, metavar='W',
                         help='subgoal in a random lane up to W m left/right of the corridor '
                              "center (default: the policy's training setting; 0 = off)")
+    parser.add_argument('--decision-layer', action='store_true',
+                        help='steer the subgoal lane around pedestrians (cash_rl.decision; '
+                             'needs a subgoal lookahead)')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
@@ -210,7 +218,11 @@ def main():
     import matplotlib.pyplot as plt
 
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
-    frames = run_episodes(env, policy, goals, args.seed)
+    stepper = None
+    if args.decision_layer:
+        from cash_rl.decision import DecisionLayer
+        stepper = DecisionLayer(env)
+    frames = run_episodes(env, policy, goals, args.seed, stepper)
 
     fig, ax = plt.subplots(figsize=(14, 6.4) if env.is_hallway else (11, 11))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.93, bottom=0.07)

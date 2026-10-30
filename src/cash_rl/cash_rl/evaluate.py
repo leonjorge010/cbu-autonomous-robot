@@ -9,6 +9,8 @@
         --subgoal-lookahead 3                     # policy sees a point 3 m ahead on the route
     ros2 run cash_rl evaluate runs/a/final_model.zip avoider --random 200 --lane-offset 0.5
                                                   # subgoal pinned 0.5 m left of center
+    ros2 run cash_rl evaluate runs/a/final_model.zip downhill --random 200 --pedestrians 1 \
+        --encounter-prob 1 --decision-layer       # lane steered around pedestrians (decision.py)
 
 --env gazebo needs `ros2 launch cash_rl train_env.launch.py` running, and gives
 the most faithful result when nothing else is loading the CPU: HallwayEnv steps
@@ -93,6 +95,10 @@ def main():
     parser.add_argument('--lane-offset', type=float, default=None, metavar='X',
                         help='pin the subgoal lane X m left (+) / right (-) of center for '
                              'every episode (2D only; needs a subgoal lookahead)')
+    parser.add_argument('--decision-layer', action='store_true',
+                        help='steer the subgoal lane around pedestrians with the rule-based '
+                             'decision layer (cash_rl.decision; 2D only; needs a subgoal '
+                             'lookahead)')
     parser.add_argument('--safety', action='store_true',
                         help='run the policy behind the LiDAR safety layer (cash_rl.safety)')
     args = parser.parse_args()
@@ -110,8 +116,12 @@ def main():
     trained_offset = [model_subgoal_offset(p) for p in args.models if p not in SCRIPTED]
     if args.subgoal_offset is None:
         args.subgoal_offset = trained_offset[0] if trained_offset and args.env == '2d' else 0.0
-    if args.lane_offset is not None:
-        args.subgoal_offset = 0.0  # pinned instead of drawn
+    if args.decision_layer and args.lane_offset is not None:
+        parser.error('--decision-layer sets the lane itself; drop --lane-offset')
+    if args.lane_offset is not None or args.decision_layer:
+        args.subgoal_offset = 0.0  # pinned (or decided) instead of drawn
+    if args.decision_layer and (args.env == 'gazebo' or not args.subgoal_lookahead):
+        parser.error('--decision-layer is 2D only and needs a subgoal lookahead')
     if (args.subgoal_offset or args.lane_offset is not None) and not args.subgoal_lookahead:
         parser.error('--subgoal-offset / --lane-offset need a subgoal lookahead')
     if args.pedestrians and args.env == 'gazebo':
@@ -140,6 +150,9 @@ def main():
                                 encounter_prob=args.encounter_prob,
                                 subgoal_lookahead=args.subgoal_lookahead,
                                 subgoal_offset=args.subgoal_offset)
+    if args.decision_layer:
+        from cash_rl.decision import DecisionLayer
+        env = DecisionLayer(env)
     if args.safety:
         from cash_rl.safety import SafetyWrapper
         env = SafetyWrapper(env)
@@ -152,6 +165,7 @@ def main():
         + (f', subgoals {args.subgoal_lookahead:g} m' if args.subgoal_lookahead else '') \
         + (f', lanes +-{args.subgoal_offset:g} m' if args.subgoal_offset else '') \
         + (f', lane {args.lane_offset:+g} m' if args.lane_offset is not None else '') \
+        + (', decision layer' if args.decision_layer else '') \
         + (', safety layer' if args.safety else '')
     door_goals = spec.DOOR_GOALS if args.env == 'gazebo' else env.unwrapped.door_goals
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})
@@ -188,7 +202,7 @@ def main():
     finally:
         env.close()
 
-    lanes = bool(args.subgoal_offset) or args.lane_offset is not None
+    lanes = bool(args.subgoal_offset) or args.lane_offset is not None or args.decision_layer
 
     def row(name, s):
         return (f'{name:44} {s["success"]:>7.1%} {s["collision"]:>9.1%} {s["timeout"]:>7.1%} '
