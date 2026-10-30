@@ -13,6 +13,31 @@ privileged `avoider`, `dagger` and TEGR training. 63 tests pass. No new training
 **Open:** unchanged from 10-23 (DAgger seeds/rounds, TEGR wall collisions, `--init-from`,
 subgoal agent).
 
+## 2026-10-30
+
+**Planner subgoals** (hierarchy step 1, Ashlyn). `HallwayRaycastEnv(subgoal_lookahead=M)` /
+`--subgoal-lookahead M` on `train`, `dagger`, `evaluate`, `view_env`: the observed goal is the
+point M m ahead on the geodesic route (`route(max_length=)`), the real goal once closer. Only
+the observation changes. `evaluate`/`view_env` default to the model's training setting. 2 new
+tests; 65 pass. No training run.
+
+Existing models, TEGR, 200 held-out goals, no subgoal / 3 m / 5 m (files
+`runs/eval_tegr_subgoal*.txt`, `runs/eval_tegr_zeroshot_subgoal*.txt`):
+
+| Model | Test | none | 3 m | 5 m |
+|---|---|---|---|---|
+| `tegr_ppo` final | no pedestrians | 86.5% | 85.5% | 85.0% |
+| `tegr_dagger_p1` | encounter, 1 ped | 61.5% | 55.5% | 61.5% |
+| `tegr_ppo` final | encounter, 1 ped | 42.0% | 43.0% | 43.0% |
+| `ppo_d800_prox` final (hallway, zero-shot) | no pedestrians | 60.0% (34% timeout) | 64.0% (30.5%) | 63.5% (30.5%) |
+
+- No real change for models trained without subgoals: TEGR models barely time out (0–2%), so
+  their failures are collisions, which subgoals don't touch.
+- The hallway model's zero-shot timeouts barely move (34% → 30.5%), so they are not mainly
+  the straight-line goal; cause still unknown (it reverses on ~18% of steps).
+- The real test is a model *trained* with subgoals: hallway-trained → TEGR zero-shot (unseen map)
+  and TEGR DAgger with subgoals.
+
 ## 2026-10-23
 
 **Training on the real TEGR 2nd floor** (`cbu_floor2`, Ashlyn; schedule weeks 8–9). Branch

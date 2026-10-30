@@ -119,13 +119,20 @@ class HallwayRaycastEnv(gym.Env):
     (falling back to a random start if that stretch of route is too short or has
     no room); without that, over half of random starts never come within 2 m of
     the robot. Drawn only when > 0, like junction_prob.
+
+    subgoal_lookahead (m) makes the observation point at a subgoal instead of the
+    goal: the point that far ahead along route() (the goal itself once it is
+    closer than that, or if the route stalls). Only the observation changes;
+    reward, success and the step limit still use the real goal. The subgoal is
+    in `subgoal` and info['subgoal'] (equal to the goal when this is None).
     """
 
     metadata = {'render_modes': ['rgb_array'], 'render_fps': int(1 / spec.CONTROL_PERIOD)}
 
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
                  range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0,
-                 pedestrians_yield=False, lane_penalty=True, encounter_prob=0.0):
+                 pedestrians_yield=False, lane_penalty=True, encounter_prob=0.0,
+                 subgoal_lookahead=None):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
@@ -193,6 +200,8 @@ class HallwayRaycastEnv(gym.Env):
 
         self.pose = np.array(spec.SPAWN_POSE, dtype=np.float64)
         self.goal = np.zeros(2)
+        self.subgoal = np.zeros(2)
+        self.subgoal_lookahead = subgoal_lookahead
         self._goal_field = None
         self._goal_distance = 0.0
         self._velocity = np.zeros(2)
@@ -376,12 +385,12 @@ class HallwayRaycastEnv(gym.Env):
         self.pedestrians = np.array(positions).reshape(-1, 2)
         self._pedestrian_velocities = np.array(velocities).reshape(-1, 2)
 
-    def route(self):
+    def route(self, max_length=None):
         """(n, 2) points every ROUTE_STEP m down the goal's geodesic field from the robot.
 
         Steepest descent over 16 headings on the field's cell values, so it follows
-        the same wall-shy route the progress reward pays for. Ends at the goal, or
-        where no step lowers the field.
+        the same wall-shy route the progress reward pays for. Ends at the goal,
+        where no step lowers the field, or after max_length m.
         """
         field = self._goal_field.grid
         headings = np.linspace(-np.pi, np.pi, 16, endpoint=False)
@@ -396,7 +405,8 @@ class HallwayRaycastEnv(gym.Env):
             return np.where(np.isfinite(out), out, np.inf)
 
         current = value(point[None])[0]
-        limit = int(4 * spec.MAX_GOAL_DISTANCE / ROUTE_STEP)
+        limit = int(4 * spec.MAX_GOAL_DISTANCE / ROUTE_STEP) if max_length is None \
+            else int(round(max_length / ROUTE_STEP)) + 1
         while len(points) < limit and np.hypot(*(self.goal - point)) > ROUTE_STEP:
             candidates = point + steps
             values = value(candidates)
@@ -558,10 +568,22 @@ class HallwayRaycastEnv(gym.Env):
 
     def observation(self):
         """Return the current observation, rebuilt from the scan stack (no new scan)."""
-        return spec.build_observation(self._scan_stack, self.pose, self.goal, self._prev_action)
+        self.subgoal = self._find_subgoal()
+        return spec.build_observation(self._scan_stack, self.pose, self.subgoal,
+                                      self._prev_action)
+
+    def _find_subgoal(self):
+        """Return the point subgoal_lookahead m along route(), else the goal."""
+        if not self.subgoal_lookahead:
+            return self.goal.copy()
+        route = self.route(max_length=self.subgoal_lookahead)
+        if len(route) > int(round(self.subgoal_lookahead / ROUTE_STEP)):
+            return route[-1].copy()
+        return self.goal.copy()
 
     def _info(self, **extra):
         return {'pose': self.pose.copy(), 'goal': self.goal.copy(),
+                'subgoal': self.subgoal.copy(),
                 'goal_distance': self._goal_distance,
                 'pedestrians': self.pedestrians.copy(), **extra}
 

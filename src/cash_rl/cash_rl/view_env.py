@@ -48,7 +48,7 @@ def run_episodes(env, policy, goals, seed):
         while True:
             frames.append({
                 'pose': env.pose.copy(), 'ranges': env._ranges.copy(),
-                'pedestrians': env.pedestrians.copy(),
+                'pedestrians': env.pedestrians.copy(), 'subgoal': env.subgoal.copy(),
                 'goal': env.goal.copy(), 'trail': np.array(trail), 'text': (
                     f'episode {i + 1}/{len(goals)}   goal: {goal_name}   '
                     f'step {step}/{env._max_steps}   return {total:+.1f}   {outcome}')})
@@ -78,7 +78,8 @@ class Scene:
 
     door_labels maps door name -> label text (default: the name). draw() with
     pose None hides the robot and beams; goal None hides the goal; pedestrians is
-    an (n, 2) array of disc centers, or None for none.
+    an (n, 2) array of disc centers, or None for none; subgoal (an orange x) is
+    drawn only when given and away from the goal.
     """
 
     def __init__(self, ax, env, door_labels=None):
@@ -107,6 +108,7 @@ class Scene:
         self.heading, = ax.plot([], [], color='white', lw=2)
         self.goal = ax.add_patch(Circle((0, 0), spec.GOAL_TOLERANCE, fc='orange',
                                         ec='darkorange', alpha=0.7))
+        self.subgoal, = ax.plot([], [], 'x', color='darkorange', ms=9, mew=2)
         size = 2 * PEDESTRIAN_RADIUS
         self.pedestrians = ax.add_collection(EllipseCollection(
             size, size, 0.0, units='xy', offsets=np.zeros((0, 2)),
@@ -114,7 +116,7 @@ class Scene:
             alpha=0.8))
         self.title = ax.set_title('', fontsize=11, family='monospace')
 
-    def draw(self, pose, ranges, goal, trail, text, pedestrians=None):
+    def draw(self, pose, ranges, goal, trail, text, pedestrians=None, subgoal=None):
         self.pedestrians.set_offsets(np.zeros((0, 2)) if pedestrians is None
                                      else np.asarray(pedestrians).reshape(-1, 2))
         self.robot.set_visible(pose is not None)
@@ -134,10 +136,14 @@ class Scene:
         self.goal.set_visible(goal is not None)
         if goal is not None:
             self.goal.center = goal
+        if subgoal is not None and (goal is None or not np.allclose(subgoal, goal)):
+            self.subgoal.set_data([subgoal[0]], [subgoal[1]])
+        else:
+            self.subgoal.set_data([], [])
         trail = np.zeros((0, 2)) if trail is None or len(trail) == 0 else np.asarray(trail)
         self.trail.set_data(trail[:, 0], trail[:, 1])
         self.title.set_text(text)
-        return (self.beams, self.trail, self.robot, self.heading, self.goal,
+        return (self.beams, self.trail, self.robot, self.heading, self.goal, self.subgoal,
                 self.pedestrians, self.title)
 
 
@@ -160,6 +166,9 @@ def main():
     parser.add_argument('--encounter-prob', type=float, default=0.0,
                         help="share of episodes whose first pedestrian starts on the robot's "
                              'route, walking toward it')
+    parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
+                        help='policy observes a subgoal M m ahead on the route (orange x; '
+                             "default: the policy's training setting; 0 = off)")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
@@ -169,12 +178,15 @@ def main():
     if args.map:
         use_map(args.map)
     elif args.policy not in POLICIES:
-        from cash_rl.train import model_map_yaml
+        from cash_rl.train import model_map_yaml, model_subgoal_lookahead
         if model_map_yaml(args.policy):
             use_map(model_map_yaml(args.policy))
+        if args.subgoal_lookahead is None:
+            args.subgoal_lookahead = model_subgoal_lookahead(args.policy)
     env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                             pedestrians_yield=args.yielding_pedestrians,
-                            encounter_prob=args.encounter_prob)
+                            encounter_prob=args.encounter_prob,
+                            subgoal_lookahead=args.subgoal_lookahead)
     if args.goal == 'random':
         goals = [(None, None)] * args.episodes
     elif args.goal == 'all' and env.door_goals:
@@ -200,7 +212,7 @@ def main():
 
     def draw(frame):
         return scene.draw(frame['pose'], frame['ranges'], frame['goal'], frame['trail'],
-                          frame['text'], frame['pedestrians'])
+                          frame['text'], frame['pedestrians'], frame['subgoal'])
 
     interval_ms = 1000 * spec.CONTROL_PERIOD / args.speed
     anim = FuncAnimation(fig, draw, frames=frames, interval=interval_ms, blit=False,

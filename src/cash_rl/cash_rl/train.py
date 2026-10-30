@@ -60,18 +60,28 @@ def load_model(path):
     raise FileNotFoundError(f'No config.json next to or above {path}')
 
 
+def _model_config(path):
+    """Return the config.json of the run a model zip belongs to, or {}."""
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(path)))
+    for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
+        config = os.path.join(candidate, 'config.json')
+        if os.path.isfile(config):
+            with open(config) as f:
+                return json.load(f)
+    return {}
+
+
 def model_map_yaml(path):
     """Map a train.py/dagger.py model was trained on (its config.json), or None.
 
     None for runs from before maps were recorded, which all used the hallway.
     """
-    directory = os.path.dirname(os.path.abspath(os.path.expanduser(path)))
-    for candidate in (directory, os.path.dirname(directory)):
-        config = os.path.join(candidate, 'config.json')
-        if os.path.isfile(config):
-            with open(config) as f:
-                return json.load(f).get('map_yaml')
-    return None
+    return _model_config(path).get('map_yaml')
+
+
+def model_subgoal_lookahead(path):
+    """--subgoal-lookahead a train.py/dagger.py model was trained with, or None."""
+    return _model_config(path).get('args', {}).get('subgoal_lookahead')
 
 
 class SingleScanModel:
@@ -227,6 +237,9 @@ def main():
                              "the robot's route, walking toward it (eval keeps random starts)")
     parser.add_argument('--no-lane-penalty', action='store_true',
                         help='train without the pedestrian lane penalty (spec.PEDESTRIAN_LANE_*)')
+    parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
+                        help='observe a subgoal M m ahead on the geodesic route instead of the '
+                             'goal, in training and eval (reward still uses the goal)')
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--ent-coef', type=float, default=None,
@@ -262,7 +275,8 @@ def main():
                   'n_pedestrians': args.pedestrians,
                   'pedestrians_yield': args.yielding_pedestrians,
                   'lane_penalty': not args.no_lane_penalty,
-                  'encounter_prob': args.encounter_prob}
+                  'encounter_prob': args.encounter_prob,
+                  'subgoal_lookahead': args.subgoal_lookahead}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
@@ -273,7 +287,8 @@ def main():
     # Pedestrian starts stay random (no encounter_prob), for the same reason.
     eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                                  pedestrians_yield=args.yielding_pedestrians,
-                                 lane_penalty=not args.no_lane_penalty)
+                                 lane_penalty=not args.no_lane_penalty,
+                                 subgoal_lookahead=args.subgoal_lookahead)
 
     model_kwargs = dict(kwargs)
     if args.lr_schedule == 'linear':

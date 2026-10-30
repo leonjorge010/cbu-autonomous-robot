@@ -689,3 +689,37 @@ def test_limited_distance_field_matches_the_full_one_within_the_limit(env):
     limited = env.map.distance_field(5.0, 0.0, limit=6.0).grid
     near = full <= 6.0
     assert np.allclose(limited[near], full[near]) and np.all(np.isinf(limited[full > 6.1]))
+
+
+def test_subgoal_sits_lookahead_metres_along_the_route_and_only_changes_the_obs():
+    plain, sub = HallwayRaycastEnv(), HallwayRaycastEnv(subgoal_lookahead=3.0)
+    options = {'spawn': spec.SPAWN_POSE, 'goal': DOOR_202}
+    obs_plain, _ = plain.reset(seed=0, options=options)
+    obs_sub, info = sub.reset(seed=0, options=options)
+    route = sub.route()
+    np.testing.assert_allclose(info['subgoal'], route[int(round(3.0 / ROUTE_STEP))])
+    distance, bearing = spec.goal_in_robot_frame(sub.pose, sub.subgoal)
+    start = spec.N_SCAN_STACK * spec.N_OBS_BEAMS
+    goal_slice = slice(start, start + 3)
+    np.testing.assert_allclose(obs_sub[goal_slice], [distance / spec.MAX_GOAL_DISTANCE,
+                                                     np.cos(bearing), np.sin(bearing)], atol=1e-6)
+    np.testing.assert_array_equal(obs_sub[:goal_slice.start], obs_plain[:goal_slice.start])
+    # Same actions, same reward and outcome: only what the policy sees changes.
+    while True:
+        action = downhill(plain)
+        _, r_plain, term_plain, trunc_plain, _ = plain.step(action)
+        _, r_sub, term_sub, trunc_sub, info = sub.step(action)
+        assert r_sub == r_plain and (term_sub, trunc_sub) == (term_plain, trunc_plain)
+        if term_plain or trunc_plain:
+            break
+    assert info['is_success']
+
+
+def test_subgoal_is_the_goal_once_it_is_closer_than_the_lookahead():
+    env = HallwayRaycastEnv(subgoal_lookahead=3.0)
+    _, info = env.reset(seed=0, options={'spawn': spec.SPAWN_POSE,
+                                         'goal': np.array(spec.SPAWN_POSE[:2]) + [2.0, 0.0]})
+    np.testing.assert_array_equal(info['subgoal'], info['goal'])
+    _, info = HallwayRaycastEnv().reset(seed=0, options={'spawn': spec.SPAWN_POSE,
+                                                         'goal': DOOR_202})
+    np.testing.assert_array_equal(info['subgoal'], info['goal'])

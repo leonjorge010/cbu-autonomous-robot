@@ -149,6 +149,9 @@ def main():
                         help='collection processes (default: CPU count - 1)')
     parser.add_argument('--map', help="map name in maps/ (e.g. 'cbu_floor2') or .yaml path "
                         '(default: $CASH_MAP_YAML, else hallway)')
+    parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
+                        help='student observes a subgoal M m ahead on the geodesic route '
+                             'instead of the goal, in collection and eval')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--name', help='run name (default: dagger_<timestamp>)')
     args = parser.parse_args()
@@ -162,7 +165,8 @@ def main():
     name = args.name or f'dagger_{datetime.datetime.now():%Y%m%d_%H%M%S}'
     run_dir = os.path.join(runs_dir(), name)
     os.makedirs(os.path.join(run_dir, 'checkpoints'), exist_ok=False)
-    env_kwargs = {'n_pedestrians': args.pedestrians, 'encounter_prob': args.encounter_prob}
+    env_kwargs = {'n_pedestrians': args.pedestrians, 'encounter_prob': args.encounter_prob,
+                  'subgoal_lookahead': args.subgoal_lookahead}
     # load_model reads args.algo; the student is an ordinary PPO MlpPolicy.
     config_args = dict(vars(args), algo='ppo')
     kwargs = algo_kwargs('ppo', 12)
@@ -183,7 +187,8 @@ def main():
     optimizer = torch.optim.Adam(actor_params, lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
 
-    eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians, encounter_prob=1.0)
+    eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians, encounter_prob=1.0,
+                                 subgoal_lookahead=args.subgoal_lookahead)
     eval_episodes = [(f'encounter_{i}', EVAL_SEED_BASE + i, None)
                      for i in range(args.eval_episodes)]
     fields = ['round', 'beta', 'labels', 'mse', 'rollout_success', 'rollout_collision',

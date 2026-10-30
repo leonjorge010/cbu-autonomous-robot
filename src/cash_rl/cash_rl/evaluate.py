@@ -5,6 +5,8 @@
     ros2 run cash_rl evaluate runs/a/best_model.zip runs/b/best_model.zip --random 200
     ros2 run cash_rl evaluate runs/a/best_model.zip --random 200 --pedestrians 4
     ros2 run cash_rl evaluate downhill avoider --random 200 --pedestrians 4  # 2D only
+    ros2 run cash_rl evaluate runs/a/final_model.zip --map cbu_floor2 --random 200 \
+        --subgoal-lookahead 3                     # policy sees a point 3 m ahead on the route
 
 --env gazebo needs `ros2 launch cash_rl train_env.launch.py` running, and gives
 the most faithful result when nothing else is loading the CPU: HallwayEnv steps
@@ -22,6 +24,7 @@ import os
 from cash_rl import scripted, spec
 from cash_rl.occupancy_map import default_map_yaml, default_map_yaml_in_workspace, use_map
 from cash_rl.train import EVAL_SEED_BASE, evaluate, load_model, model_map_yaml
+from cash_rl.train import model_subgoal_lookahead
 import numpy as np
 
 # Held-out random pairs: past train.py's periodic-eval seeds (EVAL_SEED_BASE + i).
@@ -75,11 +78,24 @@ def main():
     parser.add_argument('--map', help='map name in maps/ or .yaml path (default: the map the '
                         'first model zip was trained on, else $CASH_MAP_YAML / hallway); '
                         'door episodes are hallway only')
+    parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
+                        help='observe a subgoal M m ahead on the geodesic route instead '
+                             'of the goal (2D only; reward and success still use the goal; '
+                             "default: the first model zip's training setting; 0 = off)")
     parser.add_argument('--safety', action='store_true',
                         help='run the policy behind the LiDAR safety layer (cash_rl.safety)')
     args = parser.parse_args()
     if args.random and args.env == 'gazebo':
         parser.error('--random is 2D only (HallwayEnv spawns from fixed poses)')
+    trained_lookahead = [model_subgoal_lookahead(p) for p in args.models if p not in SCRIPTED]
+    if args.subgoal_lookahead is None and trained_lookahead and args.env == '2d':
+        args.subgoal_lookahead = trained_lookahead[0]
+    for path, lookahead in zip([p for p in args.models if p not in SCRIPTED], trained_lookahead):
+        if (lookahead or None) != (args.subgoal_lookahead or None):
+            print(f'WARNING: {path} was trained with subgoal lookahead {lookahead}, '
+                  f'evaluating with {args.subgoal_lookahead or None}', flush=True)
+    if args.subgoal_lookahead and args.env == 'gazebo':
+        parser.error("--subgoal-lookahead is 2D only (it reads the 2D map's route)")
     if args.pedestrians and args.env == 'gazebo':
         parser.error('--pedestrians is 2D only (no pedestrians in Gazebo yet)')
     if args.env == 'gazebo' and any(path in SCRIPTED for path in args.models):
@@ -103,7 +119,8 @@ def main():
         from cash_rl.raycast_env import HallwayRaycastEnv
         env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                                 pedestrians_yield=args.yielding_pedestrians,
-                                encounter_prob=args.encounter_prob)
+                                encounter_prob=args.encounter_prob,
+                                subgoal_lookahead=args.subgoal_lookahead)
     if args.safety:
         from cash_rl.safety import SafetyWrapper
         env = SafetyWrapper(env)
@@ -113,6 +130,7 @@ def main():
         + (' (yielding)' if args.pedestrians and args.yielding_pedestrians else '') \
         + (f', encounters {args.encounter_prob:g}' if args.pedestrians and args.encounter_prob
            else '') \
+        + (f', subgoals {args.subgoal_lookahead:g} m' if args.subgoal_lookahead else '') \
         + (', safety layer' if args.safety else '')
     door_goals = spec.DOOR_GOALS if args.env == 'gazebo' else env.unwrapped.door_goals
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})
