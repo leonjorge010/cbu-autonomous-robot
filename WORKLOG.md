@@ -53,8 +53,9 @@ Existing models, TEGR, 200 held-out goals, no subgoal / 3 m / 5 m (files
   after reward/obs changes (stale value function, old habits: `ppo_peds` fell 90.5% → 36% when
   pedestrians stopped yielding).
 
-**Queued, not started** (`runs/queue_subgoal.txt`, ~6.5 h; start with
-`tmux new -d -s queue "QUEUE=runs/queue_subgoal.txt ~/ros2_ws/runs/queue.sh"`)
+**Overnight queue** (`runs/queue_subgoal.txt`, all 14 jobs OK, 00:36–08:26; hallway PPO with
+subgoals took 40–44 min per 1.5M steps (route tracing; `ppo_d800_prox` took 11), DAgger 20 rounds
+48–63 min)
 - A, unseen map: `ppo_sg3_s0/1/2`, hallway PPO with `--subgoal-lookahead 3` (`ppo_d800_prox`
   settings, 1.5M steps), then zero-shot on TEGR → `runs/eval_tegr_zeroshot_sg3.txt`. Compare with
   `ppo_d800_prox`'s 60% (34% timeouts).
@@ -62,11 +63,44 @@ Existing models, TEGR, 200 held-out goals, no subgoal / 3 m / 5 m (files
   (`tegr_dagger_sg3_s*`) and without (`tegr_dagger_r20_s*`, also the seed/plateau check of 61.5%).
   Encounter test and no-pedestrian test → `runs/eval_tegr_{enc,p0}_dagger_{sg3,r20}.txt`.
 
+**Results** (200 held-out goals per model, 3 seeds each, final models)
+
+B, TEGR DAgger (clean comparison: identical except subgoals):
+
+| Test | `tegr_dagger_sg3` (3 m) | `tegr_dagger_r20` (none) | `downhill` | avoider |
+|---|---|---|---|---|
+| Encounter, 1 ped | **68.8%** (66.5/69.0/71.0) | 64.8% (63.0/65.0/66.5) | 50.5% | 89.0% |
+| No pedestrians | 88.7% (88.5/88.0/89.5) | 87.2% (84.5/88.0/89.0) | 100% | — |
+
+- Subgoals +4 points on the encounter test; every seed beats its no-subgoal partner (+2.5 to +4.5).
+  No difference without pedestrians; failures there are all wall collisions (10.5–15.5%).
+- The 10-23 `tegr_dagger_p1` (61.5%) holds up: 3-seed mean at 20 rounds 64.8%.
+- All 6 DAgger models beat `downhill` by 14–20 points.
+- DAgger has plateaued: per-round eval (100 eps) rises to ~round 10, then wanders 57–70% with no
+  trend; MSE ~0.10. More rounds won't close the gap to the teacher.
+
+A, unseen map (hallway-trained, TEGR zero-shot):
+
+| Model | Hallway | TEGR zero-shot | TEGR timeouts |
+|---|---|---|---|
+| `ppo_sg3` (3 m, 3 seeds) | 93.0% (95.5/88.0/95.5) | **72.5%** (73.0/65.0/79.5) | 16.5% |
+| `ppo_d800_prox` (1 seed, 10-15 code) | 96.5% | 60.0% | 34.0% |
+
+- Subgoal models generalize better (+12.5 points, timeouts halved) with no loss on the hallway.
+- **Confounded:** `ppo_d800_prox` predates scan stacking (41-dim obs, 1 scan) and its seeds 1/2 are
+  only in the GitHub release. Needs a same-code control without subgoals before claiming it.
+
 **Open**
-- Run the queue and analyze A and B (3-seed means).
-- If B's students still don't swerve: discrete 54-action student, and/or a side-choosing decision
-  layer.
-- `--init-from` (PPO fine-tune from the DAgger student) for the final model.
+- Control for A (3 seeds, ~40 min each; not started). Write `runs/queue_control.txt` with
+  `runs/train_eval.sh ppo_nosg_s{0,1,2} --goal-distance-range 1 25 --junction-prob 0.3 --timesteps
+  1500000 --seed {0,1,2}` (one line per seed) plus
+  `OMP_NUM_THREADS=1 ros2 run cash_rl evaluate runs/ppo_nosg_s{0,1,2}/final_model.zip --map cbu_floor2
+  --random 200 > runs/eval_tegr_zeroshot_nosg.txt 2>&1`, then
+  `tmux new -d -s queue "QUEUE=runs/queue_control.txt ~/ros2_ws/runs/queue.sh"`. Compare with 72.5%.
+- Add these models to `docs/MODELS.md`.
+- Gap to the teacher (68.8% vs 89%) won't close with more DAgger rounds: discrete 54-action
+  student, and/or a side-choosing decision layer; check the `sg3` students' hard-swerve rate.
+- `--init-from` (PPO fine-tune from `tegr_dagger_sg3`) for the final model.
 - TEGR wall collisions: `evaluate --safety` on the TEGR models; longer training.
 - Why hallway models time out on TEGR (34%; reverse ~18% of steps) — not the straight-line goal.
 - Then 4 pedestrians. Carried over: keep-right teacher at 4 peds (78%), `demo` hallway doors,
