@@ -3,6 +3,59 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-30 (afternoon)
+
+**Subgoal lanes** (hierarchy step 3, Ashlyn; commit `134f9fb`). The motion agent should follow
+subgoals from the decision layer (e.g. steer right around a pedestrian even when the goal is
+ahead-left) and see the end goal only once it is within the 3 m lookahead.
+- `--subgoal-offset W` on `train`/`dagger`/`evaluate`/`view_env`: the 3 m subgoal sits in a lane up
+  to W m left/right of the corridor center. The center comes from the walls, so the lane doesn't
+  drift with the robot. The offset is cut back to keep 0.6 m (`SAFE_CLEARANCE`) from obstacles, so
+  the max is ~0.6 m in a 2.4 m corridor. It is redrawn every 2–6 s (30% center).
+  `reset(options={'lane_offset': x})` / `evaluate --lane-offset x` pin it; a decision layer sets
+  `env.lane_offset`.
+- Reward: `spec.subgoal_lane_penalty`, 0.5 per m beyond 0.1 m from the lane at the robot's own
+  position, per step. Waived in turns (>30°), junctions, open areas and the last 3 m. Measuring
+  1 m ahead instead penalized a robot correctly holding the outside of a left turn by ~18 return.
+- Following a lane away from the goal isn't penalized: progress telescopes, so a detour costs
+  only its extra time. Scripted lane follower, hallway, right vs left lane: door ahead-left 106.9
+  vs 103.2; left turn up the branch 125.1 vs 121.7; cutting across a right lane 53.7 / 70.7.
+  Pinned by `test_following_a_lane_away_from_the_goal_is_not_penalized`. TEGR, random lanes,
+  30 goals: follows 108, ignores 94, stops −121. Runs without lanes: reward unchanged.
+- `downhill`/`avoider` follow the lane, so DAgger could teach it too. Within 2 m of a pedestrian
+  the avoider may leave the lane, but an off-center lane sets its passing side (replaces
+  keep-right). Avoider passes on the lane's side 86–91% on TEGR (hallway 62–79%), 95% success with
+  random lanes (93% without).
+- Env with subgoals + lanes: 359 steps/s vs 593 without (TEGR) → ~2.2 h per 3M-step PPO run.
+- 6 new tests; 71 pass.
+
+**Decisions**
+- Motion agent trained with PPO and rewarded for following subgoals, not DAgger: PPO never beat
+  `downhill` on encounters, DAgger plateaus at 68.8% (teacher 89%), and the course needs an RL
+  stage. Phase 1: no pedestrians, random lanes so paths aren't straight. Phase 2: test with
+  pedestrians and a (rule-based) decision layer that moves the lane around them. Hybrid kept: the
+  motion agent may still avoid on its own when the lane is wrong, but takes its side from the lane.
+- Geometry limit: a 0.6 m lane doesn't clear a pedestrian walking down the middle of a 2.4 m
+  corridor (~0.35 m slack). The decision layer needs bigger offsets or a "wait" subgoal.
+
+**Queues** (`runs/queue_now.txt` started 13:03, ~3.8 h): `tegr_ppo_lane_s0` (TEGR, 3M steps,
+`--subgoal-lookahead 3 --subgoal-offset 0.6`) + lane pinned left/center/right evals
+(`runs/eval_tegr_ppo_lane_s0_{left,center,right}.txt`, `downhill` as reference); experiment A
+control `ppo_nosg_s0-2` → `runs/eval_tegr_zeroshot_nosg.txt` (vs `ppo_sg3` 72.5%); `--safety` on
+`tegr_dagger_sg3` → `runs/eval_tegr_{enc,p0}_dagger_sg3_safety.txt`; 4-pedestrian encounter
+baselines → `runs/eval_tegr_enc4_{dagger_sg3,scripted}.txt`. `runs/queue_later.txt` (~4.5 h):
+lane seeds 1–2 and the 3-seed lane evals. Removed: 4-pedestrian DAgger without lanes, the stale
+entropy-0.01 runs in `runs/queue.txt`.
+
+**Open**
+- Results of `queue_now.txt`: does `tegr_ppo_lane_s0` reach goals (vs `tegr_ppo` 84.3%) and follow
+  lanes (`lane` column vs `downhill`)? Then `queue_later.txt`.
+- Rule-based decision layer (lane away from an oncoming pedestrian, back to center after), then
+  the phase-2 pedestrian test. On the robot it needs pedestrian detection from LiDAR.
+- Within 3 m of the goal the lane is off, so the decision layer can't steer there.
+- `evaluate` metrics for side-keeping and off-lane distance near pedestrians.
+- Add the 10-30 models to `docs/MODELS.md`. Push `main` (5 commits ahead of origin).
+
 ## 2026-10-29
 
 **Merged `pedestrians-no-yield` into `main`** (Ashlyn). Committed the map-generic TEGR code
