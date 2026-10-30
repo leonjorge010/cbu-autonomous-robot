@@ -41,7 +41,7 @@ def run_episodes(env, policy, goals, seed):
     """Simulate episodes; return a list of per-step snapshots for playback."""
     frames = []
     for i, (goal_name, goal) in enumerate(goals):
-        options = {'spawn': spec.SPAWN_POSE, 'goal': goal} if goal is not None else None
+        options = {'spawn': env.spawn_pose, 'goal': goal} if goal is not None else None
         _, info = env.reset(seed=seed + i, options=options)
         goal_name = goal_name or f'random ({info["goal"][0]:.1f}, {info["goal"][1]:.1f})'
         trail, total, step, outcome = [env.pose[:2].copy()], 0.0, 0, ''
@@ -89,10 +89,14 @@ class Scene:
         ax.imshow(m.pixels, cmap='gray', origin='lower', vmin=0, vmax=255, extent=[
             m.origin[0], m.origin[0] + m.width * m.resolution,
             m.origin[1], m.origin[1] + m.height * m.resolution])
-        for name, (gx, gy) in spec.DOOR_GOALS.items():
+        from cash_rl.occupancy_map import landmarks_for
+        for name, (gx, gy) in landmarks_for(m.yaml_path).items():
             ax.plot(gx, gy, '+', color='0.6', ms=6)
             ax.annotate((door_labels or {}).get(name, name), (gx, gy), xytext=(3, 4),
                         textcoords='offset points', fontsize=7, color='0.45')
+        ax.set_xlim(m.origin[0], m.origin[0] + m.width * m.resolution)
+        ax.set_ylim(m.origin[1], m.origin[1] + m.height * m.resolution)
+        ax.set_autoscale_on(False)
         ax.set_xlabel('x (m)')
         ax.set_ylabel('y (m)')
         self.beams = ax.add_collection(
@@ -142,8 +146,11 @@ def main():
     parser.add_argument('--policy', default='downhill',
                         help=f"{' or '.join(sorted(POLICIES))}, or a trained model .zip")
     parser.add_argument('--goal', default='random',
-                        help="'random', 'all' (every door from spawn), or a door name: "
-                             + ', '.join(sorted(spec.DOOR_GOALS)))
+                        help="'random', or on the hallway map 'all' (every door from spawn) "
+                             'or a door name: ' + ', '.join(sorted(spec.DOOR_GOALS)))
+    parser.add_argument('--map', help="map name in maps/ (e.g. 'cbu_floor2') or .yaml path "
+                        "(default: the --policy zip's training map, else $CASH_MAP_YAML / "
+                        'hallway)')
     parser.add_argument('--episodes', type=int, default=3,
                         help='number of episodes with --goal random')
     parser.add_argument('--pedestrians', type=int, default=0,
@@ -158,14 +165,25 @@ def main():
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
     args = parser.parse_args()
 
+    from cash_rl.occupancy_map import use_map
+    if args.map:
+        use_map(args.map)
+    elif args.policy not in POLICIES:
+        from cash_rl.train import model_map_yaml
+        if model_map_yaml(args.policy):
+            use_map(model_map_yaml(args.policy))
+    env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                            pedestrians_yield=args.yielding_pedestrians,
+                            encounter_prob=args.encounter_prob)
     if args.goal == 'random':
         goals = [(None, None)] * args.episodes
-    elif args.goal == 'all':
-        goals = sorted(spec.DOOR_GOALS.items())
-    elif args.goal in spec.DOOR_GOALS:
-        goals = [(args.goal, spec.DOOR_GOALS[args.goal])]
+    elif args.goal == 'all' and env.door_goals:
+        goals = sorted(env.door_goals.items())
+    elif args.goal in env.door_goals:
+        goals = [(args.goal, env.door_goals[args.goal])]
     else:
-        parser.error(f'unknown goal {args.goal!r}')
+        parser.error(f'unknown goal {args.goal!r} on this map'
+                     + ('' if env.door_goals else ' (door goals are hallway only; use random)'))
 
     import matplotlib
     if args.save:
@@ -173,13 +191,10 @@ def main():
     from matplotlib.animation import FuncAnimation, PillowWriter
     import matplotlib.pyplot as plt
 
-    env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
-                            pedestrians_yield=args.yielding_pedestrians,
-                            encounter_prob=args.encounter_prob)
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
     frames = run_episodes(env, policy, goals, args.seed)
 
-    fig, ax = plt.subplots(figsize=(14, 6.4))
+    fig, ax = plt.subplots(figsize=(14, 6.4) if env.is_hallway else (11, 11))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.93, bottom=0.07)
     scene = Scene(ax, env)
 

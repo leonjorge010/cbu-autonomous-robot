@@ -23,7 +23,7 @@ import json
 import os
 
 from cash_rl import spec
-from cash_rl.occupancy_map import default_map_yaml
+from cash_rl.occupancy_map import default_map_yaml, use_map
 from cash_rl.raycast_env import DEFAULT_GOAL_DISTANCE_RANGE, HallwayRaycastEnv
 import numpy as np
 from stable_baselines3 import PPO, SAC, TD3
@@ -58,6 +58,20 @@ def load_model(path):
                 return SingleScanModel(model)
             return model
     raise FileNotFoundError(f'No config.json next to or above {path}')
+
+
+def model_map_yaml(path):
+    """Map a train.py/dagger.py model was trained on (its config.json), or None.
+
+    None for runs from before maps were recorded, which all used the hallway.
+    """
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(path)))
+    for candidate in (directory, os.path.dirname(directory)):
+        config = os.path.join(candidate, 'config.json')
+        if os.path.isfile(config):
+            with open(config) as f:
+                return json.load(f).get('map_yaml')
+    return None
 
 
 class SingleScanModel:
@@ -125,8 +139,9 @@ class GoalEvalCallback(BaseCallback):
         self.eval_env = eval_env
         self.eval_freq = eval_freq
         self.run_dir = run_dir
-        self.episodes = [(name, 0, {'spawn': spec.SPAWN_POSE, 'goal': goal})
-                         for name, goal in sorted(spec.DOOR_GOALS.items())]
+        # Door goals from the spawn on the hallway map; other maps have none.
+        self.episodes = [(name, 0, {'spawn': eval_env.spawn_pose, 'goal': goal})
+                         for name, goal in sorted(eval_env.door_goals.items())]
         self.episodes += [(f'random_{i}', EVAL_SEED_BASE + i, None) for i in range(n_random)]
         self.best = (-1.0, -np.inf)
         self.last_eval = 0
@@ -164,7 +179,7 @@ class GoalEvalCallback(BaseCallback):
             'collision_rate': rate('collision'),
             'timeout_rate': rate('timeout'),
             'mean_return': rate('return'),
-            'door_success_rate': rate('success', doors),
+            'door_success_rate': rate('success', doors) if doors else float('nan'),
             'random_success_rate': rate('success', randoms) if randoms else float('nan'),
             'mean_steps_success': float(np.mean(succeeded)) if succeeded else float('nan'),
         }
@@ -216,10 +231,14 @@ def main():
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--ent-coef', type=float, default=None,
                         help='PPO entropy bonus (default 0.0, from algo_kwargs)')
+    parser.add_argument('--map', help="map name in maps/ (e.g. 'cbu_floor2') or .yaml path "
+                        '(default: $CASH_MAP_YAML, else hallway); door evals are hallway only')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
 
+    # Set before any env exists, so SubprocVecEnv workers load the same map.
+    map_yaml = use_map(args.map) if args.map else os.path.abspath(default_map_yaml())
     n_envs = args.n_envs or (12 if args.algo == 'ppo' else 4)
     name = args.name or f'{args.algo}_{datetime.datetime.now():%Y%m%d_%H%M%S}'
     run_dir = os.path.join(runs_dir(), name)
@@ -231,7 +250,8 @@ def main():
             parser.error('--ent-coef is PPO only')
         kwargs['ent_coef'] = args.ent_coef
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
-        json.dump({'args': vars(args), 'n_envs': n_envs, 'algo_kwargs': kwargs,
+        json.dump({'args': vars(args), 'map_yaml': map_yaml, 'n_envs': n_envs,
+                   'algo_kwargs': kwargs,
                    'spec': {k: v for k, v in vars(spec).items()
                             if k.isupper() and isinstance(v, (int, float, str, dict, tuple))}},
                   f, indent=2, default=str)
@@ -268,7 +288,7 @@ def main():
                            save_path=os.path.join(run_dir, 'checkpoints'), name_prefix='model'),
     ]
     print(f'Training {args.algo.upper()} for {args.timesteps:,} steps with {n_envs} envs '
-          f'-> {run_dir}', flush=True)
+          f'on {os.path.basename(map_yaml)} -> {run_dir}', flush=True)
     try:
         model.learn(total_timesteps=args.timesteps, callback=callbacks, tb_log_name='tb',
                     progress_bar=False)

@@ -1,4 +1,8 @@
+import os
+
 from cash_rl import spec
+from cash_rl.occupancy_map import default_map_yaml_in_workspace, keepout_yaml_for
+from cash_rl.occupancy_map import load_free_mask
 from cash_rl.raycast_env import BRANCH_MIN_Y, ENCOUNTER_DISTANCE_RANGE, ENCOUNTER_LATERAL
 from cash_rl.raycast_env import HallwayRaycastEnv, ROUTE_STEP
 from cash_rl.raycast_env import PEDESTRIAN_RADIUS, PEDESTRIAN_SLOW_FACTOR
@@ -644,3 +648,44 @@ def test_avoider_keeps_right_of_an_oncoming_pedestrian(offset):
         if terminated or truncated or env.pedestrians[0, 0] < env.pose[0] - 1.0:
             break
     assert closest[1] > 0.0  # pedestrian on the robot's left (+y while heading +x)
+
+
+TEGR_MAP = os.path.join(os.path.dirname(default_map_yaml_in_workspace()), 'cbu_floor2.yaml')
+
+
+@pytest.fixture(scope='module')
+def tegr_env():
+    return HallwayRaycastEnv(map_yaml=TEGR_MAP, n_pedestrians=4, encounter_prob=0.5)
+
+
+def test_tegr_spawns_goals_and_pedestrians_stay_out_of_keepout_zones(tegr_env):
+    allowed = load_free_mask(keepout_yaml_for(TEGR_MAP))[1]
+    for seed in range(30):
+        tegr_env.reset(seed=seed)
+        for x, y in [tegr_env.pose[:2], tegr_env.goal, *tegr_env.pedestrians]:
+            row, col = tegr_env.map.to_cell(x, y)
+            assert allowed[row, col]
+
+
+@pytest.mark.parametrize('xy, along_y', [
+    ((30.0, 12.0), False),  # south corridor
+    ((30.0, 60.0), False),  # north corridor
+    ((13.0, 30.0), True),   # west corridor
+    ((14.0, 22.0), True),   # west corridor, at TEGR 230's door recess
+])
+def test_tegr_pedestrians_walk_along_their_corridor(tegr_env, xy, along_y):
+    assert (tegr_env._walking_axis(np.array(xy))[1] > 0) == along_y
+
+
+def test_tegr_has_no_hallway_doors_or_junction():
+    env = HallwayRaycastEnv(map_yaml=TEGR_MAP)
+    assert env.door_goals == {} and env.spawn_pose is None
+    with pytest.raises(ValueError):
+        HallwayRaycastEnv(map_yaml=TEGR_MAP, junction_prob=0.3)
+
+
+def test_limited_distance_field_matches_the_full_one_within_the_limit(env):
+    full = env.map.distance_field(5.0, 0.0).grid
+    limited = env.map.distance_field(5.0, 0.0, limit=6.0).grid
+    near = full <= 6.0
+    assert np.allclose(limited[near], full[near]) and np.all(np.isinf(limited[full > 6.1]))

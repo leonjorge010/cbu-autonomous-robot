@@ -31,6 +31,7 @@ import os
 import time
 
 from cash_rl import scripted, spec
+from cash_rl.occupancy_map import default_map_yaml, use_map
 from cash_rl.raycast_env import HallwayRaycastEnv
 from cash_rl.train import algo_kwargs, EVAL_SEED_BASE, evaluate, runs_dir
 import numpy as np
@@ -146,6 +147,8 @@ def main():
                         help='encounter episodes to score the student on after each round')
     parser.add_argument('--workers', type=int, default=None,
                         help='collection processes (default: CPU count - 1)')
+    parser.add_argument('--map', help="map name in maps/ (e.g. 'cbu_floor2') or .yaml path "
+                        '(default: $CASH_MAP_YAML, else hallway)')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--name', help='run name (default: dagger_<timestamp>)')
     args = parser.parse_args()
@@ -153,6 +156,8 @@ def main():
     import torch
     from stable_baselines3 import PPO
 
+    # Set before any env exists, so the spawned collection workers load the same map.
+    map_yaml = use_map(args.map) if args.map else os.path.abspath(default_map_yaml())
     workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
     name = args.name or f'dagger_{datetime.datetime.now():%Y%m%d_%H%M%S}'
     run_dir = os.path.join(runs_dir(), name)
@@ -162,7 +167,8 @@ def main():
     config_args = dict(vars(args), algo='ppo')
     kwargs = algo_kwargs('ppo', 12)
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
-        json.dump({'args': config_args, 'teacher': 'scripted.avoider', 'algo_kwargs': kwargs,
+        json.dump({'args': config_args, 'map_yaml': map_yaml, 'teacher': 'scripted.avoider',
+                   'algo_kwargs': kwargs,
                    'spec': {k: v for k, v in vars(spec).items()
                             if k.isupper() and isinstance(v, (int, float, str, dict, tuple))}},
                   f, indent=2, default=str)
@@ -187,7 +193,8 @@ def main():
         csv.writer(f).writerow(fields)
 
     print(f'DAgger: {args.rounds + 1} rounds x {args.steps_per_round:,} labelled steps, '
-          f'{workers} workers, {args.pedestrians} pedestrian(s), encounters '
+          f'{workers} workers, {os.path.basename(map_yaml)}, {args.pedestrians} pedestrian(s), '
+          'encounters '
           f'{args.encounter_prob:g} -> {run_dir}', flush=True)
     observations, labels = [], []
     best = (-1.0, 0.0)

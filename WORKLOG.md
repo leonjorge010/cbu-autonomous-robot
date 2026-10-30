@@ -3,6 +3,83 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-23
+
+**Training on the real TEGR 2nd floor** (`cbu_floor2`, Ashlyn; schedule weeks 8–9). Branch
+`pedestrians-no-yield`; the map-generic code below is **uncommitted** (last commit `eead4e9`).
+- `--map cbu_floor2` (name in `maps/` or a path) on `train`, `dagger`, `evaluate`, `view_env`;
+  `train`/`dagger` record `map_yaml` in `config.json`, and `evaluate`/`view_env` default to the
+  model's map (warning on a mismatch). Hallway-only: door evals (`env.door_goals` is empty
+  elsewhere, so `evaluate` needs `--random N`) and `--junction-prob` (raises on other maps).
+- `<map>_keepout.yaml` keeps spawns, goals and pedestrians out of Stair 1 and the learning zones
+  (the robot can still drive in: nothing penalizes it there).
+- Pedestrians walk along the longer open stretch through their cell, majority-voted over 1.5 m
+  (before: y if y ≥ 1.5 m, so every TEGR pedestrian walked north–south). The hallway keeps its old
+  rule: hallway seeded rollouts verified bit-identical before/after.
+- Spawn-side distance field stops at the goal range (`distance_field(limit=)`): TEGR reset
+  213 → 111 ms. `view_env` labels the layout's room goals (`landmarks_for`) and fits the map.
+- Room-goal check: `trace_floorplan --overlay` + a labelled render; all 26 look right, except
+  `elevator_2` (43.0, 57.4) may sit ~2 m east of the elevator door (check on site).
+- 7 new tests; 63 pass.
+
+**Overnight queue** (`runs/queue_tegr.txt`, all 10 jobs OK, 01:52–10:56). 200 held-out goals
+(1–15 m) on TEGR; files `runs/eval_tegr_*.txt`.
+
+| Encounter test, 1 pedestrian | Success | Collision | Reversing |
+|---|---|---|---|
+| avoider (keep-right teacher) | 89.0% | 10.5% | 5.2% |
+| **`tegr_dagger_p1`** | **61.5%** | 38.5% | 6.1% |
+| `tegr_ppo_p1` (enc 0.7, no lane, ent 0.001) | 52.0% | 45.5% | 21.4% |
+| `downhill` | 50.5% | 49.5% | 0% |
+| `tegr_ppo` (no pedestrians) | 42.0% | 56.5% | 13.1% |
+
+- First learned model clearly above `downhill` (+11 points, one seed). DAgger per-round eval was
+  still rising at round 10 (44% → 57% → 61% at rounds 5, 8, 10); imitation MSE 0.115.
+- No pedestrians: `tegr_ppo` seeds 0/1/2 final 86.5/79.5/87.0% (mean 84.3%), best checkpoints
+  87.0/89.5/89.0% (mean 88.5%); `downhill` 100%. Failures are mostly wall collisions (10–14%),
+  vs 96.5% for `ppo_d800_prox` on the hallway. Hallway models zero-shot on TEGR: 57–60% (~35%
+  timeouts).
+- 4 random pedestrians: `tegr_ppo_p4` 78.0%, `tegr_dagger_p1` 76.5%, `downhill` 91.5%, avoider
+  96.0%. Random pedestrians rarely meet the robot here, so this gap is the wall-collision weakness.
+- The student still almost never swerves hard near a pedestrian: 5% of steps vs the teacher's 43%
+  (hallway student before keep-right: 13%). Its gain did not come from fixing the left/right
+  averaging.
+- Reports: progress update https://claude.ai/artifact/BiPTYtyuFbgmBCrZxjjmK3 and results-with-charts
+  doc https://claude.ai/artifact/VsfudV5hPgKR2pYEggH6VL (both private until shared). Representative
+  demo: `view_env --pedestrians 1 --encounter-prob 1 --seed 1100000 --episodes 10` for `downhill`
+  (`--map cbu_floor2`), `tegr_ppo_p1`, `tegr_dagger_p1` (4/6/7 of 10).
+
+**Open**
+- Commit the map-generic code.
+- DAgger: 2 more seeds and more rounds (`--rounds 20` or `--steps-per-round 120000`) to confirm
+  61.5% and find the plateau.
+- `--init-from` warm start for `train`/`dagger` (postponed): PPO fine-tune from the student.
+- Student that picks among the teacher's 54 discrete actions, if averaging stays the limit.
+- TEGR wall collisions: longer training and/or `evaluate --safety`.
+- Keep-right teacher with 4 pedestrians drops to 78% on the hallway (84.5% without the rule).
+- Long routes on TEGR need subgoals (goal obs is straight-line): the planned subgoal agent.
+- Hallway `dagger_p1_kr` rerun never done (superseded by TEGR). `demo` still assumes hallway doors.
+- `runs/queue.txt` still lists 4 stale ent-0.01 runs.
+
+## 2026-10-22
+
+**Encounters, privileged avoider, teacher-student training** (hallway, 1 pedestrian, Ashlyn).
+- `HallwayRaycastEnv(encounter_prob)` / `--encounter-prob`: the first pedestrian starts 4–10 m
+  ahead on the robot's route walking at it. The *encounter test* (`--encounter-prob 1`) separates
+  avoidance far better than random starts.
+- `scripted.avoider`: privileged upper bound (true future pedestrian positions). Limited to
+  pedestrians visible in the 36 beams it scores the same, so the observation is sufficient; the
+  problem is learning. Fixed a bug where it froze at rest facing its goal (3/7 doors → 7/7;
+  encounter test 84.5% → 88.5%). Added keep-right (`side_weight`, judged in the pedestrian's
+  walking frame): keeps right on 72% of close passes (was 53%), encounter 86.5%, 4 peds 78.0%.
+- `train --ent-coef`: 0.01 blew the action std up to 4.6; 0.001 is stable but changed nothing.
+- Sweep (1 ped, standard test): lane penalty + encounters 60.0% / 22.8% reversing; lane penalty off
+  73–79.5% / ~11%; `downhill` 85%, avoider 94%. Encounter test: PPO 35.5–41%, `downhill` 43.5%.
+- `dagger` (new console script, `eead4e9`): DAgger with the avoider as teacher, student = PPO
+  MlpPolicy, saves PPO zips. `dagger_p1`: 44.5% on the encounter test (`downhill` 43.5%);
+  behavior cloning alone 8.5%. Near a pedestrian the teacher swerves hard on 43% of steps split
+  left/right; the student averages them to straight (13%).
+
 ## 2026-10-21
 
 **Pedestrians that don't yield; lane penalty** (`HallwayRaycastEnv`, Ashlyn; schedule week 8). Branch

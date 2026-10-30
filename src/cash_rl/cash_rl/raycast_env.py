@@ -22,9 +22,11 @@ is penalized for coming close (spec.step_outcome). They exist only here, not in
 Gazebo.
 """
 from cash_rl import spec
+from cash_rl.occupancy_map import is_hallway_map, keepout_yaml_for, load_free_mask
 from cash_rl.occupancy_map import OccupancyMap
 import gymnasium as gym
 import numpy as np
+from scipy.ndimage import uniform_filter
 
 # Integrate the DiffDrive acceleration limits at this many substeps per control step.
 N_SUBSTEPS = 10
@@ -35,11 +37,13 @@ GOAL_CLEARANCE = 0.5
 DEFAULT_GOAL_DISTANCE_RANGE = (1.0, 15.0)
 SAFETY_SCAN_ANGLES = np.linspace(-np.pi, np.pi, 360, endpoint=False)
 # hallway.sdf: the main corridor spans |y| <= 1.2 m; the side branch rises in +y
-# from the junction at x = 14 m. Cells above this line count as the branch.
+# from the junction at x = 14 m. Cells above this line count as the branch
+# (junction_prob, and the pedestrians' walking axis on the hallway map).
 BRANCH_MIN_Y = 1.5
 MAX_SAMPLE_TRIES = 1000
-# Pedestrians: discs walking along the corridor axis (x in the main corridor, y
-# in the branch), at a speed drawn per episode.
+# Pedestrians: discs walking along the corridor axis, at a speed drawn per
+# episode. On the hallway map: x in the main corridor, y in the branch. On other
+# maps: whichever of x and y has the longer open stretch through the cell.
 PEDESTRIAN_RADIUS = 0.25
 PEDESTRIAN_SPEED_RANGE = (0.5, 0.9)
 # Pedestrian centers keep at least this much map clearance (radius + a gap).
@@ -62,6 +66,18 @@ PEDESTRIAN_PATH_BUFFER = 0.1
 ENCOUNTER_DISTANCE_RANGE = (4.0, 10.0)
 ENCOUNTER_LATERAL = 0.3
 ROUTE_STEP = 0.1  # m between traced route points
+# Non-hallway maps: neighborhood (m) whose majority sets a cell's walking axis.
+WALK_AXIS_WINDOW = 1.5
+
+
+def _run_lengths(mask):
+    """Length (cells) of the run of True along each row through each cell; 0 where False."""
+    out = np.zeros(mask.shape, dtype=np.int32)
+    for row, values in enumerate(mask):
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], values.astype(np.int8), [0]])))
+        for start, end in zip(edges[::2], edges[1::2]):
+            out[row, start:end] = end - start
+    return out
 
 
 def _rectangle_perimeter(half_length, half_width, spacing):
@@ -87,8 +103,12 @@ class HallwayRaycastEnv(gym.Env):
     goal_distance_range. With probability junction_prob, a sampled spawn and goal
     are put on opposite sides of the junction (main corridor vs. side branch), so
     the episode needs the turn. For evaluation matching HallwayEnv, pass
-    spec.SPAWN_POSE and one of spec.DOOR_GOALS. map_yaml defaults to
-    occupancy_map.default_map_yaml(); range_noise adds the URDF's Gaussian range
+    spec.SPAWN_POSE and one of spec.DOOR_GOALS (`spawn_pose` and `door_goals`
+    hold those on the hallway map; on other maps door_goals is empty, and
+    junction_prob must stay 0). map_yaml defaults to
+    occupancy_map.default_map_yaml(); a <name>_keepout.yaml next to it (from
+    build_floorplan_world.py) keeps spawns, goals and pedestrians out of its
+    zones (the robot may still drive into them). range_noise adds the URDF's Gaussian range
     noise and spec.BEAM_DROPOUT_PROB missing returns; render_mode is None or 'rgb_array'.
     n_pedestrians adds that many pedestrians (see the module docstring), placed at
     random on every reset; their positions are in `pedestrians` (n, 2) after
@@ -110,6 +130,11 @@ class HallwayRaycastEnv(gym.Env):
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
         self.map = OccupancyMap(map_yaml)
+        self.is_hallway = is_hallway_map(self.map.yaml_path)
+        if junction_prob > 0 and not self.is_hallway:
+            raise ValueError('junction_prob needs the hallway map (its junction is hard-coded)')
+        self.spawn_pose = spec.SPAWN_POSE if self.is_hallway else None
+        self.door_goals = dict(spec.DOOR_GOALS) if self.is_hallway else {}
         self.goal_distance_range = goal_distance_range
         self.junction_prob = junction_prob
         self.range_noise = range_noise
@@ -137,12 +162,34 @@ class HallwayRaycastEnv(gym.Env):
             spec.FOOTPRINT_HALF_LENGTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             spec.FOOTPRINT_HALF_WIDTH + spec.COLLISION_MARGIN + SPAWN_CLEARANCE,
             self._ray_step)
-        self._goal_cells = np.argwhere(self.map.clearance >= GOAL_CLEARANCE)
+        allowed = np.ones(self.map.free.shape, dtype=bool)
+        keepout_yaml = keepout_yaml_for(self.map.yaml_path)
+        if keepout_yaml is not None:
+            allowed = load_free_mask(keepout_yaml)[1]
+            if allowed.shape != self.map.free.shape:
+                raise ValueError(f'{keepout_yaml} does not match the map size')
+        self._spawn_cells = self.map.free_cells[
+            allowed[self.map.free_cells[:, 0], self.map.free_cells[:, 1]]]
+        self._goal_cells = np.argwhere((self.map.clearance >= GOAL_CLEARANCE) & allowed)
         self._in_branch = {
-            'spawn': self._cell_y(self.map.free_cells[:, 0]) >= BRANCH_MIN_Y,
+            'spawn': self._cell_y(self._spawn_cells[:, 0]) >= BRANCH_MIN_Y,
             'goal': self._cell_y(self._goal_cells[:, 0]) >= BRANCH_MIN_Y,
         }
-        self._pedestrian_cells = np.argwhere(self.map.clearance >= PEDESTRIAN_WALL_CLEARANCE)
+        walkable = self.map.clearance >= PEDESTRIAN_WALL_CLEARANCE
+        self._pedestrian_cells = np.argwhere(walkable & allowed)
+        # True where pedestrians walk along y (else x).
+        if self.is_hallway:
+            rows = np.arange(self.map.height)[:, None]
+            self._walks_along_y = np.broadcast_to(self._cell_y(rows) >= BRANCH_MIN_Y,
+                                                  self.map.free.shape)
+        else:
+            # Longer open stretch, then a majority vote over WALK_AXIS_WINDOW so door
+            # recesses and pinch points follow the corridor they open off.
+            along_y = (_run_lengths(walkable.T).T > _run_lengths(walkable)) & walkable
+            size = int(round(WALK_AXIS_WINDOW / self.map.resolution)) | 1
+            votes = uniform_filter(along_y.astype(float), size) \
+                / np.maximum(uniform_filter(walkable.astype(float), size), 1e-9)
+            self._walks_along_y = votes > 0.5
 
         self.pose = np.array(spec.SPAWN_POSE, dtype=np.float64)
         self.goal = np.zeros(2)
@@ -263,6 +310,13 @@ class HallwayRaycastEnv(gym.Env):
                 0.0, spec.RANGE_NOISE_STDDEV, int(finite.sum()))
         return spec.sanitize_ranges(ranges), SAFETY_SCAN_ANGLES
 
+    def _walking_axis(self, xy):
+        """Return the unit axis a pedestrian at xy walks along: (0, 1) or (1, 0)."""
+        row, col = self.map.to_cell(xy[0], xy[1])
+        row = int(np.clip(row, 0, self.map.height - 1))
+        col = int(np.clip(col, 0, self.map.width - 1))
+        return np.array([0.0, 1.0]) if self._walks_along_y[row, col] else np.array([1.0, 0.0])
+
     def _cell_y(self, rows):
         return self.map.origin[1] + (rows + 0.5) * self.map.resolution
 
@@ -272,8 +326,8 @@ class HallwayRaycastEnv(gym.Env):
 
     def _sample_spawn_pose(self, in_branch=None):
         """Collision-free pose; in_branch True/False limits it to the branch/corridor."""
-        cells = self.map.free_cells if in_branch is None \
-            else self.map.free_cells[self._in_branch['spawn'] == in_branch]
+        cells = self._spawn_cells if in_branch is None \
+            else self._spawn_cells[self._in_branch['spawn'] == in_branch]
         for _ in range(MAX_SAMPLE_TRIES):
             row, col = cells[self.np_random.integers(len(cells))]
             pose = np.array([*self._random_point_in_cell(row, col),
@@ -284,8 +338,8 @@ class HallwayRaycastEnv(gym.Env):
 
     def _sample_goal(self, spawn, in_branch=None):
         """Goal cell within goal_distance_range of spawn (geodesic), or None."""
-        from_spawn = self.map.distance_field(spawn[0], spawn[1]).grid
         lo, hi = self.goal_distance_range
+        from_spawn = self.map.distance_field(spawn[0], spawn[1], limit=hi).grid
         distances = from_spawn[self._goal_cells[:, 0], self._goal_cells[:, 1]]
         ok = (distances >= lo) & (distances <= hi)
         if in_branch is not None:
@@ -316,7 +370,7 @@ class HallwayRaycastEnv(gym.Env):
                 raise RuntimeError('No pedestrian start found clear of the robot')
             speed = self.np_random.uniform(*PEDESTRIAN_SPEED_RANGE)
             sign = 1.0 if self.np_random.random() < 0.5 else -1.0
-            axis = np.array([0.0, 1.0]) if xy[1] >= BRANCH_MIN_Y else np.array([1.0, 0.0])
+            axis = self._walking_axis(xy)
             positions.append(xy)
             velocities.append(sign * speed * axis)
         self.pedestrians = np.array(positions).reshape(-1, 2)
@@ -364,10 +418,10 @@ class HallwayRaycastEnv(gym.Env):
             return None
         travelled = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(route, axis=0).T))])
         # Pedestrians walk only along their own corridor's axis, so one placed past
-        # the junction would walk off down the other corridor before the robot
-        # turns the corner: keep to the route's first stretch in the robot's corridor.
-        in_branch = route[:, 1] >= BRANCH_MIN_Y
-        leaves = np.nonzero(in_branch != in_branch[0])[0]
+        # a corner would walk off down the other corridor before the robot turns
+        # it: keep to the route's first stretch with the robot's walking axis.
+        along_y = np.array([self._walking_axis(xy)[1] for xy in route]) > 0
+        leaves = np.nonzero(along_y != along_y[0])[0]
         end = travelled[leaves[0] - 1] if len(leaves) else travelled[-1]
         lo, hi = ENCOUNTER_DISTANCE_RANGE
         hi = min(hi, end)
@@ -383,7 +437,7 @@ class HallwayRaycastEnv(gym.Env):
             if self._clearance_at(*xy) < PEDESTRIAN_WALL_CLEARANCE \
                     or np.hypot(*(xy - self.pose[:2])) < PEDESTRIAN_SPAWN_DISTANCE:
                 continue
-            axis = np.array([0.0, 1.0]) if xy[1] >= BRANCH_MIN_Y else np.array([1.0, 0.0])
+            axis = self._walking_axis(xy)
             along = float(direction @ axis)
             if abs(along) < 0.5:  # route crosses the walking axis here (the junction)
                 continue
