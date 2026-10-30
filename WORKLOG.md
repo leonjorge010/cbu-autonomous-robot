@@ -9,6 +9,8 @@ for each session: what changed, results with numbers, and what's still open.
 (`14b094d`: `--map`, keepout zones, per-map pedestrian axes, limited Dijkstra), then merged the
 branch. `main` now has non-yielding pedestrians, the lane penalty, `--encounter-prob`, the
 privileged `avoider`, `dagger` and TEGR training. 63 tests pass. No new training or results.
+Pushed `main` to GitHub (`95f607b..8cee225`); deleted the merged local branches
+`pedestrians-no-yield` (never pushed) and `pedestrians-scan-stack`.
 
 **Open:** unchanged from 10-23 (DAgger seeds/rounds, TEGR wall collisions, `--init-from`,
 subgoal agent).
@@ -37,6 +39,38 @@ Existing models, TEGR, 200 held-out goals, no subgoal / 3 m / 5 m (files
   the straight-line goal; cause still unknown (it reverses on ~18% of steps).
 - The real test is a model *trained* with subgoals: hallway-trained → TEGR zero-shot (unseen map)
   and TEGR DAgger with subgoals.
+
+**Decisions**
+- Hierarchy: the decision (subgoal) layer is the geodesic planner (`route()`), not a learned model.
+  It uses only the map and the robot's pose, which the real robot will have (SLAM map + Nav2
+  localization). Report it as a deliberate change from the proposal's learned subgoal agent.
+  The planner ignores pedestrians; a decision layer that picks a side (or waits) for an oncoming
+  pedestrian is the extension if experiment B shows the motion model still can't commit to a
+  side. Rule-based first, learned if time allows; a fully learned subgoal agent is future work.
+- Warm starts vs. training from scratch: keep scratch runs for every comparison in the report
+  (equal footing, ±3% seed noise). Warm-start only to build the final model, as a recorded
+  curriculum: DAgger student → PPO fine-tune (1 pedestrian) → 4 pedestrians. Train from scratch
+  after reward/obs changes (stale value function, old habits: `ppo_peds` fell 90.5% → 36% when
+  pedestrians stopped yielding).
+
+**Queued, not started** (`runs/queue_subgoal.txt`, ~6.5 h; start with
+`tmux new -d -s queue "QUEUE=runs/queue_subgoal.txt ~/ros2_ws/runs/queue.sh"`)
+- A, unseen map: `ppo_sg3_s0/1/2`, hallway PPO with `--subgoal-lookahead 3` (`ppo_d800_prox`
+  settings, 1.5M steps), then zero-shot on TEGR → `runs/eval_tegr_zeroshot_sg3.txt`. Compare with
+  `ppo_d800_prox`'s 60% (34% timeouts).
+- B, pedestrians on TEGR: DAgger 20 rounds, 1 pedestrian, seeds 0–2, with 3 m subgoals
+  (`tegr_dagger_sg3_s*`) and without (`tegr_dagger_r20_s*`, also the seed/plateau check of 61.5%).
+  Encounter test and no-pedestrian test → `runs/eval_tegr_{enc,p0}_dagger_{sg3,r20}.txt`.
+
+**Open**
+- Run the queue and analyze A and B (3-seed means).
+- If B's students still don't swerve: discrete 54-action student, and/or a side-choosing decision
+  layer.
+- `--init-from` (PPO fine-tune from the DAgger student) for the final model.
+- TEGR wall collisions: `evaluate --safety` on the TEGR models; longer training.
+- Why hallway models time out on TEGR (34%; reverse ~18% of steps) — not the straight-line goal.
+- Then 4 pedestrians. Carried over: keep-right teacher at 4 peds (78%), `demo` hallway doors,
+  stale `runs/queue.txt`, `elevator_2` goal position (check on site).
 
 ## 2026-10-23
 
