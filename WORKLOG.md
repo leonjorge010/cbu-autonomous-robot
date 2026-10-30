@@ -3,6 +3,16 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-29
+
+**Merged `pedestrians-no-yield` into `main`** (Ashlyn). Committed the map-generic TEGR code
+(`14b094d`: `--map`, keepout zones, per-map pedestrian axes, limited Dijkstra), then merged the
+branch. `main` now has non-yielding pedestrians, the lane penalty, `--encounter-prob`, the
+privileged `avoider`, `dagger` and TEGR training. 63 tests pass. No new training or results.
+
+**Open:** unchanged from 10-23 (DAgger seeds/rounds, TEGR wall collisions, `--init-from`,
+subgoal agent).
+
 ## 2026-10-23
 
 **Training on the real TEGR 2nd floor** (`cbu_floor2`, Ashlyn; schedule weeks 8–9). Branch
