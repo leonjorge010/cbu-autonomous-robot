@@ -116,9 +116,10 @@ PEDESTRIAN_COLLISION_PENALTY = 40.0
 # pays SUBGOAL_LANE_WEIGHT per step per metre it sits sideways beyond
 # SUBGOAL_LANE_DEADBAND from the lane it was shown, so it is paid to follow the
 # subgoals, not just to reach the goal. Full-speed progress earns 0.5 per step;
-# 0.5 m off the lane costs 0.2, so following stays worth more than stopping.
+# 0.5 m off the lane costs 0.8, so cutting toward the goal never pays. 0.5 until
+# 2026-10-30 (tegr_ppo_lane_s0): too weak, it covered ~1/3 of a lane shift.
 SUBGOAL_LANE_DEADBAND = 0.1
-SUBGOAL_LANE_WEIGHT = 0.5
+SUBGOAL_LANE_WEIGHT = 2.0
 
 # Fixed evaluation goals: the corridor centerline in front of each door in
 # cash_sim/worlds/hallway.sdf (world frame == map frame).
