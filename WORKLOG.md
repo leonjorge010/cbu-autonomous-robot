@@ -3,6 +3,81 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-31
+
+Covers the evening of 10-30 through 01:51 on 10-31.
+
+**Learned subgoal agent** (hierarchy upper half, RL; `cash_rl/subgoal_agent.py`, console script
+`train_subgoal`, `d8ba369`). Ashlyn's choices: learned with RL, action = lane offset + wait,
+inputs = LiDAR only. Built in a worktree and merged after `queue_later.txt` finished.
+- Every 5 control steps (0.5 s) it picks a lane (±1 m, clipped by the env) and whether to wait.
+  Observes the 36 beams now / 0.5 s / 1 s ago, the planner's 3 m center-line subgoal, the end
+  goal, lane room left/right, current lane, velocity, previous action — no pedestrian positions.
+  Reward: task reward over its steps minus the motion agent's lane penalty.
+- `SubgoalEnv` trains it over a frozen motion policy (model zip via a numpy actor, or `downhill`);
+  `SubgoalLayer` runs it in `evaluate`/`view_env --subgoal-agent ZIP`. 7 tests.
+
+**`queue_later.txt` results** (all OK, 17:57–19:47): `tegr_ppo_lane_w2_s0` (lane penalty 2.0).
+
+| 200 goals, TEGR | w2 (2.0) | lane_s0 (0.5) | `downhill` |
+|---|---|---|---|
+| No pedestrians, random lanes | 93.5% | 94.0% | — |
+| Lane +0.5 pinned: success / `lane` error | 93.5% / 0.49 m | 93.0% / 0.41 m | 100% / 0.16 m |
+| Center: success / error | 91.5% / 0.25 m | 93.0% / 0.23 m | 100% / 0.13 m |
+| Lane −0.5 pinned: success / error | 90.0% / 0.26 m | 90.5% / 0.37 m | 100% / 0.15 m |
+| Encounter, center lane | 50.5% | 47.5% | 53% |
+| Encounter, decision layer | 53.0% | 51.0% | 91% |
+
+Raising the penalty kept goal-reaching but did not fix lane following.
+
+**Why PPO won't follow lanes** (diagnostic scripts, no code changed):
+- Not the penalty's size: on the +0.5 lane w2 pays ~32 lane penalty per episode vs ~7 for
+  `downhill`, and still drives at +0.09 m from center (+0.5 / 0 / −0.5 lane → +0.09 / −0.07 /
+  −0.22 m, ~30% of the shift).
+- Not training length: checkpoints 500k–3M all cover 0.2–0.3 m of the 1.0 m shift; plateaued by
+  500k steps.
+- Not the reward: `downhill` earns the same non-lane reward following lanes or ignoring them
+  (76.5 vs 76.8 per episode), so following is worth +21 with no hidden cost.
+- The policy does react to the subgoal (0.27 rad/s per 9.5° of bearing, vs 0.07 for `tegr_ppo`
+  without lanes), but steers about twice as hard from its own LiDAR position: placed on the
+  ±0.5 lane it steers back toward center (±0.42 rad/s). The penalty is charged on only ~30% of
+  steps (waived in turns, junctions, open areas, last 3 m), so it mostly learned centering.
+- The cue is weak: steering straight at the observed 3 m subgoal follows no better than PPO
+  (|err| 0.36 vs 0.32 m). 0.5 m sideways is only ~9° at 3 m, closing the gap takes ~6 s of
+  driving, and lanes redraw every 2–6 s. Same pursuit controller: 1.5 m lookahead with 8–15 s
+  holds → **0.20 m** (= `downhill`); 3 m / 2–6 s 0.36, 3 m / 8–15 s 0.30, 1.5 m / 2–6 s 0.25.
+- No penalty for switching lanes as such; a 0.5 m switch costs ~5–10 while the robot moves over.
+
+**Lane hold flag** (`7d92401`, worktree, merged at 01:51): `--lane-hold MIN MAX` on
+`train`/`dagger`/`evaluate`/`view_env` (default 2–6 s, so old runs reproduce; saved in
+`config.json`, `evaluate`/`view_env` default to the model's). `train_subgoal` now runs the motion
+model at its own lookahead (`motion_lookahead`; `downhill` 3 m) instead of a fixed 3 m. 85 tests pass.
+
+**`queue_subgoal_agent.txt` results** (all OK, 22:13–01:51; each agent 1M decisions, ~105 min).
+TEGR encounter test, 1 pedestrian, 200 held-out goals:
+
+| Motion agent | Center lane | Rule-based layer | Learned subgoal agent |
+|---|---|---|---|
+| `tegr_ppo_lane_w2_s0` | 50.5% | 53% | **53.0%** (`tegr_subgoal_w2_s0`) |
+| `downhill` | 53% | 91% | **73.5%** (`tegr_subgoal_dh_s0`) |
+
+- Over `downhill` the learned agent adds 20 points but trails the rule-based layer (privileged
+  pedestrian positions) by 17.5; its periodic eval was flat at ~70% at the end.
+- Over w2 it can't beat the follower's weakness.
+- No pedestrians, w2 + agent: 94.5% (no cost to goal-reaching).
+
+**Queue** `runs/queue_lane_retrain.txt` (~4–5 h, not started): `tegr_ppo_la15_s0` (1.5 m
+lookahead, 8–15 s holds, otherwise as w2), lane L/C/R vs `downhill`, encounter center vs decision
+layer, then `tegr_subgoal_la15_s0` over it with encounter and no-pedestrian evals.
+
+**Open**
+- `queue_lane_retrain.txt`: does `tegr_ppo_la15_s0` follow lanes (`lane` toward ~0.2 m) and keep
+  ~93% goal-reaching with less corner warning at 1.5 m? Then seeds 1–2.
+- Learned subgoal agent gap to the rule-based layer (73.5 vs 91% over `downhill`): longer
+  training, or a larger LiDAR history window.
+- `docs/MODELS.md` not updated for any lane / subgoal-agent model; `main` is 11 commits ahead of
+  `origin`, not pushed.
+
 ## 2026-10-30 (evening)
 
 **Rule-based decision layer** (hierarchy upper half, Ashlyn; `cash_rl/decision.py`, `49aeb89`).
