@@ -3,6 +3,67 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-10-30 (evening)
+
+**Rule-based decision layer** (hierarchy upper half, Ashlyn; `cash_rl/decision.py`, `49aeb89`).
+Built in a separate worktree (`decision-layer` branch) so the running queue kept `main`'s code;
+fast-forwarded into `main` and rebuilt after the queue finished (`b324cff`).
+- `PedestrianLaneDecider`: center lane until a pedestrian is ahead (≤6 m, within 1.5 m of the
+  robot's line) and closing (oncoming or overtaken). Then the lane goes 0.8 m beside the
+  pedestrian's line on the side with more room where they will meet (±1 m; keep right on ties),
+  held until the pedestrian is 0.8 m behind. `DecisionLayer` wrapper sets `env.lane_offset` each
+  step and rebuilds the obs; `evaluate`/`view_env --decision-layer`. Privileged (true pedestrian
+  state); on the robot it needs LiDAR tracking. 6 tests (`test/test_decision.py`).
+- Three fixes took `downhill` + layer from 77% to 92% (100 eps): judge room at the predicted
+  meeting point, not beside the pedestrian now (the hallway fountain narrows the right side);
+  place the lane relative to the pedestrian, not a fixed ±0.6 m from center; measure from the
+  followed lane's center (the center abreast of the pedestrian jumps at door recesses/open areas).
+- Limits: no "wait" (dead-center pedestrian in the 2.4 m hallway or by the fountain leaves no lane
+  wide enough), no lanes in the last 3 m (5 of the last 18 hits), ignores pedestrians from behind.
+
+TEGR encounter test, 1 pedestrian, 200 held-out goals:
+
+| Motion agent | Center lane | Decision layer |
+|---|---|---|
+| `downhill` (pure lane follower, privileged field) | 53.0% | **91.0%** |
+| avoider (privileged) | 89.0% (10-23) | 94.0% |
+| `tegr_ppo_lane_s0` (lane penalty 0.5) | 47.5% | 51.0% |
+
+The layer works when the motion agent follows the lane; `tegr_ppo_lane_s0` barely does (lane error
+0.41 m with the layer).
+
+**`tegr_ppo_lane_s0`** (TEGR PPO, 3M steps, 3 m subgoals, random lanes ±0.6 m, lane penalty 0.5;
+165 min incl. ~1 h with the laptop lid closed — closing the lid pauses runs, doesn't break them).
+- Goal-reaching, no pedestrians, random lanes: **94.0%** final / 95.5% best, collisions 4.5%,
+  reversing 6.2%. `tegr_ppo` (no subgoals) 3 seeds: 84.3% final, collisions 9.5–14%. One seed.
+- Lane following is weak: pinned lane +0.5 / 0 / −0.5 → robot drives at +0.12 / −0.03 / −0.19 m
+  from center (median, 40 eps), ~1/3 of the shift. `lane` error 0.37–0.41 m vs `downhill`
+  0.13–0.16 m (`runs/eval_tegr_ppo_lane_s0_{left,center,right}.txt`).
+- So `SUBGOAL_LANE_WEIGHT` 0.5 → **2.0** (`b324cff`). Scripted check, TEGR random lanes: follows 93
+  vs ignores 59 (was 108 vs 94); stops −189. All tests pass. Old runs keep 0.5 in `config.json`;
+  re-evaluating them with 2.0 changes only the `return` column.
+
+**`queue_now.txt` results** (all 12 jobs OK, 13:03–17:41; TEGR, 200 held-out goals, 3 seeds)
+- Experiment A control, hallway-trained → TEGR zero-shot: `ppo_nosg` (same code, no subgoals)
+  56.8% (57.0/54.5/59.0), timeouts 37.8%, vs `ppo_sg3` **72.5%**, timeouts 16.5%. Subgoals +15.7
+  points on the unseen floor; the 10-30 confound (old 41-dim `ppo_d800_prox`) is gone.
+- Safety layer on `tegr_dagger_sg3`: no pedestrians 88.7% → **94.7%** (collisions 10–15% →
+  0.5–1.5%, timeouts 4–5%); encounter 68.8% → **73.3%**; overrides 6–10% of steps.
+- 4-pedestrian encounter test: `tegr_dagger_sg3` (trained with 1) 63.7% (62.5/61.0/67.5),
+  `downhill` 47.0%, avoider 87.5%.
+
+**Queue** `runs/queue_later.txt` (6 jobs, ~2 h, not started): `tegr_ppo_lane_w2_s0` (penalty 2.0),
+lane pinned left/center/right vs `tegr_ppo_lane_s0` and `downhill`, encounter test center lane vs
+`--decision-layer`. Seeds 1–2 only if it follows.
+
+**Open**
+- `queue_later.txt`: does `tegr_ppo_lane_w2_s0` follow lanes (`lane` toward ~0.15 m) while keeping
+  ~94% goal-reaching, and does the decision layer lift its encounter score well above center lane?
+- Decision layer: a "wait" option, lanes within the last 3 m, pedestrians from behind, LiDAR
+  pedestrian tracking for the robot.
+- `evaluate` metrics for side-keeping and off-lane distance near pedestrians.
+- Add the 10-30 models to `docs/MODELS.md`. Push `main` (8 commits ahead of origin).
+
 ## 2026-10-30 (afternoon)
 
 **Subgoal lanes** (hierarchy step 3, Ashlyn; commit `134f9fb`). The motion agent should follow
