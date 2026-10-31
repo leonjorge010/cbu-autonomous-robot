@@ -180,6 +180,8 @@ def main():
     parser.add_argument('--decision-layer', action='store_true',
                         help='steer the subgoal lane around pedestrians (cash_rl.decision; '
                              'needs a subgoal lookahead)')
+    parser.add_argument('--subgoal-agent', metavar='ZIP',
+                        help='a train_subgoal model sets the lane and when to wait instead')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
@@ -219,7 +221,10 @@ def main():
 
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
     stepper = None
-    if args.decision_layer:
+    if args.subgoal_agent:
+        from cash_rl.subgoal_agent import SubgoalLayer
+        stepper = SubgoalLayer(env, args.subgoal_agent)
+    elif args.decision_layer:
         from cash_rl.decision import DecisionLayer
         stepper = DecisionLayer(env)
     frames = run_episodes(env, policy, goals, args.seed, stepper)
