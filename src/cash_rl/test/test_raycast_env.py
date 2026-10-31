@@ -832,3 +832,15 @@ def test_following_a_lane_away_from_the_goal_is_not_penalized():
             assert info['is_success']
             returns[offset] = total
         assert returns[-0.5] > returns[0.5] - 3.0, (goal, returns)
+
+
+def test_lane_hold_sets_how_long_random_lanes_last():
+    env = HallwayRaycastEnv(subgoal_lookahead=3.0, subgoal_offset=0.6, lane_hold=(8.0, 15.0))
+    holds = []
+    for seed in range(20):
+        env.reset(seed=seed)
+        holds.append(env._lane_steps_left)
+    assert all(80 <= h <= 150 for h in holds)
+    default = HallwayRaycastEnv(subgoal_lookahead=3.0, subgoal_offset=0.6)
+    default.reset(seed=0)
+    assert default.lane_hold == LANE_HOLD_RANGE and default._lane_steps_left <= 60

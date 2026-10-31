@@ -32,7 +32,7 @@ import time
 
 from cash_rl import scripted, spec
 from cash_rl.occupancy_map import default_map_yaml, use_map
-from cash_rl.raycast_env import HallwayRaycastEnv
+from cash_rl.raycast_env import HallwayRaycastEnv, LANE_HOLD_RANGE
 from cash_rl.train import algo_kwargs, EVAL_SEED_BASE, evaluate, runs_dir
 import numpy as np
 
@@ -157,6 +157,10 @@ def main():
                              'corridor center (needs --subgoal-lookahead; the teacher follows '
                              'the lane and passes pedestrians on its side), in collection and '
                              'eval')
+    parser.add_argument('--lane-hold', type=float, nargs=2, default=LANE_HOLD_RANGE,
+                        metavar=('MIN', 'MAX'),
+                        help='seconds each random lane is held before a new one is drawn '
+                             '(default %(default)s)')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--name', help='run name (default: dagger_<timestamp>)')
     args = parser.parse_args()
@@ -174,7 +178,8 @@ def main():
     os.makedirs(os.path.join(run_dir, 'checkpoints'), exist_ok=False)
     env_kwargs = {'n_pedestrians': args.pedestrians, 'encounter_prob': args.encounter_prob,
                   'subgoal_lookahead': args.subgoal_lookahead,
-                  'subgoal_offset': args.subgoal_offset}
+                  'subgoal_offset': args.subgoal_offset,
+                  'lane_hold': tuple(args.lane_hold)}
     # load_model reads args.algo; the student is an ordinary PPO MlpPolicy.
     config_args = dict(vars(args), algo='ppo')
     kwargs = algo_kwargs('ppo', 12)
@@ -197,7 +202,8 @@ def main():
 
     eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians, encounter_prob=1.0,
                                  subgoal_lookahead=args.subgoal_lookahead,
-                                 subgoal_offset=args.subgoal_offset)
+                                 subgoal_offset=args.subgoal_offset,
+                                 lane_hold=tuple(args.lane_hold))
     eval_episodes = [(f'encounter_{i}', EVAL_SEED_BASE + i, None)
                      for i in range(args.eval_episodes)]
     fields = ['round', 'beta', 'labels', 'mse', 'rollout_success', 'rollout_collision',

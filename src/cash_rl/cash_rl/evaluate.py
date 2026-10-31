@@ -30,7 +30,7 @@ import os
 from cash_rl import scripted, spec
 from cash_rl.occupancy_map import default_map_yaml, default_map_yaml_in_workspace, use_map
 from cash_rl.train import EVAL_SEED_BASE, evaluate, load_model, model_map_yaml
-from cash_rl.train import model_subgoal_lookahead, model_subgoal_offset
+from cash_rl.train import model_lane_hold, model_subgoal_lookahead, model_subgoal_offset
 import numpy as np
 
 # Held-out random pairs: past train.py's periodic-eval seeds (EVAL_SEED_BASE + i).
@@ -94,6 +94,9 @@ def main():
                         help='subgoal in a random lane up to W m left/right of the corridor '
                              "center (2D only; default: the first model zip's training "
                              'setting; 0 = off)')
+    parser.add_argument('--lane-hold', type=float, nargs=2, default=None, metavar=('MIN', 'MAX'),
+                        help='seconds each random lane is held (2D only; default: the first '
+                             "model zip's training setting)")
     parser.add_argument('--lane-offset', type=float, default=None, metavar='X',
                         help='pin the subgoal lane X m left (+) / right (-) of center for '
                              'every episode (2D only; needs a subgoal lookahead)')
@@ -103,7 +106,7 @@ def main():
                              'lookahead)')
     parser.add_argument('--subgoal-agent', metavar='ZIP',
                         help='a train_subgoal model that sets the lane and when to wait '
-                             '(cash_rl.subgoal_agent; 2D only; needs subgoal lookahead 3)')
+                             '(cash_rl.subgoal_agent; 2D only; needs a subgoal lookahead)')
     parser.add_argument('--safety', action='store_true',
                         help='run the policy behind the LiDAR safety layer (cash_rl.safety)')
     args = parser.parse_args()
@@ -121,10 +124,13 @@ def main():
     trained_offset = [model_subgoal_offset(p) for p in args.models if p not in SCRIPTED]
     if args.subgoal_offset is None:
         args.subgoal_offset = trained_offset[0] if trained_offset and args.env == '2d' else 0.0
+    if args.lane_hold is None:
+        args.lane_hold = model_lane_hold(next(p for p in args.models if p not in SCRIPTED)) \
+            if trained_offset else None
     if args.decision_layer and args.subgoal_agent:
         parser.error('pick one of --decision-layer and --subgoal-agent')
     if args.subgoal_agent and args.subgoal_lookahead is None:
-        args.subgoal_lookahead = 3.0
+        args.subgoal_lookahead = 3.0  # downhill: the planner's default
     if args.subgoal_agent:
         args.decision_layer = True  # same checks and lane bookkeeping; the agent sets the lane
     if args.decision_layer and args.lane_offset is not None:
@@ -160,7 +166,8 @@ def main():
                                 pedestrians_yield=args.yielding_pedestrians,
                                 encounter_prob=args.encounter_prob,
                                 subgoal_lookahead=args.subgoal_lookahead,
-                                subgoal_offset=args.subgoal_offset)
+                                subgoal_offset=args.subgoal_offset,
+                                **({'lane_hold': tuple(args.lane_hold)} if args.lane_hold else {}))
     if args.subgoal_agent:
         from cash_rl.subgoal_agent import SubgoalLayer
         env = SubgoalLayer(env, args.subgoal_agent)

@@ -73,7 +73,8 @@ ROUTE_STEP = 0.1  # m between traced route points
 # no wall in reach the route point stands in (that one moves with the robot).
 # The offset is cut back to keep LANE_MIN_CLEARANCE from any obstacle: the
 # clearance the geodesic route keeps, so the teachers' wall costs don't hold the
-# robot short of the lane. Random offsets are held for LANE_HOLD_RANGE seconds;
+# robot short of the lane. Random offsets are held for LANE_HOLD_RANGE seconds
+# (the default of the env's lane_hold);
 # LANE_ZERO_PROB of draws are 0 (the corridor center).
 LANE_SCAN_DISTANCE = 2.5
 LANE_MAX_WIDTH = 4.0
@@ -156,7 +157,7 @@ class HallwayRaycastEnv(gym.Env):
     lane: `lane_offset` m left (+) or right (-) of the corridor's center, across
     the route at the lookahead point (see LANE_*). The center comes from the
     walls, not the route, so the lane doesn't drift with the robot. lane_offset
-    is redrawn uniformly within +-subgoal_offset every LANE_HOLD_RANGE seconds
+    is redrawn uniformly within +-subgoal_offset every lane_hold seconds
     (0 with LANE_ZERO_PROB). reset(options={'lane_offset': x}) turns lanes on
     for the episode (subgoal_offset or not) with lane_offset pinned to x, so a
     decision layer can then set `lane_offset` itself between steps. `lane` is
@@ -177,7 +178,7 @@ class HallwayRaycastEnv(gym.Env):
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
                  range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0,
                  pedestrians_yield=False, lane_penalty=True, encounter_prob=0.0,
-                 subgoal_lookahead=None, subgoal_offset=0.0):
+                 subgoal_lookahead=None, subgoal_offset=0.0, lane_hold=LANE_HOLD_RANGE):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
             raise ValueError(f'Unsupported render_mode {render_mode!r}')
@@ -250,6 +251,7 @@ class HallwayRaycastEnv(gym.Env):
         self.subgoal = np.zeros(2)
         self.subgoal_lookahead = subgoal_lookahead
         self.subgoal_offset = subgoal_offset
+        self.lane_hold = tuple(lane_hold)
         self.lane_offset = 0.0
         self._lane_steps_left = np.inf
         self._lanes = False  # this episode's subgoal sits in a lane
@@ -715,7 +717,7 @@ class HallwayRaycastEnv(gym.Env):
         """Draw a new random lane offset and how many steps to hold it."""
         self.lane_offset = 0.0 if self.np_random.random() < LANE_ZERO_PROB \
             else float(self.np_random.uniform(-self.subgoal_offset, self.subgoal_offset))
-        self._lane_steps_left = int(round(self.np_random.uniform(*LANE_HOLD_RANGE)
+        self._lane_steps_left = int(round(self.np_random.uniform(*self.lane_hold)
                                           / spec.CONTROL_PERIOD))
 
     def _robot_lane_error(self):

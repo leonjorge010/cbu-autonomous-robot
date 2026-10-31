@@ -24,7 +24,7 @@ import os
 
 from cash_rl import spec
 from cash_rl.occupancy_map import default_map_yaml, use_map
-from cash_rl.raycast_env import DEFAULT_GOAL_DISTANCE_RANGE, HallwayRaycastEnv
+from cash_rl.raycast_env import DEFAULT_GOAL_DISTANCE_RANGE, HallwayRaycastEnv, LANE_HOLD_RANGE
 import numpy as np
 from stable_baselines3 import PPO, SAC, TD3
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
@@ -87,6 +87,11 @@ def model_subgoal_lookahead(path):
 def model_subgoal_offset(path):
     """--subgoal-offset a train.py/dagger.py model was trained with, or 0."""
     return _model_config(path).get('args', {}).get('subgoal_offset') or 0.0
+
+
+def model_lane_hold(path):
+    """--lane-hold a train.py/dagger.py model was trained with (the default before the flag)."""
+    return tuple(_model_config(path).get('args', {}).get('lane_hold') or LANE_HOLD_RANGE)
 
 
 class SingleScanModel:
@@ -254,6 +259,10 @@ def main():
                         help='put the subgoal in a random lane up to W m left/right of the '
                              'corridor center and pay for staying in it (needs '
                              '--subgoal-lookahead), in training and eval')
+    parser.add_argument('--lane-hold', type=float, nargs=2, default=LANE_HOLD_RANGE,
+                        metavar=('MIN', 'MAX'),
+                        help='seconds each random lane is held before a new one is drawn '
+                             '(default %(default)s)')
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--ent-coef', type=float, default=None,
@@ -293,7 +302,8 @@ def main():
                   'lane_penalty': not args.no_lane_penalty,
                   'encounter_prob': args.encounter_prob,
                   'subgoal_lookahead': args.subgoal_lookahead,
-                  'subgoal_offset': args.subgoal_offset}
+                  'subgoal_offset': args.subgoal_offset,
+                  'lane_hold': tuple(args.lane_hold)}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
                              env_kwargs=env_kwargs,
                              vec_env_cls=vec_cls,
@@ -306,7 +316,8 @@ def main():
                                  pedestrians_yield=args.yielding_pedestrians,
                                  lane_penalty=not args.no_lane_penalty,
                                  subgoal_lookahead=args.subgoal_lookahead,
-                                 subgoal_offset=args.subgoal_offset)
+                                 subgoal_offset=args.subgoal_offset,
+                                 lane_hold=tuple(args.lane_hold))
 
     model_kwargs = dict(kwargs)
     if args.lr_schedule == 'linear':

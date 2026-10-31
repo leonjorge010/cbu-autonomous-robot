@@ -8,8 +8,8 @@ r"""Learned subgoal agent: the upper half of the hierarchy, trained with RL.
 Every DECISION_STEPS control steps (0.5 s) it picks, for the motion agent below
 it (a frozen lane-following policy, or scripted.downhill):
   - a lane: action[0] * MAX_LANE_OFFSET m left (+) / right (-) of the corridor
-    center, which HallwayRaycastEnv clips to the room there and moves the 3 m
-    subgoal into (the planner still picks how far along the route it lies);
+    center, which HallwayRaycastEnv clips to the room there and moves the
+    motion agent's subgoal into (the planner still picks how far along the route it lies);
   - whether to wait: action[1] > 0 stops the robot instead of running the
     motion agent, so it can let a pedestrian pass where no lane is wide enough.
 
@@ -43,9 +43,23 @@ DECISION_STEPS = 5  # control steps (0.1 s) per decision
 # Scans kept for the observation: now, and this many decisions back.
 SCAN_HISTORY = (0, 1, 2)
 MAX_LANE_OFFSET = 1.0  # m; the env clips it to the room the corridor has
-LOOKAHEAD = 3.0  # m, the planner's subgoal distance (as the motion agents were trained)
+# m: how far ahead on the route the planner's next subgoal is observed (this
+# agent's view), and the motion subgoal distance for downhill. A model motion
+# agent keeps the lookahead it was trained with.
+LOOKAHEAD = 3.0
 ROOM_SCALE = 2.0  # m, lane room normalization
 N_OBS = len(SCAN_HISTORY) * spec.N_OBS_BEAMS + 3 + 3 + 2 + 1 + 2 + 2
+
+
+def motion_lookahead(name):
+    """Subgoal lookahead (m) the motion policy expects: its training setting, or LOOKAHEAD."""
+    if name == 'downhill':
+        return LOOKAHEAD
+    from cash_rl.train import model_subgoal_lookahead
+    lookahead = model_subgoal_lookahead(name)
+    if not lookahead:
+        raise ValueError(f'{name} was not trained with a subgoal lookahead')
+    return lookahead
 
 
 def motion_policy(name):
@@ -127,16 +141,17 @@ def task_reward(reward, info):
 class SubgoalEnv(gym.Env):
     """One step = one subgoal decision, then DECISION_STEPS steps of the motion agent.
 
-    env_kwargs go to HallwayRaycastEnv (subgoal_lookahead is set to LOOKAHEAD
-    and lanes are pinned: this agent sets them). info is the last control
-    step's (without a NaN 'lane_error'), plus 'waiting'.
+    env_kwargs go to HallwayRaycastEnv (subgoal_lookahead is the motion
+    policy's, see motion_lookahead, and lanes are pinned: this agent sets
+    them). info is the last control step's (without a NaN 'lane_error'), plus 'waiting'.
     """
 
     metadata = {'render_modes': []}
 
     def __init__(self, motion='downhill', **env_kwargs):
         super().__init__()
-        env_kwargs = dict(env_kwargs, subgoal_lookahead=LOOKAHEAD, subgoal_offset=0.0)
+        env_kwargs = dict(env_kwargs, subgoal_lookahead=motion_lookahead(motion),
+                          subgoal_offset=0.0)
         self.base = HallwayRaycastEnv(**env_kwargs)
         self.motion = motion_policy(motion)
         self.observer = SubgoalObserver()
@@ -178,7 +193,7 @@ class SubgoalEnv(gym.Env):
 class SubgoalLayer(gym.Wrapper):
     """Runs a trained subgoal agent over a HallwayRaycastEnv driven by any motion policy.
 
-    The wrapped env must have subgoal_lookahead == LOOKAHEAD. Every
+    The wrapped env needs a subgoal lookahead (the motion policy's). Every
     DECISION_STEPS steps the agent sets the lane and may order a wait, during
     which the motion policy's actions are replaced by a stop. info adds
     'decision_offset' and 'waiting'.
@@ -186,8 +201,8 @@ class SubgoalLayer(gym.Wrapper):
 
     def __init__(self, env, agent_path):
         super().__init__(env)
-        if env.unwrapped.subgoal_lookahead != LOOKAHEAD:
-            raise ValueError(f'the subgoal agent needs subgoal_lookahead {LOOKAHEAD}')
+        if not env.unwrapped.subgoal_lookahead:
+            raise ValueError('the subgoal agent needs a subgoal lookahead')
         from cash_rl.train import load_model
         self.agent = load_model(agent_path)
         self.observer = SubgoalObserver()
@@ -236,7 +251,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train the subgoal agent with PPO.')
     parser.add_argument('--motion', required=True,
                         help='frozen motion policy: a train.py model zip trained with '
-                             "--subgoal-lookahead 3 (and lanes), or 'downhill'")
+                             "--subgoal-lookahead (and lanes), or 'downhill'")
     parser.add_argument('--timesteps', type=int, default=1_000_000,
                         help='decisions (each runs DECISION_STEPS control steps)')
     parser.add_argument('--pedestrians', type=int, default=1)
@@ -260,7 +275,9 @@ def main():
     kwargs = algo_kwargs('ppo', args.n_envs)
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         # algo 'ppo' so train.load_model loads it; subgoal_agent marks what it is.
-        json.dump({'args': dict(vars(args), algo='ppo', motion=motion), 'map_yaml': map_yaml,
+        json.dump({'args': dict(vars(args), algo='ppo', motion=motion,
+                                motion_lookahead=motion_lookahead(motion)),
+                   'map_yaml': map_yaml,
                    'subgoal_agent': True, 'n_envs': args.n_envs, 'algo_kwargs': kwargs,
                    'decision_steps': DECISION_STEPS,
                    'spec': {k: v for k, v in vars(spec).items()

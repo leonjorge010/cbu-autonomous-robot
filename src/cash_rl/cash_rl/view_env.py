@@ -177,6 +177,8 @@ def main():
     parser.add_argument('--subgoal-offset', type=float, default=None, metavar='W',
                         help='subgoal in a random lane up to W m left/right of the corridor '
                              "center (default: the policy's training setting; 0 = off)")
+    parser.add_argument('--lane-hold', type=float, nargs=2, default=None, metavar=('MIN', 'MAX'),
+                        help="seconds each random lane is held (default: the policy's setting)")
     parser.add_argument('--decision-layer', action='store_true',
                         help='steer the subgoal lane around pedestrians (cash_rl.decision; '
                              'needs a subgoal lookahead)')
@@ -191,18 +193,22 @@ def main():
     if args.map:
         use_map(args.map)
     elif args.policy not in POLICIES:
-        from cash_rl.train import model_map_yaml, model_subgoal_lookahead, model_subgoal_offset
+        from cash_rl.train import (model_lane_hold, model_map_yaml, model_subgoal_lookahead,
+                                   model_subgoal_offset)
         if model_map_yaml(args.policy):
             use_map(model_map_yaml(args.policy))
         if args.subgoal_lookahead is None:
             args.subgoal_lookahead = model_subgoal_lookahead(args.policy)
         if args.subgoal_offset is None:
             args.subgoal_offset = model_subgoal_offset(args.policy)
+        if args.lane_hold is None:
+            args.lane_hold = model_lane_hold(args.policy)
     env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                             pedestrians_yield=args.yielding_pedestrians,
                             encounter_prob=args.encounter_prob,
                             subgoal_lookahead=args.subgoal_lookahead,
-                            subgoal_offset=args.subgoal_offset or 0.0)
+                            subgoal_offset=args.subgoal_offset or 0.0,
+                            **({'lane_hold': tuple(args.lane_hold)} if args.lane_hold else {}))
     if args.goal == 'random':
         goals = [(None, None)] * args.episodes
     elif args.goal == 'all' and env.door_goals:

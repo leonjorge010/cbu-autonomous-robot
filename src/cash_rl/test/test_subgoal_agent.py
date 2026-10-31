@@ -3,7 +3,8 @@ import os
 
 from cash_rl import spec
 from cash_rl.raycast_env import HallwayRaycastEnv
-from cash_rl.subgoal_agent import DECISION_STEPS, N_OBS, SubgoalEnv, SubgoalLayer, task_reward
+from cash_rl.subgoal_agent import DECISION_STEPS, LOOKAHEAD, motion_lookahead, N_OBS
+from cash_rl.subgoal_agent import SubgoalEnv, SubgoalLayer, task_reward
 from gymnasium.utils.env_checker import check_env
 import numpy as np
 
@@ -71,3 +72,11 @@ def test_subgoal_layer_runs_a_saved_agent_over_a_motion_policy(tmp_path):
         if info['waiting']:
             assert abs(env.unwrapped._velocity[0]) <= 0.5
     assert len(offsets) >= 1
+
+
+def test_motion_lookahead_follows_the_motion_model(tmp_path):
+    with open(os.path.join(tmp_path, 'config.json'), 'w') as f:
+        json.dump({'args': {'algo': 'ppo', 'subgoal_lookahead': 1.5}}, f)
+    assert motion_lookahead(str(tmp_path / 'final_model.zip')) == 1.5
+    assert motion_lookahead('downhill') == LOOKAHEAD
+    assert SubgoalEnv().base.subgoal_lookahead == LOOKAHEAD
