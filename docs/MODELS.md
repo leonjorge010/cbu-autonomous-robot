@@ -3,15 +3,23 @@
 Every navigation policy trained so far: what task each one learned, how it was trained, and how it
 scored. The sections from the Summary through Collision analysis cover the hallway models and were
 measured on 2026-10-15. Each model was evaluated with the code it was trained on, so each row is
-scored on its own task. [Subgoal lanes and the subgoal agent](#subgoal-lanes-and-the-subgoal-agent)
-covers the hierarchical models on the TEGR floor (2026-10-30/31).
+scored on its own task. [TEGR floor and pedestrians](#tegr-floor-and-pedestrians) (2026-10-23/30)
+and [Subgoal lanes and the subgoal agent](#subgoal-lanes-and-the-subgoal-agent) (2026-10-30/31)
+cover the later models.
 
-**Current recommendation: `ppo_d800_prox`** (seed 0, best checkpoint). It matches the code on `main`
-(real LiDAR model, slow reverse, near-wall cost, proximity penalty). Of the five seed-0 models it
-ties for the best success and collision rates, while reversing 8% of the time instead of 51%. Over
-three training seeds the same setup averages **93.4% success and 4.2% collisions** (see
-[Seed variation](#seed-variation)). Download it from the
-[`models-2026-10-15` release](https://github.com/leonjorge010/cbu-autonomous-robot/releases/tag/models-2026-10-15).
+**Where things stand (2026-10-31)**
+- **Hallway, no pedestrians: `ppo_d800_prox`** (seed 0, best checkpoint), the latest released model
+  ([`models-2026-10-15`](https://github.com/leonjorge010/cbu-autonomous-robot/releases/tag/models-2026-10-15)).
+  Over three seeds its setup averages **93.4% success and 4.2% collisions** (see
+  [Seed variation](#seed-variation)). It predates scan stacking (it sees 1 scan, 41 values);
+  current code still runs it through `train.load_model`, which feeds it only the newest scan.
+- **TEGR floor with a pedestrian, learned end to end: `tegr_dagger_sg3`** (3 seeds) behind the
+  safety layer: **94.7%** without pedestrians, **73.3%** on the encounter test. See
+  [TEGR floor and pedestrians](#tegr-floor-and-pedestrians).
+- **Hierarchy:** the rule-based decision layer over `downhill` reaches 91% on the encounter test
+  and the learned subgoal agent 73.5%, but `downhill` reads the map and isn't deployable, and the
+  PPO motion agents don't follow lanes yet. See
+  [Subgoal lanes and the subgoal agent](#subgoal-lanes-and-the-subgoal-agent).
 
 ## Summary
 
@@ -215,6 +223,66 @@ Where the 2D collisions happen on the 200-goal test:
 - **The water fountain** sticks out into the corridor and now causes as many hits as the corners.
   Training with random obstacles, the next planned step, should help with it.
 
+## TEGR floor and pedestrians
+
+Measured 2026-10-23 to 10-30 on `cbu_floor2` (the real TEGR 2nd floor; unseen by hallway models).
+200 held-out goals 1–15 m away, final checkpoints; three-seed rows give the mean and each seed.
+
+**What changed from the hallway models**
+- **Observation (113 values):** the last 3 scans (0.1 s apart, so moving things show up), goal,
+  previous action. With `--subgoal-lookahead 3` the "goal" is a point 3 m ahead on the route
+  (the real goal only within 3 m); reward and success still use the real goal.
+- **Pedestrians:** 0.25 m discs walking the corridor at 0.5–0.9 m/s that don't yield; hitting one
+  costs −40, and the robot pays for being close to one or standing in its path.
+- **Encounter test:** one pedestrian starts on the robot's route walking toward it, every episode.
+- **DAgger** (`dagger`): a student network copies `scripted.avoider`, a controller that reads the
+  pedestrians' true positions and future paths, on the states the student itself visits.
+  20 rounds × 60k labelled steps, 1 pedestrian, 70% encounter episodes.
+
+**Hallway → TEGR without retraining** (hallway PPO, 1.5M steps, `ppo_d800_prox` settings, 3 seeds):
+
+| Model | Hallway | TEGR | TEGR timeouts |
+|---|---|---|---|
+| `ppo_nosg` (no subgoal) | 92.8% (94.0/91.5/93.0) | 56.8% (57.0/54.5/59.0) | 37.8% |
+| `ppo_sg3` (3 m subgoal) | 93.0% (95.5/88.0/95.5) | **72.5%** (73.0/65.0/79.5) | 16.5% |
+
+The subgoal costs nothing on the training map and adds 15.7 points on the unseen floor, mostly by
+halving the timeouts.
+
+**Trained on TEGR, no pedestrians**
+
+| Model | Success | Notes |
+|---|---|---|
+| `tegr_ppo` (PPO 3M, 3 seeds) | 84.3% (86.5/79.5/87.0) | failures mostly wall collisions (10–14%) |
+| `tegr_dagger_r20` (DAgger, no subgoal) | 87.2% (84.5/88.0/89.0) | |
+| `tegr_dagger_sg3` (DAgger, 3 m subgoal) | 88.7% (88.5/88.0/89.5) | collisions 10.5–12% |
+| `tegr_dagger_sg3` + safety layer | **94.7%** (93.5/95.5/95.0) | collisions 0.5–1.5%, timeouts 4–5% |
+| `tegr_ppo_lane_s0` (PPO, 3 m subgoal + lanes, 1 seed) | 94.0% | see the next section |
+| `downhill` (scripted, reads the map) | 100% | |
+
+**Encounter test, 1 pedestrian**
+
+| Model | Success |
+|---|---|
+| `tegr_ppo` (trained without pedestrians) | 42.0% |
+| `downhill` (ignores pedestrians) | 50.5% |
+| `tegr_ppo_p1` (PPO with 1 pedestrian, 1 seed) | 52.0% |
+| `tegr_dagger_p1` (DAgger, 10 rounds, 1 seed) | 61.5% |
+| `tegr_dagger_r20` (20 rounds, no subgoal) | 64.8% (63.0/65.0/66.5) |
+| `tegr_dagger_sg3` (20 rounds, 3 m subgoal) | 68.8% (66.5/69.0/71.0) |
+| `tegr_dagger_sg3` + safety layer | **73.3%** (72.5/75.0/72.5) |
+| `scripted.avoider` (teacher, reads pedestrians) | 89.0% |
+
+- **PPO alone barely learns to avoid** (52%, 21% of steps reversing); copying the avoider works
+  better. Every DAgger model beats `downhill` by 14–20 points.
+- **The subgoal helps the student:** every `sg3` seed beats its no-subgoal partner (+2.5 to +4.5).
+- **DAgger has plateaued** at ~round 10 (per-round eval wanders 57–70% after). The student averages
+  the teacher's hard left and right swerves into going straight (5% hard-swerve steps vs the
+  teacher's 43%), so the gap to the teacher won't close with more rounds. This is what the
+  decision layers in the next section address: pick the side, then follow it.
+- **4 pedestrians, encounter test** (trained with 1): `tegr_dagger_sg3` 63.7% (62.5/61.0/67.5),
+  `downhill` 47.0%, avoider 87.5%.
+
 ## Subgoal lanes and the subgoal agent
 
 Measured 2026-10-30/31 on `cbu_floor2` (the real TEGR 2nd floor, ~140 m of corridor), one seed
@@ -303,6 +371,9 @@ every setting.
 | `ppo_d800` | `14351b5` | same as `ppo_junction` |
 | `ppo_d800_wallcost` | `b333324` to `4081d99` | same as `ppo_junction` |
 | `ppo_d800_prox` | `5f4369e` or later | same as `ppo_junction` |
+| `ppo_sg3_s{0,1,2}` | `b4b6dd7` or later | `ros2 run cash_rl train --name ppo_sg3_s0 --timesteps 1500000 --goal-distance-range 1 25 --junction-prob 0.3 --eval-random 20 --subgoal-lookahead 3 --seed 0` (`ppo_nosg`: same without `--subgoal-lookahead`) |
+| `tegr_ppo` (+ `_s1`, `_s2`) | `14b094d` or later | `ros2 run cash_rl train --name tegr_ppo --map cbu_floor2 --goal-distance-range 1 25 --eval-random 40` |
+| `tegr_dagger_sg3_s{0,1,2}` | `b4b6dd7` or later | `ros2 run cash_rl dagger --name tegr_dagger_sg3_s0 --map cbu_floor2 --pedestrians 1 --encounter-prob 0.7 --rounds 20 --subgoal-lookahead 3 --seed 0` (`tegr_dagger_r20`: same without `--subgoal-lookahead`) |
 | `tegr_ppo_lane_s0` | `134f9fb` | `ros2 run cash_rl train --name tegr_ppo_lane_s0 --map cbu_floor2 --goal-distance-range 1 25 --eval-random 40 --subgoal-lookahead 3 --subgoal-offset 0.6 --seed 0` |
 | `tegr_ppo_lane_w2_s0` | `b324cff` or later | same as `tegr_ppo_lane_s0` |
 | `tegr_subgoal_w2_s0` | `d8ba369` or later | `ros2 run cash_rl train_subgoal --motion runs/tegr_ppo_lane_w2_s0/final_model.zip --map cbu_floor2 --pedestrians 1 --encounter-prob 0.7 --seed 0` |

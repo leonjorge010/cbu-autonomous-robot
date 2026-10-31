@@ -31,25 +31,39 @@ Stack: Ubuntu 24.04 · ROS 2 Jazzy · Gazebo Harmonic · Stable-Baselines3 (PyTo
 
 | | |
 |---|---|
-| Observation (41 numbers) | 36 LiDAR distances (every 10°), distance and direction to the goal, last action |
+| Observation (113 numbers) | 36 LiDAR distances (every 10°) from each of the last 3 scans, distance and direction to the goal (or to a subgoal 3 m ahead on the route), last action |
 | Action | forward speed (up to 0.5 m/s; reverse only 0.15 m/s) and turn rate (up to 1 rad/s) |
-| Reward | + progress toward the goal measured *around* walls (with extra cost near walls), − small time penalty, +10 for reaching the goal, −20 for a collision |
+| Reward | + progress toward the goal measured *around* walls (with extra cost near walls), − small time penalty, +10 for reaching the goal, −20 for a collision (−40 for hitting a pedestrian, plus penalties for crowding one) |
 | Success | within 0.3 m of the goal |
 | Evaluation | every 100k steps: all 7 doors from the spawn point + 20 fixed random start/goal pairs |
 
 **Results so far.** The full comparison, with every training parameter and learning curves, is in
 [docs/MODELS.md](docs/MODELS.md).
 
-| Model | Sensor model | Goals reached (200 unseen) | Collisions | Time spent reversing |
+Hallway, no pedestrians (200 unseen goals):
+
+| Model | Sensor model | Goals reached | Collisions | Time spent reversing |
 |---|---|---|---|---|
 | `ppo_junction` | ideal LiDAR, fast reverse | 96% | 3% | 51% |
-| `ppo_d800_prox` (current, mean of 3 seeds) | real STL-27L LiDAR, slow reverse, keeps clear of walls | 93% ± 3% | 4% ± 2% | 10% |
+| `ppo_d800_prox` (released, mean of 3 seeds) | real STL-27L LiDAR, slow reverse, keeps clear of walls | 93% ± 3% | 4% ± 2% | 10% |
 
 With the LiDAR safety layer (`cash_rl/safety.py`, `evaluate --safety`) in front of the policy,
-collisions drop to 0.7% on average, with no loss in success. All models reach all 7 doors. The released seed of the current model scored 96.5% / 3%. The current
-model uses the realistic sensor and rarely reverses. Remaining collisions are mostly at the water fountain and from
-awkward start poses. Next: Gazebo check of the new models, then random obstacles, then pedestrians,
-then a layout it has never seen.
+collisions drop to 0.7% on average, with no loss in success. All models reach all 7 doors.
+
+Real TEGR 2nd floor (`cbu_floor2`, 200 unseen goals). The encounter test sends one pedestrian
+down the robot's route toward it every episode:
+
+| Model | No pedestrians | Encounter test |
+|---|---|---|
+| Hallway model, never trained on TEGR (subgoal 3 m ahead, 3 seeds) | 72.5% (57% without the subgoal) | — |
+| `tegr_ppo` (PPO, 3 seeds) | 84% | 42% |
+| `tegr_dagger_sg3` + safety layer (copies a scripted avoider, 3 seeds) | **95%** | **73%** |
+| `tegr_ppo_lane_s0` (PPO following subgoal lanes, 1 seed) | 94% | 48% |
+| Scripted lane follower + rule-based decision layer (reads the map and pedestrians) | 100% | 91% |
+| Scripted lane follower + learned subgoal agent (LiDAR only) | — | 73.5% |
+
+Next: retrain the motion agent so it actually follows the lanes the decision layer picks (1.5 m
+subgoal, lanes held 8–15 s), then put the decision layers on top of it.
 
 ## Setup (once per computer)
 
