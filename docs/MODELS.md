@@ -1,8 +1,10 @@
 # Model comparison
 
 Every navigation policy trained so far: what task each one learned, how it was trained, and how it
-scored. All numbers below were measured on 2026-10-15. Each model was evaluated with the code it
-was trained on, so each row is scored on its own task.
+scored. The sections from the Summary through Collision analysis cover the hallway models and were
+measured on 2026-10-15. Each model was evaluated with the code it was trained on, so each row is
+scored on its own task. [Subgoal lanes and the subgoal agent](#subgoal-lanes-and-the-subgoal-agent)
+covers the hierarchical models on the TEGR floor (2026-10-30/31).
 
 **Current recommendation: `ppo_d800_prox`** (seed 0, best checkpoint). It matches the code on `main`
 (real LiDAR model, slow reverse, near-wall cost, proximity penalty). Of the five seed-0 models it
@@ -213,6 +215,71 @@ Where the 2D collisions happen on the 200-goal test:
 - **The water fountain** sticks out into the corridor and now causes as many hits as the corners.
   Training with random obstacles, the next planned step, should help with it.
 
+## Subgoal lanes and the subgoal agent
+
+Measured 2026-10-30/31 on `cbu_floor2` (the real TEGR 2nd floor, ~140 m of corridor), one seed
+each. These models use the current observation (113 values: the last 3 scans plus the goal and
+previous action), so they aren't comparable to the hallway rows above.
+
+**The hierarchy.** A planner puts the motion agent's goal on the route 3 m ahead (the *subgoal*;
+the real goal only within 3 m). A decision layer moves that subgoal sideways into a *lane* (up to
+±1 m from the corridor center) to steer around pedestrians. The motion agent is paid to follow
+the lane: −2.0 per step per meter it sits more than 0.1 m off it (0.5 for `tegr_ppo_lane_s0`),
+waived in turns, junctions, open areas and the last 3 m, so following a lane away from the goal
+costs only time.
+
+### Motion agents
+
+PPO, same hyperparameters as above (113 → 256 → 256), 3M steps, goals 1–25 m, subgoal 3 m ahead,
+random lanes up to ±0.6 m redrawn every 2–6 s, no pedestrians. 200 held-out goals; `lane` is the
+mean sideways distance (m) from the lane on charged steps.
+
+| Model | Lane penalty | Random lanes | Lane +0.5: success / `lane` | Center | Lane −0.5 |
+|---|---|---|---|---|---|
+| `tegr_ppo` (no subgoal, 3 seeds) | — | 84.3% | — | — | — |
+| `tegr_ppo_lane_s0` | 0.5 | **94.0%** | 93.0% / 0.41 | 93.0% / 0.23 | 90.5% / 0.37 |
+| `tegr_ppo_lane_w2_s0` | 2.0 | 93.5% | 93.5% / 0.49 | 91.5% / 0.25 | 90.0% / 0.26 |
+| `downhill` (scripted, reads the map) | — | — | 100% / 0.16 | 100% / 0.13 | 100% / 0.15 |
+
+- **Following a subgoal 3 m ahead helps goal-reaching:** 84% → 94% on TEGR.
+- **Neither PPO model really follows lanes.** With the lane pinned at +0.5 / 0 / −0.5 m,
+  `tegr_ppo_lane_w2_s0` drives at +0.09 / −0.07 / −0.22 m from center: about 30% of the shift.
+  Quadrupling the penalty changed nothing.
+- **Why:** not the reward (following costs `downhill` nothing else, and is worth +21 per episode)
+  and not training length (checkpoints from 500k to 3M steps follow equally little). A 0.5 m lane
+  shift moves a point 3 m ahead by only ~9°, closing the gap takes ~6 s of driving, and lanes
+  change every 2–6 s; the policy steers about twice as hard from its LiDAR position (back to the
+  center) as from the subgoal. A controller that only steers at the observed subgoal follows no
+  better (0.36 m). The same controller gets 0.20 m (= `downhill`) with a 1.5 m lookahead and lanes
+  held 8–15 s, so `tegr_ppo_la15_s0` is being trained with those settings (`--subgoal-lookahead
+  1.5 --lane-hold 8 15`).
+
+### Decision layers
+
+**Rule-based layer** (`cash_rl/decision.py`): when a pedestrian ahead is closing, put the lane
+0.8 m beside their line on the side with more room. Reads the true pedestrian positions.
+**Learned subgoal agent** (`cash_rl/subgoal_agent.py`): PPO, picks a lane (±1 m) and whether to
+wait every 0.5 s from LiDAR only (3 scans 0.5 s apart, subgoal, goal, lane room, velocity), no
+pedestrian positions. Trained 1M decisions (~105 min) over a frozen motion agent, 1 pedestrian,
+70% of episodes start with one walking toward the robot.
+
+Encounter test: 1 pedestrian walking toward the robot along its route, 200 held-out goals.
+
+| Motion agent | Center lane | Rule-based layer | Learned subgoal agent |
+|---|---|---|---|
+| `downhill` | 53.0% | **91.0%** | **73.5%** (`tegr_subgoal_dh_s0`) |
+| `tegr_ppo_lane_s0` | 47.5% | 51.0% | — |
+| `tegr_ppo_lane_w2_s0` | 50.5% | 53.0% | 53.0% (`tegr_subgoal_w2_s0`) |
+| scripted avoider (reads pedestrians) | 89.0% | 94.0% | — |
+
+- **The hierarchy works when the motion agent follows its lane:** over `downhill` the rule-based
+  layer adds 38 points and the learned agent 20.
+- **Over the PPO motion agents neither layer helps,** because they barely move into the lane.
+- **The learned agent trails the rule-based layer by 17.5 points** over `downhill`. Part of that
+  is information: it sees only LiDAR. Its periodic eval was flat at ~70% at the end of training.
+- **It doesn't cost goal-reaching:** without pedestrians, `tegr_ppo_lane_w2_s0` +
+  `tegr_subgoal_w2_s0` reaches 94.5%.
+
 ## Caveats
 
 - **Only `ppo_d800_prox` has multiple seeds.** It spreads ±2.8% in success and ±1.6% in
@@ -221,8 +288,8 @@ Where the 2D collisions happen on the 200-goal test:
 - **Gazebo covers only the 7 doors from spawn.** Random start poses aren't supported there yet.
 - **The proximity penalty in Gazebo** measures distance from the scan, while 2D uses the map. They
   agree to about one map cell (5 cm), and the policy never sees the penalty at run time.
-- **Every model trained on one hallway map** with no people or moving obstacles. These numbers
-  don't show how a policy handles a new building.
+- **The hallway models trained on one map** with no people or moving obstacles. The TEGR lane and
+  subgoal-agent models are single seeds; the encounter tests use one pedestrian.
 
 ## Reproducing
 
@@ -236,9 +303,15 @@ every setting.
 | `ppo_d800` | `14351b5` | same as `ppo_junction` |
 | `ppo_d800_wallcost` | `b333324` to `4081d99` | same as `ppo_junction` |
 | `ppo_d800_prox` | `5f4369e` or later | same as `ppo_junction` |
+| `tegr_ppo_lane_s0` | `134f9fb` | `ros2 run cash_rl train --name tegr_ppo_lane_s0 --map cbu_floor2 --goal-distance-range 1 25 --eval-random 40 --subgoal-lookahead 3 --subgoal-offset 0.6 --seed 0` |
+| `tegr_ppo_lane_w2_s0` | `b324cff` or later | same as `tegr_ppo_lane_s0` |
+| `tegr_subgoal_w2_s0` | `d8ba369` or later | `ros2 run cash_rl train_subgoal --motion runs/tegr_ppo_lane_w2_s0/final_model.zip --map cbu_floor2 --pedestrians 1 --encounter-prob 0.7 --seed 0` |
+| `tegr_subgoal_dh_s0` | `d8ba369` or later | same with `--motion downhill` |
 
 Evaluate any model with
-`ros2 run cash_rl evaluate runs/<name>/best_model.zip --random 200`. Run the old models' code
+`ros2 run cash_rl evaluate runs/<name>/best_model.zip --random 200` (TEGR models: the map and
+subgoal settings come from `config.json`; pin a lane with `--lane-offset 0.5`, run the encounter
+test with `--pedestrians 1 --encounter-prob 1`, add `--decision-layer` or `--subgoal-agent ZIP`). Run the old models' code
 (`git checkout 5cb4ade`) to score them on their own task. On current code they score worse,
 because they rely on fast reverse. All D800 models share the same observation and action, so they
 run unchanged on current code. Only their training reward differed.
