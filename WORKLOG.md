@@ -30,7 +30,8 @@ inputs = LiDAR only. Built in a worktree and merged after `queue_later.txt` fini
 
 Raising the penalty kept goal-reaching but did not fix lane following.
 
-**Why PPO won't follow lanes** (diagnostic scripts, no code changed):
+**Why PPO won't follow lanes** (`src/cash_rl/tools/lane_diagnostics.py`: `pinned`, `sensitivity`,
+`tug`, `rewards`, `pursuit`):
 - Not the penalty's size: on the +0.5 lane w2 pays ~32 lane penalty per episode vs ~7 for
   `downhill`, and still drives at +0.09 m from center (+0.5 / 0 / −0.5 lane → +0.09 / −0.07 /
   −0.22 m, ~30% of the shift).

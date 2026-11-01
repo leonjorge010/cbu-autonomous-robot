@@ -319,7 +319,7 @@ mean sideways distance (m) from the lane on charged steps.
   change every 2–6 s; the policy steers about twice as hard from its LiDAR position (back to the
   center) as from the subgoal. A controller that only steers at the observed subgoal follows no
   better (0.36 m). The same controller gets 0.20 m (= `downhill`) with a 1.5 m lookahead and lanes
-  held 8–15 s, so `tegr_ppo_la15_s0` is being trained with those settings (`--subgoal-lookahead
+  held 8–15 s (`src/cash_rl/tools/lane_diagnostics.py` reproduces each check), so `tegr_ppo_la15_s0` is being trained with those settings (`--subgoal-lookahead
   1.5 --lane-hold 8 15`).
 
 ### Decision layers
