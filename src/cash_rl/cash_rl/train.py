@@ -263,6 +263,13 @@ def main():
                         metavar=('MIN', 'MAX'),
                         help='seconds each random lane is held before a new one is drawn '
                              '(default %(default)s)')
+    parser.add_argument('--decision-layer-prob', type=float, default=0.0, metavar='P',
+                        help='share of training episodes whose lane the rule-based decision '
+                             'layer (decision.DecisionLayer) picks around pedestrians; the rest '
+                             'keep the --subgoal-offset random lanes (needs --subgoal-lookahead)')
+    parser.add_argument('--init', metavar='ZIP',
+                        help='start from this model zip (fine-tune) instead of a fresh policy; '
+                             'its hyperparameters are kept (--lr-schedule/--ent-coef ignored)')
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--ent-coef', type=float, default=None,
@@ -274,6 +281,8 @@ def main():
     args = parser.parse_args()
     if args.subgoal_offset and not args.subgoal_lookahead:
         parser.error('--subgoal-offset needs --subgoal-lookahead')
+    if args.decision_layer_prob and not args.subgoal_lookahead:
+        parser.error('--decision-layer-prob needs --subgoal-lookahead')
 
     # Set before any env exists, so SubprocVecEnv workers load the same map.
     map_yaml = use_map(args.map) if args.map else os.path.abspath(default_map_yaml())
@@ -304,8 +313,13 @@ def main():
                   'subgoal_lookahead': args.subgoal_lookahead,
                   'subgoal_offset': args.subgoal_offset,
                   'lane_hold': tuple(args.lane_hold)}
+    wrapper = {}
+    if args.decision_layer_prob:
+        from cash_rl.decision import DecisionLayer
+        wrapper = {'wrapper_class': DecisionLayer,
+                   'wrapper_kwargs': {'prob': args.decision_layer_prob}}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
-                             env_kwargs=env_kwargs,
+                             env_kwargs=env_kwargs, **wrapper,
                              vec_env_cls=vec_cls,
                              monitor_kwargs={'info_keywords': ('is_success',)})
     # Eval always uses the default goal range, so every run is scored on the same
@@ -324,8 +338,13 @@ def main():
         initial_lr = kwargs.get('learning_rate', 3e-4)
         # SB3 passes progress_remaining, which goes from 1 to 0 over training.
         model_kwargs['learning_rate'] = lambda progress: initial_lr * progress
-    model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
-                             tensorboard_log=run_dir, **model_kwargs)
+    if args.init:
+        model = ALGOS[args.algo].load(os.path.expanduser(args.init), env=train_env,
+                                      device='cpu', tensorboard_log=run_dir)
+        model.set_random_seed(args.seed)
+    else:
+        model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
+                                 tensorboard_log=run_dir, **model_kwargs)
     callbacks = [
         GoalEvalCallback(eval_env, args.eval_random, args.eval_freq, run_dir),
         CheckpointCallback(save_freq=max(1, args.checkpoint_freq // n_envs),

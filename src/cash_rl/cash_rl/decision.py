@@ -119,13 +119,18 @@ class DecisionLayer(gym.Wrapper):
     lane_offset after every reset and step, rebuilding the observation so the
     policy acts on the new lane. info['decision_offset'] is the requested offset
     (info['lane_offset'] what the corridor allowed). Needs subgoal_lookahead.
+    prob < 1 (for training) runs it only in that share of episodes, drawn per reset;
+    the others pass through untouched (the env's own lanes, random if subgoal_offset).
     """
 
-    def __init__(self, env, decider=None):
+    def __init__(self, env, decider=None, prob=1.0):
         super().__init__(env)
         if not env.unwrapped.subgoal_lookahead:
             raise ValueError('the decision layer needs subgoal_lookahead')
         self.decider = decider or PedestrianLaneDecider()
+        self.prob = prob
+        self.active = True
+        self._rng = np.random.default_rng()
 
     def _decide(self, info):
         base = self.env.unwrapped
@@ -138,6 +143,11 @@ class DecisionLayer(gym.Wrapper):
         return obs, info
 
     def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self.active = self.prob >= 1 or self._rng.random() < self.prob
+        if not self.active:
+            return self.env.reset(seed=seed, options=options)
         self.decider.reset()
         options = dict(options or {}, lane_offset=0.0)
         _, info = self.env.reset(seed=seed, options=options)
@@ -145,7 +155,7 @@ class DecisionLayer(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        if not (terminated or truncated):
+        if self.active and not (terminated or truncated):
             obs, info = self._decide(info)
         return obs, reward, terminated, truncated, info
 

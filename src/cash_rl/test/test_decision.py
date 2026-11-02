@@ -64,3 +64,21 @@ def test_lane_returns_to_center_once_the_pedestrian_is_behind():
 def test_decision_layer_needs_subgoals():
     with pytest.raises(ValueError):
         DecisionLayer(HallwayRaycastEnv())
+
+
+def test_decision_layer_prob_runs_it_in_that_share_of_episodes():
+    env = DecisionLayer(HallwayRaycastEnv(subgoal_lookahead=3.0, subgoal_offset=0.6,
+                                          range_noise=False), prob=0.5)
+    active = []
+    for episode in range(40):
+        _, info = env.reset(seed=episode)
+        active.append(env.active)
+        assert ('decision_offset' in info) == env.active
+        _, _, _, _, info = env.step(np.zeros(2))
+        assert ('decision_offset' in info) == env.active
+    assert 10 < sum(active) < 30
+    off = DecisionLayer(HallwayRaycastEnv(subgoal_lookahead=3.0, subgoal_offset=0.6,
+                                          range_noise=False), prob=0.0)
+    plain = HallwayRaycastEnv(subgoal_lookahead=3.0, subgoal_offset=0.6, range_noise=False)
+    obs, _ = off.reset(seed=3)
+    np.testing.assert_allclose(obs, plain.reset(seed=3)[0])  # random lanes untouched
