@@ -5,6 +5,8 @@
     ros2 run cash_rl view_env --goal all --save doors.gif
     ros2 run cash_rl view_env --policy ~/ros2_ws/runs/<run>/best_model.zip --goal all
     ros2 run cash_rl view_env --pedestrians 4
+    ros2 run cash_rl view_env --policy runs/<run>/final_model.zip --lane-offset -0.5 \
+        --held-out 8 42
 
 Shows the SLAM map to scale with the robot footprint (collision margin
 included), the 36 observed lidar beams, the goal tolerance circle, the path so
@@ -37,17 +39,21 @@ def load_trained_policy(path):
     return policy
 
 
-def run_episodes(env, policy, goals, seed, stepper=None):
+def run_episodes(env, policy, goals, seed, stepper=None, options=None, seeds=None):
     """Simulate episodes; return a list of per-step snapshots for playback.
 
     stepper (default env) is what reset/step are called on, e.g. a wrapper; the
-    snapshots read the unwrapped env.
+    snapshots read the unwrapped env. options are added to every reset (e.g.
+    lane_offset); seeds, if given, replaces seed + i per episode.
     """
     stepper = stepper or env
     frames = []
     for i, (goal_name, goal) in enumerate(goals):
-        options = {'spawn': env.spawn_pose, 'goal': goal} if goal is not None else None
-        _, info = stepper.reset(seed=seed + i, options=options)
+        reset_options = dict(options or {})
+        if goal is not None:
+            reset_options.update(spawn=env.spawn_pose, goal=goal)
+        _, info = stepper.reset(seed=seeds[i] if seeds else seed + i,
+                                options=reset_options or None)
         goal_name = goal_name or f'random ({info["goal"][0]:.1f}, {info["goal"][1]:.1f})'
         trail, total, step, outcome = [env.pose[:2].copy()], 0.0, 0, ''
         while True:
@@ -184,6 +190,11 @@ def main():
                              'needs a subgoal lookahead)')
     parser.add_argument('--subgoal-agent', metavar='ZIP',
                         help='a train_subgoal model sets the lane and when to wait instead')
+    parser.add_argument('--lane-offset', type=float, default=None, metavar='X',
+                        help='pin the subgoal lane X m left of center (as evaluate --lane-offset)')
+    parser.add_argument('--held-out', type=int, nargs='+', metavar='I',
+                        help="play evaluate --random's held-out episodes random_I (same seeds, "
+                             'so the same spawn/goal/outcome as the eval)')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
@@ -203,13 +214,24 @@ def main():
             args.subgoal_offset = model_subgoal_offset(args.policy)
         if args.lane_hold is None:
             args.lane_hold = model_lane_hold(args.policy)
+    if args.lane_offset is not None:
+        if args.decision_layer or args.subgoal_agent:
+            parser.error('--decision-layer/--subgoal-agent set the lane; drop --lane-offset')
+        if not args.subgoal_lookahead:
+            parser.error('--lane-offset needs a subgoal lookahead')
+        args.subgoal_offset = 0.0  # pinned instead of drawn, as in evaluate
     env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                             pedestrians_yield=args.yielding_pedestrians,
                             encounter_prob=args.encounter_prob,
                             subgoal_lookahead=args.subgoal_lookahead,
                             subgoal_offset=args.subgoal_offset or 0.0,
                             **({'lane_hold': tuple(args.lane_hold)} if args.lane_hold else {}))
-    if args.goal == 'random':
+    seeds = None
+    if args.held_out:
+        from cash_rl.evaluate import HELD_OUT_SEED_BASE
+        goals = [(f'random_{i}', None) for i in args.held_out]
+        seeds = [HELD_OUT_SEED_BASE + i for i in args.held_out]
+    elif args.goal == 'random':
         goals = [(None, None)] * args.episodes
     elif args.goal == 'all' and env.door_goals:
         goals = sorted(env.door_goals.items())
@@ -233,7 +255,9 @@ def main():
     elif args.decision_layer:
         from cash_rl.decision import DecisionLayer
         stepper = DecisionLayer(env)
-    frames = run_episodes(env, policy, goals, args.seed, stepper)
+    frames = run_episodes(env, policy, goals, args.seed, stepper,
+                          {'lane_offset': args.lane_offset}
+                          if args.lane_offset is not None else None, seeds)
 
     fig, ax = plt.subplots(figsize=(14, 6.4) if env.is_hallway else (11, 11))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.93, bottom=0.07)
