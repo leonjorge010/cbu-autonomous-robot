@@ -3,6 +3,76 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-11-02
+
+Covers 11-01 (from 14:43) through 07:04 on 11-02: two queues, `queue_lane_retrain.txt` and
+`queue_9h.txt`, all jobs OK.
+
+**Lane retrain works: `tegr_ppo_la15`** (subgoal 1.5 m ahead instead of 3 m, random lanes held
+8–15 s instead of 2–6 s, lane penalty 2.0; otherwise as `tegr_ppo_lane_w2_s0`). 200 held-out
+TEGR goals, 3 seeds (s0 / s1 / s2):
+
+| | s0 | s1 | s2 | mean | w2 (3 m) | `downhill` (1.5 m) |
+|---|---|---|---|---|---|---|
+| No pedestrians, random lanes | 96.0% | 97.0% | 98.5% | **97.2%** | 93.5% | — |
+| `lane` error, lane +0.5 / 0 / −0.5 (m) | .22/.17/.19 | .24/.18/.25 | .21/.15/.20 | **.22/.17/.21** | .49/.25/.26 | .15/.12/.14 |
+| Encounter, center lane | 49.0% | 52.5% | 50.5% | **50.7%** | 50.5% | 53% |
+| Encounter, rule-based layer | 72.5% | 64.0% | 70.5% | **69.0%** | 53.0% | 91% |
+| Encounter, learned subgoal agent | 65.5% | — | — | — | 53.0% | 73.5% |
+
+PPO now follows lanes (error close to `downhill`), so the upper half of the hierarchy finally
+helps: the rule-based layer adds +18 points (was +2.5). Learned subgoal agent over la15 s0
+(`tegr_subgoal_la15_s0`): 65.5% on encounters, 95.5% without pedestrians but return +33 vs +60
+and lane error 0.43 — it switches lanes with nobody in the way.
+
+**Right-lane collisions** (s0, lane −0.5: 9.5%): 17 of 19 hit the wall on the robot's right,
+clustered where walls jut out (4 at the same spot, ~(16, 12.8)), mostly where the lane penalty is
+waived (turns, junctions, last metres). Largely seed-specific: s1 / s2 right lane 4% / 1% (s1
+left lane 8.5%). Tools: `view_env --lane-offset X --held-out I...` replays evaluate's held-out
+episode `random_I` (`cae8cf3`); `src/cash_rl/tools/lane_collisions.py` lists which episodes
+collide (uncommitted).
+
+**What still fails is the pedestrian:** la15 s0 + rule-based layer, 55 encounter failures =
+51 pedestrian hits + 4 walls. la15 never trained with pedestrians.
+
+**Pedestrian fine-tune: `tegr_ppo_la15_ped_s0`** (new `train --init ZIP` and
+`--decision-layer-prob P`, `5e68926`; `DecisionLayer(prob=P)` runs the rule-based layer in that
+share of episodes, random lanes in the rest). From la15 s0, 3M steps, 1 pedestrian, encounter
+0.7, rule-based layer in 70% of episodes, la15's own hyperparameters (lr 3e-4). It got worse:
+
+| | la15 s0 | fine-tune final | checkpoints 250k / 500k / 1M |
+|---|---|---|---|
+| Encounter, rule-based layer | 72.5% | 66.5% | **77.5%** / 76.5% / 72.5% |
+| + safety layer | — | 68.0% | |
+| No pedestrians, random lanes | 96.0% | 92.5% | |
+| Lane −0.5 pinned | 90.5% | 86.0% | |
+| Learned subgoal agent on top (`tegr_subgoal_la15_ped_s0`), encounter | 65.5% | 59.0% | |
+
+Periodic eval fell steadily from 92.5% at step 0 to ~80%. Pedestrian training helps briefly
+(+5 by 250k) and then the full learning rate erodes what la15 knew — likely too large a step for
+fine-tuning, with the value head facing reward terms (pedestrian penalties) it never saw.
+Best pedestrian motion agent for now: `runs/tegr_ppo_la15_ped_s0/checkpoints/model_249996_steps.zip`.
+
+**Next steps**
+1. Redo the fine-tune gently: lr ~5e-5–1e-4 (new `train --learning-rate LR`, which also
+   overrides an `--init` model's rate), ~750k steps, checkpoints every 100–125k. Queued as
+   `runs/queue_gentle_ft.txt` (lr 1e-4 for 750k and 5e-5 for 1.5M, from la15 s0/s1/s2, every
+   checkpoint on the encounter test + rule-based layer and without pedestrians; plus the
+   unseen-hallway test from step 5). Rank checkpoints by the
+   encounter test with the rule-based layer — the periodic eval uses random pedestrian starts.
+   Optionally warm up the value head first (a few 100k steps with the policy frozen).
+2. If it beats ~77.5% / holds ~96% without pedestrians, repeat on la15 s1 and s2 for a 3-seed mean.
+3. Retrain the learned subgoal agent over the best motion agent, with a cost for changing lanes
+   when no pedestrian is near (it wanders: lane error 0.43 with nobody around).
+4. More pedestrians: keep training at 1 until encounters with a decision layer reach ~85%, then
+   fine-tune 1 → 2 → 4. Meanwhile add 4-pedestrian evals (rule-based layer) of the best model as a
+   baseline — not added to `queue_9h.txt` by choice.
+5. Unseen-environment test (proposal week 9): evaluate the TEGR models on the hallway map
+   (`--map hallway --random 200`), eval only.
+6. Optional: the right-lane wall clips — keep the lane `SAFE_CLEARANCE` from walls that jut out
+   ahead, not only at the cross-section at the robot.
+7. Update `docs/MODELS.md` and the README with la15 (3 seeds) and the fine-tune.
+
 ## 2026-10-31
 
 Covers the evening of 10-30 through 01:51 on 10-31.
