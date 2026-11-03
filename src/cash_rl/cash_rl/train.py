@@ -269,7 +269,11 @@ def main():
                              'keep the --subgoal-offset random lanes (needs --subgoal-lookahead)')
     parser.add_argument('--init', metavar='ZIP',
                         help='start from this model zip (fine-tune) instead of a fresh policy; '
-                             'its hyperparameters are kept (--lr-schedule/--ent-coef ignored)')
+                             'its hyperparameters are kept except --learning-rate/--lr-schedule '
+                             '(--ent-coef ignored)')
+    parser.add_argument('--learning-rate', type=float, default=None, metavar='LR',
+                        help='initial learning rate (default 3e-4 from algo_kwargs; with --init, '
+                             "the loaded model's unless this or --lr-schedule linear is given)")
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--ent-coef', type=float, default=None,
@@ -296,6 +300,8 @@ def main():
         if args.algo != 'ppo':
             parser.error('--ent-coef is PPO only')
         kwargs['ent_coef'] = args.ent_coef
+    if args.learning_rate is not None:
+        kwargs['learning_rate'] = args.learning_rate
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         json.dump({'args': vars(args), 'map_yaml': map_yaml, 'n_envs': n_envs,
                    'algo_kwargs': kwargs,
@@ -339,8 +345,13 @@ def main():
         # SB3 passes progress_remaining, which goes from 1 to 0 over training.
         model_kwargs['learning_rate'] = lambda progress: initial_lr * progress
     if args.init:
+        # load() applies these before building lr_schedule, and SB3 sets the optimizer's
+        # rate from lr_schedule on every update, so the override reaches training.
+        overrides = {}
+        if args.learning_rate is not None or args.lr_schedule == 'linear':
+            overrides['learning_rate'] = model_kwargs['learning_rate']
         model = ALGOS[args.algo].load(os.path.expanduser(args.init), env=train_env,
-                                      device='cpu', tensorboard_log=run_dir)
+                                      device='cpu', tensorboard_log=run_dir, **overrides)
         model.set_random_seed(args.seed)
     else:
         model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
