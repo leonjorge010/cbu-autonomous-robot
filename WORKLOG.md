@@ -3,6 +3,99 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-11-04
+
+Covers 11-02 evening through 11-04: two queues, `queue_gentle_ft.txt` (night of 11-02) and
+`queue_subgoal_rl.txt` (01:44–09:05 on 11-04), all jobs OK. Code: `train --learning-rate`
+(`e5a6e44`), `train_subgoal` exploration flags (`adf8bbf`), `tools/subgoal_diagnostics.py`
+(`d19a6a1`).
+
+**Gentle pedestrian fine-tune: the learning rate wasn't the bottleneck.** New
+`train --learning-rate LR` (also overrides an `--init` model's rate). From la15 s0/s1/s2, same
+setup as `tegr_ppo_la15_ped_s0` (1 pedestrian, encounter 0.7, rule-based layer in 70% of
+episodes): lr 1e-4 for 750k and lr 5e-5 for 1.5M, checkpoints every 125k. 200 held-out TEGR
+goals, 3-seed means:
+
+| | lr 1e-4 | lr 5e-5 | la15 (no fine-tune) |
+|---|---|---|---|
+| Encounter + rule-based layer, any checkpoint | 69.2–72.2% | 69.0–71.5% | 69.0% |
+| Encounter + rule-based layer, final | 70.0% | 73.0% | |
+| No pedestrians, any checkpoint | 96.8–98.2% | 96.5–98.2% | 97.2% |
+
+The fine-tunes no longer lose la15's skills, but they barely improve avoidance. The differences
+are noise: lr 5e-5 s0's final model and its 1.5M checkpoint, 96 steps apart, score 76.0% vs
+72.5%. The old 77.5% (lr 3e-4, 250k, one seed) was likely luck. Seed 1 is weakest throughout
+(62–71%). Periodic eval was flat (80–95%). Best motion agent for now:
+`runs/tegr_ppo_la15_ped_lr5e5_s0/final_model.zip` (76.0% with the rule-based layer on s0).
+
+**Unseen environment (proposal week 9).** TEGR-trained la15 on the hallway map, never trained
+there: no pedestrians 92.5 / 95.5 / 98.5% (mean **95.5%** vs 97.2% on TEGR); encounter +
+rule-based layer 73.0 / 59.0 / 65.5% (mean **65.8%** vs 69.0%; the hallway is only 2.4 m wide).
+`downhill` + rule-based layer on the hallway hasn't been run, so there's no baseline for it yet.
+
+**Why the learned subgoal agent loses to the rule-based layer.** Over la15 s0, 100 encounter
+episodes (`tools/subgoal_diagnostics.py`):
+
+| | Learned (`tegr_subgoal_la15_s0`) | Rule-based layer |
+|---|---|---|
+| Success / pedestrian hits / wall hits | 73 / 22 / 5 | 79 / 17 / 4 |
+| \|lane\| (m), nobody within 4 m / pedestrian within 4 m | 0.81 / 0.86 | 0.03 / 0.40 |
+| Lane movement per step (m), nobody near | 0.042 | 0.004 |
+| Share of steps waiting | 0.1% | — |
+| Robot's lane error in the 2 s before a pedestrian hit | 0.51 m | 0.48 m |
+
+It doesn't react: it holds ~0.8 m off center all the time, drifts, and never waits. Its periodic
+eval was flat from 50k to 1M decisions. The old `downhill` agent does the same (0.95 m). Under
+both layers the robot is ~0.5 m from its lane when hit, so la15's lane-change speed limits both.
+
+**Calmer exploration (pure RL): didn't fix it.** Default exploration jumps the lane 0.82 m per
+0.5 s decision and waits on 51% of decisions. New `train_subgoal` flags (defaults reproduce the
+first agents): `--log-std-init -1` (lane jump 0.41 m), `--wait-bias -0.75` (2% waits),
+`--lane-change-cost 1.0` (per m the lane moves), plus `--init`/`--learning-rate`/`--checkpoint-freq`.
+
+| 200 goals, TEGR | Encounter | No peds | \|lane\| far / near | Rule-based layer |
+|---|---|---|---|---|
+| `tegr_subgoal_rl_dh_s0` (over `downhill`, 1M) | 74.0% (best 75.5%) | 100% | 0.83 / 0.90 | 91% |
+| old `tegr_subgoal_dh_s0` | 73.5% | — | 0.95 / 1.00 | 91% |
+| `tegr_subgoal_rl_lr5e5_s0` (over lr5e5 s0, 1.5M) | 63.5% | 97.0% | 0.50 / 0.57 | 76.0% |
+| `tegr_subgoal_rl_lr5e5_s1` (same, seed 1) | 62.0% | 98.5% | 0.27 / 0.35 | 76.0% |
+
+The lane-change cost cut drift (0.042 → 0.015 m per step) and learning was slower but ended at
+the same level (`downhill` agent ~70% by 500k, then flat). The agents still hold a fixed offset
+whether or not someone is near, and still almost never wait.
+
+**Why it doesn't learn to react: driving to the side already avoids most simulated pedestrians.**
+Driving off center is fine in itself (the goal is no collisions, not a center lane). The problem
+is that it works only because of how our encounter pedestrians walk: they start within ±0.3 m of
+the route's center line (`ENCOUNTER_LATERAL`, `raycast_env.py`) and walk straight down it, so a
+robot ~0.8 m to one side passes many of them without reacting, and training never shows it the
+pedestrians that walk on its side. Real people walk anywhere, so an agent that never reacts
+would hit those. It also collides more than the rule-based layer even on the current test
+(26% vs 10% over `downhill`, 36–38% vs 24% over lr5e5 s0). Worth a paragraph in the report as
+the reward hacking the proposal named as a risk: the policy exploited a narrow training
+distribution instead of learning to avoid pedestrians.
+
+**Next steps**
+Goal for the subgoal agent: fewer collisions than the rule-based layer, with pedestrians
+anywhere in the hall. Where it drives (side or center) doesn't matter.
+1. Training-only pedestrian placement: spread encounter pedestrians across the corridor width,
+   and in some episodes start them on the robot's current side, so driving to one side no longer
+   avoids them on its own. Keep `ENCOUNTER_LATERAL` 0.3 for the encounter test so results stay
+   comparable.
+2. New "pedestrian on your side" test (collision rate is the metric): checks avoidance of
+   pedestrians that aren't walking down the middle. Expect the current agents to collide far
+   more there than the rule-based layer.
+3. Missing baseline: `tegr_ppo_la15_ped_lr5e5_s0` alone (center lane) on the encounter test, to
+   measure how much a subgoal agent adds.
+4. Retrain the subgoal agent with 1 over `downhill` (fast check), then over lr5e5 s0. Fallback
+   if it still collides more than the rule-based layer: pretrain it to copy the rule-based layer
+   (DAgger), then PPO.
+5. Motion side: measure la15's lane-change speed (time to settle after a 0.8 m lane jump vs
+   `downhill`). It limits every decision layer (~0.5 m off its lane when hit).
+6. `downhill` + rule-based layer on the hallway, as the unseen-test baseline.
+7. Update `docs/MODELS.md` and the README: la15 (3 seeds), the fine-tunes, the unseen test,
+   the subgoal agents.
+
 ## 2026-11-02
 
 Covers 11-01 (from 14:43) through 07:04 on 11-02: two queues, `queue_lane_retrain.txt` and
