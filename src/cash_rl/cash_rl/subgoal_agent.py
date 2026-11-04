@@ -22,7 +22,15 @@ and its previous action. No pedestrian positions.
 Its reward is the task reward summed over its control steps, without the
 motion agent's lane penalty (which only grades how well the motion agent
 follows the lane this agent chose): progress, goal, collisions (pedestrian
-hits cost double), pedestrian proximity and the pedestrian lane penalty.
+hits cost double), pedestrian proximity and the pedestrian lane penalty;
+optionally minus lane_change_cost per m the lane moves, so lane changes have to
+pay for themselves (the first agents drifted between lanes with nobody near).
+
+Exploration (train_subgoal): --log-std-init sets the starting action noise and
+--wait-bias the starting mean of the wait output. With the defaults (std 1, mean
+0) the lane jumps up to ±1 m at random every 0.5 s and half the decisions wait,
+so a dodge held for the 3-4 s before a meeting is almost never tried and waiting
+is learned away before it can pay; the first agents plateaued by 50k decisions.
 
 SubgoalEnv is the training env (one step = one decision). SubgoalLayer runs a
 trained agent on top of any motion policy for evaluate/view_env, like
@@ -148,8 +156,9 @@ class SubgoalEnv(gym.Env):
 
     metadata = {'render_modes': []}
 
-    def __init__(self, motion='downhill', **env_kwargs):
+    def __init__(self, motion='downhill', lane_change_cost=0.0, **env_kwargs):
         super().__init__()
+        self.lane_change_cost = lane_change_cost
         env_kwargs = dict(env_kwargs, subgoal_lookahead=motion_lookahead(motion),
                           subgoal_offset=0.0)
         self.base = HallwayRaycastEnv(**env_kwargs)
@@ -172,9 +181,11 @@ class SubgoalEnv(gym.Env):
 
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        previous_lane = self.base.lane_offset
         wait = apply_decision(self.base, action)
         self._motion_obs = self.base.observation()  # same scans, subgoal in the new lane
-        total, terminated, truncated, info = 0.0, False, False, {}
+        total = -self.lane_change_cost * abs(self.base.lane_offset - previous_lane)
+        terminated, truncated, info = False, False, {}
         for _ in range(DECISION_STEPS):
             command = np.zeros(2) if wait else self.motion(self.base, self._motion_obs)
             self._motion_obs, reward, terminated, truncated, info = self.base.step(command)
@@ -247,6 +258,7 @@ def main():
     from stable_baselines3.common.callbacks import CheckpointCallback
     from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.vec_env import SubprocVecEnv
+    import torch
 
     parser = argparse.ArgumentParser(description='Train the subgoal agent with PPO.')
     parser.add_argument('--motion', required=True,
@@ -263,9 +275,27 @@ def main():
     parser.add_argument('--eval-freq', type=int, default=50_000)
     parser.add_argument('--n-envs', type=int, default=12)
     parser.add_argument('--map', help="map name in maps/ (e.g. 'cbu_floor2') or .yaml path")
+    parser.add_argument('--lane-change-cost', type=float, default=0.0, metavar='C',
+                        help='reward cost per m the chosen lane moves (default 0, as the '
+                             'first agents)')
+    parser.add_argument('--log-std-init', type=float, default=0.0,
+                        help='starting log std of the action noise (default 0: std 1, as the '
+                             'first agents; -1: std 0.37)')
+    parser.add_argument('--wait-bias', type=float, default=0.0,
+                        help='starting mean of the wait output (> 0 waits); negative makes '
+                             'waiting a rare action to try (default 0: half the decisions)')
+    parser.add_argument('--init', metavar='ZIP',
+                        help='continue from this subgoal agent zip (same --motion); its '
+                             'hyperparameters are kept except --learning-rate')
+    parser.add_argument('--learning-rate', type=float, default=None, metavar='LR',
+                        help='learning rate (default 3e-4 from algo_kwargs; with --init, the '
+                             "loaded model's unless given)")
+    parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--name', help='run name (default: subgoal_<timestamp>)')
     args = parser.parse_args()
+    if args.init and (args.log_std_init or args.wait_bias):
+        parser.error('--log-std-init/--wait-bias set a fresh policy; --init keeps the loaded one')
 
     map_yaml = use_map(args.map) if args.map else os.path.abspath(default_map_yaml())
     motion = args.motion if args.motion == 'downhill' else os.path.abspath(args.motion)
@@ -273,6 +303,9 @@ def main():
     run_dir = os.path.join(runs_dir(), name)
     os.makedirs(run_dir, exist_ok=False)
     kwargs = algo_kwargs('ppo', args.n_envs)
+    kwargs['policy_kwargs'] = dict(kwargs['policy_kwargs'], log_std_init=args.log_std_init)
+    if args.learning_rate is not None:
+        kwargs['learning_rate'] = args.learning_rate
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         # algo 'ppo' so train.load_model loads it; subgoal_agent marks what it is.
         json.dump({'args': dict(vars(args), algo='ppo', motion=motion,
@@ -285,18 +318,30 @@ def main():
                   f, indent=2, default=str)
 
     env_kwargs = {'motion': motion, 'goal_distance_range': tuple(args.goal_distance_range),
-                  'n_pedestrians': args.pedestrians, 'encounter_prob': args.encounter_prob}
+                  'n_pedestrians': args.pedestrians, 'encounter_prob': args.encounter_prob,
+                  'lane_change_cost': args.lane_change_cost}
     train_env = make_vec_env(SubgoalEnv, n_envs=args.n_envs, seed=args.seed,
                              env_kwargs=env_kwargs, vec_env_cls=SubprocVecEnv,
                              monitor_kwargs={'info_keywords': ('is_success',)})
     # Scored on the encounter test: what this agent is for.
-    eval_env = SubgoalEnv(motion=motion, n_pedestrians=args.pedestrians, encounter_prob=1.0)
-    model = PPO('MlpPolicy', train_env, seed=args.seed, verbose=0, tensorboard_log=run_dir,
-                **kwargs)
+    eval_env = SubgoalEnv(motion=motion, n_pedestrians=args.pedestrians, encounter_prob=1.0,
+                          lane_change_cost=args.lane_change_cost)
+    if args.init:
+        overrides = {}
+        if args.learning_rate is not None:
+            overrides['learning_rate'] = args.learning_rate
+        model = PPO.load(os.path.expanduser(args.init), env=train_env, device='cpu',
+                         tensorboard_log=run_dir, **overrides)
+        model.set_random_seed(args.seed)
+    else:
+        model = PPO('MlpPolicy', train_env, seed=args.seed, verbose=0, tensorboard_log=run_dir,
+                    **kwargs)
+        with torch.no_grad():
+            model.policy.action_net.bias[1] = args.wait_bias
     callbacks = [
         GoalEvalCallback(eval_env, args.eval_random, args.eval_freq, run_dir),
-        CheckpointCallback(max(250_000 // args.n_envs, 1), os.path.join(run_dir, 'checkpoints'),
-                           name_prefix='subgoal'),
+        CheckpointCallback(max(args.checkpoint_freq // args.n_envs, 1),
+                           os.path.join(run_dir, 'checkpoints'), name_prefix='subgoal'),
     ]
     print(f'Training the subgoal agent for {args.timesteps:,} decisions with {args.n_envs} '
           f'envs on {os.path.basename(map_yaml)}, motion {os.path.basename(motion)}, '

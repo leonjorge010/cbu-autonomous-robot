@@ -80,3 +80,16 @@ def test_motion_lookahead_follows_the_motion_model(tmp_path):
     assert motion_lookahead(str(tmp_path / 'final_model.zip')) == 1.5
     assert motion_lookahead('downhill') == LOOKAHEAD
     assert SubgoalEnv().base.subgoal_lookahead == LOOKAHEAD
+
+
+def test_lane_change_cost_charges_each_metre_the_lane_moves():
+    pose = {'spawn': (8.0, 0.0, 0.0), 'goal': (20.0, 0.0)}
+    free, costly = SubgoalEnv(), SubgoalEnv(lane_change_cost=2.0)
+    for env in (free, costly):
+        env.reset(seed=0, options=pose)
+    rewards = []
+    for action in ([0.5, -1.0], [0.5, -1.0], [-0.25, -1.0]):  # move 0.5 m, hold, move 0.75 m
+        _, r_free, *_ = free.step(np.array(action, dtype=np.float32))
+        _, r_costly, *_ = costly.step(np.array(action, dtype=np.float32))
+        rewards.append(r_free - r_costly)
+    assert np.allclose(rewards, [1.0, 0.0, 1.5])
