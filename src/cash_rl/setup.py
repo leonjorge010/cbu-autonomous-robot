@@ -28,6 +28,8 @@ setup(
             'train = cash_rl.train:main',
             'evaluate = cash_rl.evaluate:main',
             'demo = cash_rl.demo:main',
+            'dagger = cash_rl.dagger:main',
+            'train_subgoal = cash_rl.subgoal_agent:main',
         ],
     },
 )

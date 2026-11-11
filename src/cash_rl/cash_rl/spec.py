@@ -56,12 +56,17 @@ CONTROL_PERIOD = 0.1
 EPISODE_TIME_FACTOR = 2.0
 EPISODE_TIME_SLACK = 10.0
 
-# Goal-reaching task. Observation = [N_OBS_BEAMS ranges / MAX_RANGE,
-# goal distance / MAX_GOAL_DISTANCE, cos(goal bearing), sin(goal bearing),
-# previous action (2)], with the goal in the robot's base_footprint frame.
+# Goal-reaching task. Observation = [the last N_SCAN_STACK scans' N_OBS_BEAMS
+# ranges / MAX_RANGE, newest first, goal distance / MAX_GOAL_DISTANCE,
+# cos(goal bearing), sin(goal bearing), previous action (2)], with the goal in
+# the robot's base_footprint frame. One scan per control step; the stack lets the
+# policy see obstacles move. On reset the first scan fills every slot.
 GOAL_TOLERANCE = 0.3
 MAX_GOAL_DISTANCE = 30.0
-N_OBS = N_OBS_BEAMS + 3 + 2
+N_SCAN_STACK = 3
+N_OBS = N_SCAN_STACK * N_OBS_BEAMS + 3 + 2
+# Observation size before scan stacking (one scan), for models trained then.
+SINGLE_SCAN_N_OBS = N_OBS_BEAMS + 3 + 2
 
 # Reward per step: PROGRESS_WEIGHT * (decrease in geodesic goal distance, m)
 # - TIME_PENALTY, plus GOAL_REWARD on reaching the goal or - COLLISION_PENALTY
@@ -84,10 +89,54 @@ COLLISION_PENALTY = 20.0
 # wall cost above shapes the route; this teaches holding it at speed near walls.
 PROXIMITY_DISTANCE = 0.30
 PROXIMITY_WEIGHT = 0.5
+# Pedestrians (HallwayRaycastEnv only). Within PEDESTRIAN_COMFORT_DISTANCE (gap
+# between the disc and the margin-inflated footprint) the robot pays up to
+# PEDESTRIAN_PROXIMITY_PENALTY per pedestrian per step, rising linearly from 0
+# at the edge of that zone to the full amount at contact. Hitting a pedestrian
+# costs PEDESTRIAN_COLLISION_PENALTY instead of COLLISION_PENALTY. Pedestrians
+# don't count toward the wall clearance above. A robot stopped (forward speed
+# below PEDESTRIAN_WAIT_SPEED) with a pedestrian inside the comfort zone is
+# waiting for it: it pays neither that penalty nor TIME_PENALTY, so stopping to
+# let someone pass costs nothing (being walked into still costs the collision).
+PEDESTRIAN_COMFORT_DISTANCE = 0.8
+PEDESTRIAN_WAIT_SPEED = 0.05
+# Lane penalty: pedestrians don't yield, and the proximity penalty above starts
+# under a second before contact, too late for the robot to turn and get clear.
+# So while the robot's footprint is in a pedestrian's walking lane and that
+# pedestrian would reach it within PEDESTRIAN_LANE_HORIZON (s, at their closing
+# speed), the robot pays up to PEDESTRIAN_LANE_PENALTY per pedestrian per step,
+# rising linearly from 0 at the horizon to the full amount at contact. Leaving
+# the lane ends it, so stepping aside early pays off. It applies while waiting
+# too: waiting beside the lane is free, waiting in it is not.
+PEDESTRIAN_LANE_HORIZON = 3.0
+PEDESTRIAN_LANE_PENALTY = 0.3
+PEDESTRIAN_PROXIMITY_PENALTY = 0.3
+PEDESTRIAN_COLLISION_PENALTY = 40.0
+# Subgoal lanes (HallwayRaycastEnv subgoal_offset / lane_offset only): the robot
+# pays SUBGOAL_LANE_WEIGHT per step per metre it sits sideways beyond
+# SUBGOAL_LANE_DEADBAND from the lane it was shown, so it is paid to follow the
+# subgoals, not just to reach the goal. Full-speed progress earns 0.5 per step;
+# 0.5 m off the lane costs 0.8, so cutting toward the goal never pays. 0.5 until
+# 2026-10-30 (tegr_ppo_lane_s0): too weak, it covered ~1/3 of a lane shift.
+SUBGOAL_LANE_DEADBAND = 0.1
+SUBGOAL_LANE_WEIGHT = 2.0
+
+# Fixed evaluation goals: the corridor centerline in front of each door in
+# cash_sim/worlds/hallway.sdf (world frame == map frame).
+DOOR_GOALS = {
+    'door_101': (4.0, 0.0),
+    'door_105': (7.0, 0.0),
+    'door_102': (9.0, 0.0),
+    'door_103': (20.0, 0.0),
+    'door_104': (24.0, 0.0),
+    'door_201': (14.0, 6.0),
+    'door_202': (14.0, 9.0),
+}
+SPAWN_POSE = (0.0, 0.0, 0.0)  # sim.launch.py's default x, y, yaw
 
 
 def observation_space():
-    low = np.concatenate([np.zeros(N_OBS_BEAMS), [0.0, -1.0, -1.0], [-1.0, -1.0]])
+    low = np.concatenate([np.zeros(N_SCAN_STACK * N_OBS_BEAMS), [0.0, -1.0, -1.0], [-1.0, -1.0]])
     high = np.ones(N_OBS)
     return gym.spaces.Box(low=low.astype(np.float32), high=high.astype(np.float32),
                           dtype=np.float32)
@@ -126,14 +175,38 @@ def goal_in_robot_frame(pose, goal):
     return float(np.hypot(dx, dy)), float(np.arctan2(dy, dx) - pose[2])
 
 
-def build_observation(obs_ranges, pose, goal, prev_action):
-    """Assemble the N_OBS observation from sanitized N_OBS_BEAMS ranges."""
+def new_scan_stack(obs_ranges):
+    """(N_SCAN_STACK, N_OBS_BEAMS) stack with every slot set to the first scan."""
+    return np.tile(np.asarray(obs_ranges, dtype=np.float32), (N_SCAN_STACK, 1))
+
+
+def push_scan(scan_stack, obs_ranges):
+    """Return scan_stack with obs_ranges as the newest (first) row, oldest dropped."""
+    return np.concatenate([np.asarray(obs_ranges, dtype=np.float32)[None], scan_stack[:-1]])
+
+
+def build_observation(scan_stack, pose, goal, prev_action):
+    """Assemble the N_OBS observation from a stack of sanitized ranges.
+
+    scan_stack is (N_SCAN_STACK, N_OBS_BEAMS), newest first (see new_scan_stack
+    and push_scan).
+    """
     distance, bearing = goal_in_robot_frame(pose, goal)
     return np.concatenate([
-        np.asarray(obs_ranges, dtype=np.float32) / MAX_RANGE,
+        np.asarray(scan_stack, dtype=np.float32).reshape(-1) / MAX_RANGE,
         [min(distance / MAX_GOAL_DISTANCE, 1.0), np.cos(bearing), np.sin(bearing)],
         np.clip(prev_action, -1.0, 1.0),
     ]).astype(np.float32)
+
+
+def single_scan_observation(obs):
+    """Cut an N_OBS observation down to SINGLE_SCAN_N_OBS (newest scan only).
+
+    For policies trained before scan stacking.
+    """
+    obs = np.asarray(obs)
+    return np.concatenate([obs[..., :N_OBS_BEAMS], obs[..., N_SCAN_STACK * N_OBS_BEAMS:]],
+                          axis=-1)
 
 
 def scan_hits_footprint(ranges, angles):
@@ -173,21 +246,64 @@ def episode_step_limit(goal_distance):
     return int(np.ceil(seconds / CONTROL_PERIOD))
 
 
+def pedestrian_proximity_penalty(pedestrian_gaps):
+    """Return the step's total penalty for pedestrians within the comfort zone.
+
+    pedestrian_gaps are distances (m) from each pedestrian's edge to the
+    margin-inflated footprint; negative (overlap) counts as contact.
+    """
+    gaps = np.asarray(pedestrian_gaps, dtype=np.float64)
+    closeness = np.clip(1.0 - gaps / PEDESTRIAN_COMFORT_DISTANCE, 0.0, 1.0)
+    return PEDESTRIAN_PROXIMITY_PENALTY * float(closeness.sum())
+
+
+def waiting_for_pedestrian(linear_speed, pedestrian_gaps):
+    """Return True if the robot is stopped with a pedestrian inside the comfort zone."""
+    return abs(linear_speed) < PEDESTRIAN_WAIT_SPEED \
+        and bool(np.any(np.asarray(pedestrian_gaps) < PEDESTRIAN_COMFORT_DISTANCE))
+
+
+def pedestrian_lane_penalty(lane_times):
+    """Return the step's total penalty for standing in pedestrians' lanes.
+
+    lane_times are the seconds until each pedestrian would reach the robot's
+    footprint walking its lane (inf if the robot isn't in that lane ahead of it).
+    """
+    times = np.asarray(lane_times, dtype=np.float64)
+    urgency = np.clip(1.0 - times / PEDESTRIAN_LANE_HORIZON, 0.0, 1.0)
+    return PEDESTRIAN_LANE_PENALTY * float(urgency.sum())
+
+
+def subgoal_lane_penalty(lane_error):
+    """Per-step penalty for a sideways distance (m) from the subgoal lane."""
+    return SUBGOAL_LANE_WEIGHT * max(0.0, abs(lane_error) - SUBGOAL_LANE_DEADBAND)
+
+
 def step_outcome(prev_goal_distance, goal_distance, pose, goal, collided,
-                 clearance=float('inf')):
+                 clearance=float('inf'), pedestrian_gaps=(), hit_pedestrian=False,
+                 waiting=False, pedestrian_lane_times=(), lane_error=0.0):
     """Return (reward, reached) for one step.
 
     goal_distance/prev_goal_distance are geodesic (around walls); NaN (pose off
     the traversable map) counts as no progress. Reaching is Euclidean, within
     GOAL_TOLERANCE, and doesn't count on a colliding step. clearance is the
     footprint's gap to the nearest obstacle (m), for the proximity penalty.
+    pedestrian_gaps adds the pedestrian proximity penalty; a collision with
+    hit_pedestrian set costs PEDESTRIAN_COLLISION_PENALTY instead of
+    COLLISION_PENALTY. waiting (waiting_for_pedestrian) drops TIME_PENALTY and
+    the pedestrian proximity penalty. pedestrian_lane_times adds the lane
+    penalty (pedestrian_lane_penalty), waiting or not. lane_error (m from the
+    subgoal lane) adds subgoal_lane_penalty.
     """
     progress = goal_distance - prev_goal_distance
     progress = 0.0 if not np.isfinite(progress) else -progress
     reached = (not collided) and goal_in_robot_frame(pose, goal)[0] < GOAL_TOLERANCE
-    reward = PROGRESS_WEIGHT * progress - TIME_PENALTY - proximity_penalty(clearance)
+    reward = PROGRESS_WEIGHT * progress - proximity_penalty(clearance) \
+        - pedestrian_lane_penalty(pedestrian_lane_times) - subgoal_lane_penalty(lane_error)
+    if not waiting:
+        reward -= TIME_PENALTY + pedestrian_proximity_penalty(pedestrian_gaps)
     if reached:
         reward += GOAL_REWARD
     if collided:
-        reward -= COLLISION_PENALTY
+        reward -= PEDESTRIAN_COLLISION_PENALTY if hit_pedestrian else COLLISION_PENALTY
     return reward, reached

@@ -1,15 +1,8 @@
-"""Occupancy map loading, keep-out zones, named goals and geodesic goal distances.
+"""SLAM occupancy map loading and geodesic (around-the-walls) goal distances.
 
 ROS-free, shared by HallwayRaycastEnv (raycasting, spawn sampling) and HallwayEnv
-(reward). The map frame is aligned with the Gazebo world frame.
-
-A map MAP.yaml (map_server format) may have two sidecar files next to it:
-  MAP_keepout.yaml  Nav2 keepout-filter mask on the same grid: occupied cells are
-                    open floor the robot must not enter (learning zones, stairs).
-  MAP_goals.yaml    spawn: [x, y, yaw], the default start pose (the world's spawn);
-                    goals: {name: [x, y] or [x, y, yaw]}, the named evaluation goals;
-                    branch_min_y: optional, for junction_prob (cells at or above it
-                    count as the side branch; hallway only).
+(reward). The map frame is aligned with the Gazebo world frame, since SLAM was
+started at the spawn pose.
 """
 import os
 
@@ -29,6 +22,67 @@ DEFAULT_MAP_RELPATH = os.path.join('maps', 'hallway.yaml')
 TRAVERSABLE_CLEARANCE = 0.25
 
 
+def resolve_map_yaml(name_or_path):
+    """Return the .yaml path for a map path or a name in <workspace>/maps, e.g. 'cbu_floor2'."""
+    if os.path.isfile(name_or_path):
+        return os.path.abspath(name_or_path)
+    maps_dir = os.path.dirname(default_map_yaml_in_workspace())
+    candidate = os.path.join(maps_dir, name_or_path + ('' if name_or_path.endswith('.yaml')
+                                                       else '.yaml'))
+    if os.path.isfile(candidate):
+        return candidate
+    raise FileNotFoundError(f'No map {name_or_path!r} (not a file, not in {maps_dir})')
+
+
+def is_hallway_map(yaml_path):
+    """Return True for maps/hallway.yaml, which spec.DOOR_GOALS and junctions assume."""
+    return os.path.basename(os.path.realpath(yaml_path)) == os.path.basename(DEFAULT_MAP_RELPATH)
+
+
+def keepout_yaml_for(yaml_path):
+    """Return the <name>_keepout.yaml next to a map (from build_floorplan_world.py), or None."""
+    stem, ext = os.path.splitext(yaml_path)
+    candidate = f'{stem}_keepout{ext}'
+    return candidate if os.path.isfile(candidate) else None
+
+
+def load_free_mask(yaml_path):
+    """Return (meta, free mask with row 0 at the bottom, raw pixels) of a map_server map."""
+    with open(yaml_path) as f:
+        meta = yaml.safe_load(f)
+    image_path = os.path.join(os.path.dirname(yaml_path), meta['image'])
+    pixels = np.array(Image.open(image_path).convert('L'), dtype=np.float32)
+    occupancy = pixels / 255.0 if meta.get('negate', 0) else (255.0 - pixels) / 255.0
+    # Flip so row 0 is the bottom (y = origin_y) row, matching world +y up.
+    return meta, (occupancy < meta['free_thresh'])[::-1].copy(), pixels[::-1]
+
+
+def landmarks_for(yaml_path):
+    """Return named places {name: (x, y)} to label on a map.
+
+    spec.DOOR_GOALS on the hallway, else the doors in cash_sim's
+    worlds/<name>_layout.yaml (from trace_floorplan.py), if there is one.
+    """
+    if is_hallway_map(yaml_path):
+        return dict(spec.DOOR_GOALS)
+    maps_dir = os.path.dirname(os.path.realpath(yaml_path))
+    stem = os.path.splitext(os.path.basename(yaml_path))[0]
+    layout = os.path.join(os.path.dirname(maps_dir), 'src', 'cash_sim', 'worlds',
+                          f'{stem}_layout.yaml')
+    if not os.path.isfile(layout):
+        return {}
+    with open(layout) as f:
+        doors = yaml.safe_load(f).get('doors', {})
+    return {name: (float(v[0]), float(v[1])) for name, v in doors.items()}
+
+
+def use_map(name_or_path):
+    """Resolve a map name/path and make it the default (also for subprocesses); return it."""
+    path = resolve_map_yaml(name_or_path)
+    os.environ[DEFAULT_MAP_ENV_VAR] = path
+    return path
+
+
 def default_map_yaml():
     """Return $CASH_MAP_YAML, else maps/hallway.yaml found above this source file.
 
@@ -37,6 +91,11 @@ def default_map_yaml():
     """
     if os.environ.get(DEFAULT_MAP_ENV_VAR):
         return os.environ[DEFAULT_MAP_ENV_VAR]
+    return default_map_yaml_in_workspace()
+
+
+def default_map_yaml_in_workspace():
+    """Return maps/hallway.yaml found above this source file (ignores $CASH_MAP_YAML)."""
     directory = os.path.dirname(os.path.realpath(__file__))
     while True:
         candidate = os.path.join(directory, DEFAULT_MAP_RELPATH)
@@ -53,10 +112,9 @@ def default_map_yaml():
 class DistanceField:
     """Geodesic distance (m) to one point, sampled at map cell centers."""
 
-    def __init__(self, grid, occupancy_map, goal):
+    def __init__(self, grid, occupancy_map):
         self.grid = grid
         self._map = occupancy_map
-        self.goal = np.asarray(goal, dtype=np.float64)
 
     def __call__(self, x, y):
         """Bilinearly interpolate at (x, y), ignoring unreachable cells; NaN if none."""
@@ -75,108 +133,23 @@ class DistanceField:
                     weight_sum += wr * wc
         return total / weight_sum if weight_sum > 1e-9 else float('nan')
 
-    def waypoint(self, x, y, lookahead):
-        """Point about `lookahead` m (path length) along the cheapest route from (x, y).
-
-        Follows the field downhill cell by cell, so the route rounds corners as the
-        reward's does. Returns the goal itself when it is closer than that, or when
-        (x, y) is off the traversable cells.
-        """
-        m = self._map
-        row, col = (int(v) for v in m.to_cell(x, y))
-        if not (0 <= row < m.height and 0 <= col < m.width) \
-                or not np.isfinite(self.grid[row, col]):
-            return self.goal.copy()
-        downhill = self._downhill()
-        index, length = row * m.width + col, 0.0
-        while length < lookahead:
-            next_index = int(downhill[index])
-            if next_index == index:
-                return self.goal.copy()  # reached the goal's cell
-            step = abs(next_index - index)
-            length += m.resolution * (1.0 if step in (1, m.width) else np.sqrt(2.0))
-            index = next_index
-        return np.array(m.cell_center(*divmod(index, m.width)))
-
-    def _downhill(self):
-        """Flat index of each cell's lowest 8-neighbor (itself if none is lower); cached."""
-        if getattr(self, '_downhill_cache', None) is None:
-            h, w = self.grid.shape
-            padded = np.full((h + 2, w + 2), np.inf)
-            padded[1:-1, 1:-1] = self.grid
-            best = self.grid.copy()
-            index = np.arange(h * w).reshape(h, w)
-            downhill = index.copy()
-            for dr, dc in ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)):
-                neighbor = padded[1 + dr:1 + dr + h, 1 + dc:1 + dc + w]
-                lower = neighbor < best
-                best = np.where(lower, neighbor, best)
-                downhill = np.where(lower, index + dr * w + dc, downhill)
-            self._downhill_cache = downhill.ravel()
-        return self._downhill_cache
-
-
-def _load_grid(yaml_path):
-    """(meta, pixels, occupancy) of a map_server map; rows top-down as in the image."""
-    with open(yaml_path) as f:
-        meta = yaml.safe_load(f)
-    image_path = os.path.join(os.path.dirname(yaml_path), meta['image'])
-    pixels = np.array(Image.open(image_path).convert('L'), dtype=np.float32)
-    occupancy = pixels / 255.0 if meta.get('negate', 0) else (255.0 - pixels) / 255.0
-    if meta['origin'][2] != 0:
-        raise ValueError(f'{yaml_path}: rotated map origins are not supported')
-    return meta, pixels, occupancy
-
-
-def sidecar_path(yaml_path, suffix):
-    """MAP.yaml -> MAP_<suffix>.yaml."""
-    return f'{os.path.splitext(yaml_path)[0]}_{suffix}.yaml'
-
 
 class OccupancyMap:
-    """map_server-format map (.yaml + image); anything not free is an obstacle.
-
-    Also loads the optional keep-out and goals sidecars (see the module docstring):
-    keepout (bool grid), allowed (free and not keep-out), spawn ((x, y, yaw) or
-    None), goals ({name: (x, y)}), goal_yaws ({name: yaw or None}), branch_min_y.
-    """
+    """map_server-format map (.yaml + image); anything not free is an obstacle."""
 
     def __init__(self, yaml_path=None):
         yaml_path = yaml_path or default_map_yaml()
         self.yaml_path = os.path.abspath(yaml_path)
-        self.name = os.path.splitext(os.path.basename(yaml_path))[0]
-        meta, pixels, occupancy = _load_grid(yaml_path)
+        meta, self.free, pixels = load_free_mask(yaml_path)
+
+        origin_x, origin_y, origin_yaw = meta['origin']
+        if origin_yaw != 0:
+            raise ValueError(f'{yaml_path}: rotated map origins are not supported')
         self.resolution = float(meta['resolution'])
-        self.origin = np.array(meta['origin'][:2], dtype=np.float64)
-        # Flip so row 0 is the bottom (y = origin_y) row, matching world +y up.
-        self.free = (occupancy < meta['free_thresh'])[::-1].copy()
-        self.pixels = pixels[::-1].astype(np.uint8)
+        self.origin = np.array([origin_x, origin_y], dtype=np.float64)
+        self.pixels = pixels.astype(np.uint8)
         self.height, self.width = self.free.shape
         self.free_cells = np.argwhere(self.free)
-
-        self.keepout = np.zeros_like(self.free)
-        keepout_yaml = sidecar_path(yaml_path, 'keepout')
-        if os.path.isfile(keepout_yaml):
-            k_meta, _, k_occupancy = _load_grid(keepout_yaml)
-            if (k_occupancy.shape != self.free.shape
-                    or float(k_meta['resolution']) != self.resolution
-                    or not np.allclose(k_meta['origin'][:2], self.origin)):
-                raise ValueError(f'{keepout_yaml} is not on the same grid as {yaml_path}')
-            self.keepout = (k_occupancy > k_meta['occupied_thresh'])[::-1].copy()
-        self.allowed = self.free & ~self.keepout
-        self.allowed_cells = np.argwhere(self.allowed)
-
-        self.spawn, self.goals, self.goal_yaws, self.branch_min_y = None, {}, {}, None
-        goals_yaml = sidecar_path(yaml_path, 'goals')
-        if os.path.isfile(goals_yaml):
-            with open(goals_yaml) as f:
-                goals = yaml.safe_load(f) or {}
-            if goals.get('spawn') is not None:
-                self.spawn = tuple(float(v) for v in goals['spawn'])
-            for name, pose in (goals.get('goals') or {}).items():
-                self.goals[name] = (float(pose[0]), float(pose[1]))
-                self.goal_yaws[name] = float(pose[2]) if len(pose) > 2 else None
-            self.branch_min_y = goals.get('branch_min_y')
         # Distance from each cell center to the nearest non-free cell center (m).
         self.clearance = distance_transform_edt(self.free) * self.resolution
         self._build_graph()
@@ -198,22 +171,13 @@ class OccupancyMap:
         free[inside] = self.free[row[inside], col[inside]]
         return free
 
-    def in_keepout(self, x, y):
-        """Vectorized: True where (x, y) is in a keep-out cell."""
-        row, col = self.to_cell(np.asarray(x), np.asarray(y))
-        inside = (row >= 0) & (row < self.height) & (col >= 0) & (col < self.width)
-        keepout = np.zeros(row.shape, dtype=bool)
-        keepout[inside] = self.keepout[row[inside], col[inside]]
-        return keepout
-
     def _build_graph(self):
         """8-connected graph over traversable cells, edge weights in meters.
 
-        Keep-out cells are not traversable, so routes go around keep-out zones.
         Each edge's length is scaled by the mean of its two cells' wall-cost
         factors (spec.SAFE_CLEARANCE, spec.WALL_COST).
         """
-        self.traversable = (self.clearance >= TRAVERSABLE_CLEARANCE) & ~self.keepout
+        self.traversable = self.clearance >= TRAVERSABLE_CLEARANCE
         nearness = np.clip(1.0 - self.clearance / spec.SAFE_CLEARANCE, 0.0, None)
         cost = 1.0 + spec.WALL_COST * nearness ** 2
         self._traversable_cells = np.argwhere(self.traversable)
@@ -234,10 +198,11 @@ class OccupancyMap:
             (np.concatenate(weight), (np.concatenate(src), np.concatenate(dst))), shape=(n, n))
         self._node_of = node_of
 
-    def distance_field(self, x, y):
+    def distance_field(self, x, y, limit=np.inf):
         """Wall-cost-weighted geodesic distance from every traversable cell to (x, y).
 
-        inf on cells that are not traversable.
+        inf on cells that are not traversable, or (to save time on big maps) farther
+        than `limit`; cells within it get the same distances as without one.
         """
         row, col = self.to_cell(np.asarray(x), np.asarray(y))
         if (0 <= row < self.height and 0 <= col < self.width
@@ -247,7 +212,7 @@ class OccupancyMap:
             centers = np.stack(self.cell_center(*self._traversable_cells.T), axis=1)
             source = int(np.argmin(np.hypot(centers[:, 0] - x, centers[:, 1] - y)))
         source_xy = self.cell_center(*self._traversable_cells[source])
-        distances = dijkstra(self._graph, directed=False, indices=source)
+        distances = dijkstra(self._graph, directed=False, indices=source, limit=limit)
         grid = np.full(self.free.shape, np.inf)
         grid[self.traversable] = distances + np.hypot(source_xy[0] - x, source_xy[1] - y)
-        return DistanceField(grid, self, (x, y))
+        return DistanceField(grid, self)

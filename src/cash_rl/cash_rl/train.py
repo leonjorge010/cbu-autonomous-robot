@@ -2,19 +2,15 @@
 
     ros2 run cash_rl train                                  # PPO, 3M steps
     ros2 run cash_rl train --algo sac --timesteps 1000000
-    ros2 run cash_rl train --map ~/ros2_ws/maps/cbu_floor2.yaml --lookahead 10
+    ros2 run cash_rl train --pedestrians 4                  # moving pedestrians
+    ros2 run cash_rl train --pedestrians 4 --yielding-pedestrians  # that step around it
     tensorboard --logdir ~/ros2_ws/runs                     # watch it
 
 Writes runs/<name>/ in the workspace (gitignored): config.json, TensorBoard
 logs, eval.csv, checkpoints/, best_model.zip and final_model.zip.
 
---map picks the occupancy map (default $CASH_MAP_YAML, else maps/hallway.yaml);
-its keep-out zones and named goals come from the sidecar files next to it (see
-occupancy_map). The resolved map path is recorded in config.json, and evaluate
-uses it by default.
-
 Every --eval-freq steps the deterministic policy is evaluated on a fixed set:
-each of the map's named goals from the map's spawn (what HallwayEnv evaluates in
+each spec.DOOR_GOALS entry from spec.SPAWN_POSE (what HallwayEnv evaluates in
 Gazebo) plus --eval-random fixed-seed random spawn/goal pairs. Success,
 collision and timeout rates and mean return go to TensorBoard (eval/*) and
 eval.csv — those, not the exploration-noisy training reward, are the learning
@@ -27,8 +23,8 @@ import json
 import os
 
 from cash_rl import spec
-from cash_rl.occupancy_map import default_map_yaml
-from cash_rl.raycast_env import DEFAULT_GOAL_DISTANCE_RANGE, HallwayRaycastEnv
+from cash_rl.occupancy_map import default_map_yaml, use_map
+from cash_rl.raycast_env import DEFAULT_GOAL_DISTANCE_RANGE, HallwayRaycastEnv, LANE_HOLD_RANGE
 import numpy as np
 from stable_baselines3 import PPO, SAC, TD3
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
@@ -45,35 +41,70 @@ def runs_dir():
     return os.path.join(os.path.dirname(os.path.dirname(default_map_yaml())), 'runs')
 
 
-def run_config(model_path):
-    """Return the config.json of the run a train.py model zip belongs to."""
-    directory = os.path.dirname(os.path.abspath(os.path.expanduser(model_path)))
+def load_model(path):
+    """Load a train.py model zip; the algo is read from the run's config.json.
+
+    Models trained before scan stacking (spec.SINGLE_SCAN_N_OBS observations) are
+    wrapped to take current N_OBS observations, keeping only the newest scan.
+    """
+    path = os.path.expanduser(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
+        config = os.path.join(candidate, 'config.json')
+        if os.path.isfile(config):
+            with open(config) as f:
+                model = ALGOS[json.load(f)['args']['algo']].load(path, device='cpu')
+            if model.observation_space.shape == (spec.SINGLE_SCAN_N_OBS,):
+                return SingleScanModel(model)
+            return model
+    raise FileNotFoundError(f'No config.json next to or above {path}')
+
+
+def _model_config(path):
+    """Return the config.json of the run a model zip belongs to, or {}."""
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(path)))
     for candidate in (directory, os.path.dirname(directory)):  # run dir or checkpoints/
         config = os.path.join(candidate, 'config.json')
         if os.path.isfile(config):
             with open(config) as f:
                 return json.load(f)
-    raise FileNotFoundError(f'No config.json next to or above {model_path}')
+    return {}
 
 
-def load_model(path):
-    """Load a train.py model zip; the algo is read from the run's config.json."""
-    path = os.path.expanduser(path)
-    return ALGOS[run_config(path)['args']['algo']].load(path, device='cpu')
+def model_map_yaml(path):
+    """Map a train.py/dagger.py model was trained on (its config.json), or None.
 
-
-def goal_episodes(env, repeats=1):
-    """(name, seed, options) episodes: the env map's named goals from its spawn.
-
-    Goals at the spawn itself (e.g. cbu_floor2's stair_1) are skipped.
+    None for runs from before maps were recorded, which all used the hallway.
     """
-    m = env.unwrapped.map
-    if m.spawn is None:
-        return []
-    return [(name, repeat, {'spawn': m.spawn, 'goal': goal})
-            for name, goal in sorted(m.goals.items())
-            if np.hypot(goal[0] - m.spawn[0], goal[1] - m.spawn[1]) > 1.0
-            for repeat in range(repeats)]
+    return _model_config(path).get('map_yaml')
+
+
+def model_subgoal_lookahead(path):
+    """--subgoal-lookahead a train.py/dagger.py model was trained with, or None."""
+    return _model_config(path).get('args', {}).get('subgoal_lookahead')
+
+
+def model_subgoal_offset(path):
+    """--subgoal-offset a train.py/dagger.py model was trained with, or 0."""
+    return _model_config(path).get('args', {}).get('subgoal_offset') or 0.0
+
+
+def model_lane_hold(path):
+    """--lane-hold a train.py/dagger.py model was trained with (the default before the flag)."""
+    return tuple(_model_config(path).get('args', {}).get('lane_hold') or LANE_HOLD_RANGE)
+
+
+class SingleScanModel:
+    """Wrap a pre-scan-stacking model so predict() accepts N_OBS observations."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def predict(self, observation, **kwargs):
+        return self.model.predict(spec.single_scan_observation(observation), **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
 
 
 def algo_kwargs(algo, n_envs):
@@ -94,13 +125,15 @@ def evaluate(model, env, episodes):
 
     Besides outcome and return: 'path' = distance driven (m), 'start_distance' =
     geodesic start distance (m), 'reverse' = share of steps commanding reverse,
-    'override' = share of steps a safety.SafetyWrapper changed the action.
+    'override' = share of steps a safety.SafetyWrapper changed the action,
+    'lane_errors' = |info['lane_error']| on steps charged a lane penalty (m, a list).
     """
     results = []
     for name, seed, options in episodes:
         obs, info = env.reset(seed=seed, options=options)
         start_distance, prev = info['goal_distance'], info['pose'][:2].copy()
         total, steps, path, reversing, overrides = 0.0, 0, 0.0, 0, 0
+        lane_errors = []
         while True:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -108,16 +141,18 @@ def evaluate(model, env, episodes):
             steps += 1
             reversing += action[0] < 0
             overrides += bool(info.get('safety_override', False))
+            if np.isfinite(info.get('lane_error', np.nan)):
+                lane_errors.append(abs(info['lane_error']))
             path += float(np.hypot(*(info['pose'][:2] - prev)))
             prev = info['pose'][:2].copy()
             if terminated or truncated:
                 break
         results.append({'name': name, 'success': bool(info['is_success']),
                         'collision': bool(info['collided']),
-                        'keepout': bool(info.get('keepout', False)),
                         'timeout': not terminated, 'return': total, 'steps': steps,
                         'path': path, 'start_distance': start_distance,
-                        'reverse': reversing / steps, 'override': overrides / steps})
+                        'reverse': reversing / steps, 'override': overrides / steps,
+                        'lane_errors': lane_errors})
     return results
 
 
@@ -129,7 +164,9 @@ class GoalEvalCallback(BaseCallback):
         self.eval_env = eval_env
         self.eval_freq = eval_freq
         self.run_dir = run_dir
-        self.episodes = goal_episodes(eval_env)
+        # Door goals from the spawn on the hallway map; other maps have none.
+        self.episodes = [(name, 0, {'spawn': eval_env.spawn_pose, 'goal': goal})
+                         for name, goal in sorted(eval_env.door_goals.items())]
         self.episodes += [(f'random_{i}', EVAL_SEED_BASE + i, None) for i in range(n_random)]
         self.best = (-1.0, -np.inf)
         self.last_eval = 0
@@ -202,58 +239,130 @@ def main():
     parser.add_argument('--goal-distance-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
                         default=DEFAULT_GOAL_DISTANCE_RANGE,
                         help='geodesic distance range (m) of random training goals')
-    parser.add_argument('--map', help='occupancy map .yaml (default: $CASH_MAP_YAML, else '
-                                      'maps/hallway.yaml)')
-    parser.add_argument('--lookahead', type=float, default=None,
-                        help='observe a waypoint this far (m) along the route instead of the '
-                             'goal, in training and eval (default: the goal itself)')
     parser.add_argument('--junction-prob', type=float, default=0.0,
                         help='share of training episodes that start and end on opposite '
                              'sides of the junction')
+    parser.add_argument('--pedestrians', type=int, default=0,
+                        help='moving pedestrians per episode, in training and eval')
+    parser.add_argument('--yielding-pedestrians', action='store_true',
+                        help='pedestrians slow down and step around the robot instead of '
+                             'walking into it (how pedestrian runs before 2026-10-21 trained)')
+    parser.add_argument('--encounter-prob', type=float, default=0.0,
+                        help='share of training episodes whose first pedestrian starts on '
+                             "the robot's route, walking toward it (eval keeps random starts)")
+    parser.add_argument('--no-lane-penalty', action='store_true',
+                        help='train without the pedestrian lane penalty (spec.PEDESTRIAN_LANE_*)')
+    parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
+                        help='observe a subgoal M m ahead on the geodesic route instead of the '
+                             'goal, in training and eval (reward still uses the goal)')
+    parser.add_argument('--subgoal-offset', type=float, default=0.0, metavar='W',
+                        help='put the subgoal in a random lane up to W m left/right of the '
+                             'corridor center and pay for staying in it (needs '
+                             '--subgoal-lookahead), in training and eval')
+    parser.add_argument('--lane-hold', type=float, nargs=2, default=LANE_HOLD_RANGE,
+                        metavar=('MIN', 'MAX'),
+                        help='seconds each random lane is held before a new one is drawn '
+                             '(default %(default)s)')
+    parser.add_argument('--decision-layer-prob', type=float, default=0.0, metavar='P',
+                        help='share of training episodes whose lane the rule-based decision '
+                             'layer (decision.DecisionLayer) picks around pedestrians; the rest '
+                             'keep the --subgoal-offset random lanes (needs --subgoal-lookahead)')
+    parser.add_argument('--init', metavar='ZIP',
+                        help='start from this model zip (fine-tune) instead of a fresh policy; '
+                             'its hyperparameters are kept except --learning-rate/--lr-schedule '
+                             '(--ent-coef ignored)')
+    parser.add_argument('--learning-rate', type=float, default=None, metavar='LR',
+                        help='initial learning rate (default 3e-4 from algo_kwargs; with --init, '
+                             "the loaded model's unless this or --lr-schedule linear is given)")
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
+    parser.add_argument('--ent-coef', type=float, default=None,
+                        help='PPO entropy bonus (default 0.0, from algo_kwargs)')
+    parser.add_argument('--map', help="map name in maps/ (e.g. 'cbu_floor2') or .yaml path "
+                        '(default: $CASH_MAP_YAML, else hallway); door evals are hallway only')
     parser.add_argument('--checkpoint-freq', type=int, default=250_000)
     parser.add_argument('--name', help='run name (default: <algo>_<timestamp>)')
     args = parser.parse_args()
+    if args.subgoal_offset and not args.subgoal_lookahead:
+        parser.error('--subgoal-offset needs --subgoal-lookahead')
+    if args.decision_layer_prob and not args.subgoal_lookahead:
+        parser.error('--decision-layer-prob needs --subgoal-lookahead')
 
-    args.map = os.path.abspath(os.path.expanduser(args.map or default_map_yaml()))
+    # Set before any env exists, so SubprocVecEnv workers load the same map.
+    map_yaml = use_map(args.map) if args.map else os.path.abspath(default_map_yaml())
     n_envs = args.n_envs or (12 if args.algo == 'ppo' else 4)
     name = args.name or f'{args.algo}_{datetime.datetime.now():%Y%m%d_%H%M%S}'
     run_dir = os.path.join(runs_dir(), name)
     os.makedirs(run_dir, exist_ok=False)
 
     kwargs = algo_kwargs(args.algo, n_envs)
+    if args.ent_coef is not None:
+        if args.algo != 'ppo':
+            parser.error('--ent-coef is PPO only')
+        kwargs['ent_coef'] = args.ent_coef
+    if args.learning_rate is not None:
+        kwargs['learning_rate'] = args.learning_rate
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
-        json.dump({'args': vars(args), 'n_envs': n_envs, 'algo_kwargs': kwargs,
+        json.dump({'args': vars(args), 'map_yaml': map_yaml, 'n_envs': n_envs,
+                   'algo_kwargs': kwargs,
                    'spec': {k: v for k, v in vars(spec).items()
                             if k.isupper() and isinstance(v, (int, float, str, dict, tuple))}},
                   f, indent=2, default=str)
 
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
-    env_kwargs = {'map_yaml': args.map, 'goal_distance_range': tuple(args.goal_distance_range),
-                  'junction_prob': args.junction_prob, 'lookahead': args.lookahead}
+    env_kwargs = {'goal_distance_range': tuple(args.goal_distance_range),
+                  'junction_prob': args.junction_prob,
+                  'n_pedestrians': args.pedestrians,
+                  'pedestrians_yield': args.yielding_pedestrians,
+                  'lane_penalty': not args.no_lane_penalty,
+                  'encounter_prob': args.encounter_prob,
+                  'subgoal_lookahead': args.subgoal_lookahead,
+                  'subgoal_offset': args.subgoal_offset,
+                  'lane_hold': tuple(args.lane_hold)}
+    wrapper = {}
+    if args.decision_layer_prob:
+        from cash_rl.decision import DecisionLayer
+        wrapper = {'wrapper_class': DecisionLayer,
+                   'wrapper_kwargs': {'prob': args.decision_layer_prob}}
     train_env = make_vec_env(HallwayRaycastEnv, n_envs=n_envs, seed=args.seed,
-                             env_kwargs=env_kwargs,
+                             env_kwargs=env_kwargs, **wrapper,
                              vec_env_cls=vec_cls,
                              monitor_kwargs={'info_keywords': ('is_success',)})
     # Eval always uses the default goal range, so every run is scored on the same
-    # random spawn/goal pairs regardless of its training goal range.
-    eval_env = HallwayRaycastEnv(map_yaml=args.map, lookahead=args.lookahead)
+    # random spawn/goal pairs regardless of its training goal range. It does use
+    # the training pedestrians: runs are comparable only at equal counts and behavior.
+    # Pedestrian starts stay random (no encounter_prob), for the same reason.
+    eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                                 pedestrians_yield=args.yielding_pedestrians,
+                                 lane_penalty=not args.no_lane_penalty,
+                                 subgoal_lookahead=args.subgoal_lookahead,
+                                 subgoal_offset=args.subgoal_offset,
+                                 lane_hold=tuple(args.lane_hold))
 
     model_kwargs = dict(kwargs)
     if args.lr_schedule == 'linear':
         initial_lr = kwargs.get('learning_rate', 3e-4)
         # SB3 passes progress_remaining, which goes from 1 to 0 over training.
         model_kwargs['learning_rate'] = lambda progress: initial_lr * progress
-    model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
-                             tensorboard_log=run_dir, **model_kwargs)
+    if args.init:
+        # load() applies these before building lr_schedule, and SB3 sets the optimizer's
+        # rate from lr_schedule on every update, so the override reaches training.
+        overrides = {}
+        if args.learning_rate is not None or args.lr_schedule == 'linear':
+            overrides['learning_rate'] = model_kwargs['learning_rate']
+        model = ALGOS[args.algo].load(os.path.expanduser(args.init), env=train_env,
+                                      device='cpu', tensorboard_log=run_dir, **overrides)
+        model.set_random_seed(args.seed)
+    else:
+        model = ALGOS[args.algo]('MlpPolicy', train_env, seed=args.seed, verbose=0,
+                                 tensorboard_log=run_dir, **model_kwargs)
     callbacks = [
         GoalEvalCallback(eval_env, args.eval_random, args.eval_freq, run_dir),
         CheckpointCallback(save_freq=max(1, args.checkpoint_freq // n_envs),
                            save_path=os.path.join(run_dir, 'checkpoints'), name_prefix='model'),
     ]
-    print(f'Training {args.algo.upper()} for {args.timesteps:,} steps with {n_envs} envs on '
-          f'{os.path.relpath(args.map)} -> {run_dir}', flush=True)
+    print(f'Training {args.algo.upper()} for {args.timesteps:,} steps with {n_envs} envs '
+          f'on {os.path.basename(map_yaml)} -> {run_dir}', flush=True)
     try:
         model.learn(total_timesteps=args.timesteps, callback=callbacks, tb_log_name='tb',
                     progress_bar=False)

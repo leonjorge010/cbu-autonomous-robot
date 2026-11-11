@@ -3,7 +3,518 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-11-02
+
+Covers 11-01 (from 14:43) through 07:04 on 11-02: two queues, `queue_lane_retrain.txt` and
+`queue_9h.txt`, all jobs OK.
+
+**Lane retrain works: `tegr_ppo_la15`** (subgoal 1.5 m ahead instead of 3 m, random lanes held
+8–15 s instead of 2–6 s, lane penalty 2.0; otherwise as `tegr_ppo_lane_w2_s0`). 200 held-out
+TEGR goals, 3 seeds (s0 / s1 / s2):
+
+| | s0 | s1 | s2 | mean | w2 (3 m) | `downhill` (1.5 m) |
+|---|---|---|---|---|---|---|
+| No pedestrians, random lanes | 96.0% | 97.0% | 98.5% | **97.2%** | 93.5% | — |
+| `lane` error, lane +0.5 / 0 / −0.5 (m) | .22/.17/.19 | .24/.18/.25 | .21/.15/.20 | **.22/.17/.21** | .49/.25/.26 | .15/.12/.14 |
+| Encounter, center lane | 49.0% | 52.5% | 50.5% | **50.7%** | 50.5% | 53% |
+| Encounter, rule-based layer | 72.5% | 64.0% | 70.5% | **69.0%** | 53.0% | 91% |
+| Encounter, learned subgoal agent | 65.5% | — | — | — | 53.0% | 73.5% |
+
+PPO now follows lanes (error close to `downhill`), so the upper half of the hierarchy finally
+helps: the rule-based layer adds +18 points (was +2.5). Learned subgoal agent over la15 s0
+(`tegr_subgoal_la15_s0`): 65.5% on encounters, 95.5% without pedestrians but return +33 vs +60
+and lane error 0.43 — it switches lanes with nobody in the way.
+
+**Right-lane collisions** (s0, lane −0.5: 9.5%): 17 of 19 hit the wall on the robot's right,
+clustered where walls jut out (4 at the same spot, ~(16, 12.8)), mostly where the lane penalty is
+waived (turns, junctions, last metres). Largely seed-specific: s1 / s2 right lane 4% / 1% (s1
+left lane 8.5%). Tools: `view_env --lane-offset X --held-out I...` replays evaluate's held-out
+episode `random_I` (`cae8cf3`); `src/cash_rl/tools/lane_collisions.py` lists which episodes
+collide (uncommitted).
+
+**What still fails is the pedestrian:** la15 s0 + rule-based layer, 55 encounter failures =
+51 pedestrian hits + 4 walls. la15 never trained with pedestrians.
+
+**Pedestrian fine-tune: `tegr_ppo_la15_ped_s0`** (new `train --init ZIP` and
+`--decision-layer-prob P`, `5e68926`; `DecisionLayer(prob=P)` runs the rule-based layer in that
+share of episodes, random lanes in the rest). From la15 s0, 3M steps, 1 pedestrian, encounter
+0.7, rule-based layer in 70% of episodes, la15's own hyperparameters (lr 3e-4). It got worse:
+
+| | la15 s0 | fine-tune final | checkpoints 250k / 500k / 1M |
+|---|---|---|---|
+| Encounter, rule-based layer | 72.5% | 66.5% | **77.5%** / 76.5% / 72.5% |
+| + safety layer | — | 68.0% | |
+| No pedestrians, random lanes | 96.0% | 92.5% | |
+| Lane −0.5 pinned | 90.5% | 86.0% | |
+| Learned subgoal agent on top (`tegr_subgoal_la15_ped_s0`), encounter | 65.5% | 59.0% | |
+
+Periodic eval fell steadily from 92.5% at step 0 to ~80%. Pedestrian training helps briefly
+(+5 by 250k) and then the full learning rate erodes what la15 knew — likely too large a step for
+fine-tuning, with the value head facing reward terms (pedestrian penalties) it never saw.
+Best pedestrian motion agent for now: `runs/tegr_ppo_la15_ped_s0/checkpoints/model_249996_steps.zip`.
+
+**Next steps**
+1. Redo the fine-tune gently: lr ~5e-5–1e-4 (new `train --learning-rate LR`, which also
+   overrides an `--init` model's rate), ~750k steps, checkpoints every 100–125k. Queued as
+   `runs/queue_gentle_ft.txt` (lr 1e-4 for 750k and 5e-5 for 1.5M, from la15 s0/s1/s2, every
+   checkpoint on the encounter test + rule-based layer and without pedestrians; plus the
+   unseen-hallway test from step 5). Rank checkpoints by the
+   encounter test with the rule-based layer — the periodic eval uses random pedestrian starts.
+   Optionally warm up the value head first (a few 100k steps with the policy frozen).
+2. If it beats ~77.5% / holds ~96% without pedestrians, repeat on la15 s1 and s2 for a 3-seed mean.
+3. Retrain the learned subgoal agent over the best motion agent, with a cost for changing lanes
+   when no pedestrian is near (it wanders: lane error 0.43 with nobody around).
+4. More pedestrians: keep training at 1 until encounters with a decision layer reach ~85%, then
+   fine-tune 1 → 2 → 4. Meanwhile add 4-pedestrian evals (rule-based layer) of the best model as a
+   baseline — not added to `queue_9h.txt` by choice.
+5. Unseen-environment test (proposal week 9): evaluate the TEGR models on the hallway map
+   (`--map hallway --random 200`), eval only.
+6. Optional: the right-lane wall clips — keep the lane `SAFE_CLEARANCE` from walls that jut out
+   ahead, not only at the cross-section at the robot.
+7. Update `docs/MODELS.md` and the README with la15 (3 seeds) and the fine-tune.
+
+## 2026-10-31
+
+Covers the evening of 10-30 through 01:51 on 10-31.
+
+**Learned subgoal agent** (hierarchy upper half, RL; `cash_rl/subgoal_agent.py`, console script
+`train_subgoal`, `d8ba369`). Ashlyn's choices: learned with RL, action = lane offset + wait,
+inputs = LiDAR only. Built in a worktree and merged after `queue_later.txt` finished.
+- Every 5 control steps (0.5 s) it picks a lane (±1 m, clipped by the env) and whether to wait.
+  Observes the 36 beams now / 0.5 s / 1 s ago, the planner's 3 m center-line subgoal, the end
+  goal, lane room left/right, current lane, velocity, previous action — no pedestrian positions.
+  Reward: task reward over its steps minus the motion agent's lane penalty.
+- `SubgoalEnv` trains it over a frozen motion policy (model zip via a numpy actor, or `downhill`);
+  `SubgoalLayer` runs it in `evaluate`/`view_env --subgoal-agent ZIP`. 7 tests.
+
+**`queue_later.txt` results** (all OK, 17:57–19:47): `tegr_ppo_lane_w2_s0` (lane penalty 2.0).
+
+| 200 goals, TEGR | w2 (2.0) | lane_s0 (0.5) | `downhill` |
+|---|---|---|---|
+| No pedestrians, random lanes | 93.5% | 94.0% | — |
+| Lane +0.5 pinned: success / `lane` error | 93.5% / 0.49 m | 93.0% / 0.41 m | 100% / 0.16 m |
+| Center: success / error | 91.5% / 0.25 m | 93.0% / 0.23 m | 100% / 0.13 m |
+| Lane −0.5 pinned: success / error | 90.0% / 0.26 m | 90.5% / 0.37 m | 100% / 0.15 m |
+| Encounter, center lane | 50.5% | 47.5% | 53% |
+| Encounter, decision layer | 53.0% | 51.0% | 91% |
+
+Raising the penalty kept goal-reaching but did not fix lane following.
+
+**Why PPO won't follow lanes** (`src/cash_rl/tools/lane_diagnostics.py`: `pinned`, `sensitivity`,
+`tug`, `rewards`, `pursuit`):
+- Not the penalty's size: on the +0.5 lane w2 pays ~32 lane penalty per episode vs ~7 for
+  `downhill`, and still drives at +0.09 m from center (+0.5 / 0 / −0.5 lane → +0.09 / −0.07 /
+  −0.22 m, ~30% of the shift).
+- Not training length: checkpoints 500k–3M all cover 0.2–0.3 m of the 1.0 m shift; plateaued by
+  500k steps.
+- Not the reward: `downhill` earns the same non-lane reward following lanes or ignoring them
+  (76.5 vs 76.8 per episode), so following is worth +21 with no hidden cost.
+- The policy does react to the subgoal (0.27 rad/s per 9.5° of bearing, vs 0.07 for `tegr_ppo`
+  without lanes), but steers about twice as hard from its own LiDAR position: placed on the
+  ±0.5 lane it steers back toward center (±0.42 rad/s). The penalty is charged on only ~30% of
+  steps (waived in turns, junctions, open areas, last 3 m), so it mostly learned centering.
+- The cue is weak: steering straight at the observed 3 m subgoal follows no better than PPO
+  (|err| 0.36 vs 0.32 m). 0.5 m sideways is only ~9° at 3 m, closing the gap takes ~6 s of
+  driving, and lanes redraw every 2–6 s. Same pursuit controller: 1.5 m lookahead with 8–15 s
+  holds → **0.20 m** (= `downhill`); 3 m / 2–6 s 0.36, 3 m / 8–15 s 0.30, 1.5 m / 2–6 s 0.25.
+- No penalty for switching lanes as such; a 0.5 m switch costs ~5–10 while the robot moves over.
+
+**Lane hold flag** (`7d92401`, worktree, merged at 01:51): `--lane-hold MIN MAX` on
+`train`/`dagger`/`evaluate`/`view_env` (default 2–6 s, so old runs reproduce; saved in
+`config.json`, `evaluate`/`view_env` default to the model's). `train_subgoal` now runs the motion
+model at its own lookahead (`motion_lookahead`; `downhill` 3 m) instead of a fixed 3 m. 85 tests pass.
+
+**`queue_subgoal_agent.txt` results** (all OK, 22:13–01:51; each agent 1M decisions, ~105 min).
+TEGR encounter test, 1 pedestrian, 200 held-out goals:
+
+| Motion agent | Center lane | Rule-based layer | Learned subgoal agent |
+|---|---|---|---|
+| `tegr_ppo_lane_w2_s0` | 50.5% | 53% | **53.0%** (`tegr_subgoal_w2_s0`) |
+| `downhill` | 53% | 91% | **73.5%** (`tegr_subgoal_dh_s0`) |
+
+- Over `downhill` the learned agent adds 20 points but trails the rule-based layer (privileged
+  pedestrian positions) by 17.5; its periodic eval was flat at ~70% at the end.
+- Over w2 it can't beat the follower's weakness.
+- No pedestrians, w2 + agent: 94.5% (no cost to goal-reaching).
+
+**Queue** `runs/queue_lane_retrain.txt` (~4–5 h, not started): `tegr_ppo_la15_s0` (1.5 m
+lookahead, 8–15 s holds, otherwise as w2), lane L/C/R vs `downhill`, encounter center vs decision
+layer, then `tegr_subgoal_la15_s0` over it with encounter and no-pedestrian evals.
+
+**Open**
+- `queue_lane_retrain.txt`: does `tegr_ppo_la15_s0` follow lanes (`lane` toward ~0.2 m) and keep
+  ~93% goal-reaching with less corner warning at 1.5 m? Then seeds 1–2.
+- Learned subgoal agent gap to the rule-based layer (73.5 vs 91% over `downhill`): longer
+  training, or a larger LiDAR history window.
+- `docs/MODELS.md` not updated for any lane / subgoal-agent model; `main` is 11 commits ahead of
+  `origin`, not pushed.
+
+## 2026-10-30 (evening)
+
+**Rule-based decision layer** (hierarchy upper half, Ashlyn; `cash_rl/decision.py`, `49aeb89`).
+Built in a separate worktree (`decision-layer` branch) so the running queue kept `main`'s code;
+fast-forwarded into `main` and rebuilt after the queue finished (`b324cff`).
+- `PedestrianLaneDecider`: center lane until a pedestrian is ahead (≤6 m, within 1.5 m of the
+  robot's line) and closing (oncoming or overtaken). Then the lane goes 0.8 m beside the
+  pedestrian's line on the side with more room where they will meet (±1 m; keep right on ties),
+  held until the pedestrian is 0.8 m behind. `DecisionLayer` wrapper sets `env.lane_offset` each
+  step and rebuilds the obs; `evaluate`/`view_env --decision-layer`. Privileged (true pedestrian
+  state); on the robot it needs LiDAR tracking. 6 tests (`test/test_decision.py`).
+- Three fixes took `downhill` + layer from 77% to 92% (100 eps): judge room at the predicted
+  meeting point, not beside the pedestrian now (the hallway fountain narrows the right side);
+  place the lane relative to the pedestrian, not a fixed ±0.6 m from center; measure from the
+  followed lane's center (the center abreast of the pedestrian jumps at door recesses/open areas).
+- Limits: no "wait" (dead-center pedestrian in the 2.4 m hallway or by the fountain leaves no lane
+  wide enough), no lanes in the last 3 m (5 of the last 18 hits), ignores pedestrians from behind.
+
+TEGR encounter test, 1 pedestrian, 200 held-out goals:
+
+| Motion agent | Center lane | Decision layer |
+|---|---|---|
+| `downhill` (pure lane follower, privileged field) | 53.0% | **91.0%** |
+| avoider (privileged) | 89.0% (10-23) | 94.0% |
+| `tegr_ppo_lane_s0` (lane penalty 0.5) | 47.5% | 51.0% |
+
+The layer works when the motion agent follows the lane; `tegr_ppo_lane_s0` barely does (lane error
+0.41 m with the layer).
+
+**`tegr_ppo_lane_s0`** (TEGR PPO, 3M steps, 3 m subgoals, random lanes ±0.6 m, lane penalty 0.5;
+165 min incl. ~1 h with the laptop lid closed — closing the lid pauses runs, doesn't break them).
+- Goal-reaching, no pedestrians, random lanes: **94.0%** final / 95.5% best, collisions 4.5%,
+  reversing 6.2%. `tegr_ppo` (no subgoals) 3 seeds: 84.3% final, collisions 9.5–14%. One seed.
+- Lane following is weak: pinned lane +0.5 / 0 / −0.5 → robot drives at +0.12 / −0.03 / −0.19 m
+  from center (median, 40 eps), ~1/3 of the shift. `lane` error 0.37–0.41 m vs `downhill`
+  0.13–0.16 m (`runs/eval_tegr_ppo_lane_s0_{left,center,right}.txt`).
+- So `SUBGOAL_LANE_WEIGHT` 0.5 → **2.0** (`b324cff`). Scripted check, TEGR random lanes: follows 93
+  vs ignores 59 (was 108 vs 94); stops −189. All tests pass. Old runs keep 0.5 in `config.json`;
+  re-evaluating them with 2.0 changes only the `return` column.
+
+**`queue_now.txt` results** (all 12 jobs OK, 13:03–17:41; TEGR, 200 held-out goals, 3 seeds)
+- Experiment A control, hallway-trained → TEGR zero-shot: `ppo_nosg` (same code, no subgoals)
+  56.8% (57.0/54.5/59.0), timeouts 37.8%, vs `ppo_sg3` **72.5%**, timeouts 16.5%. Subgoals +15.7
+  points on the unseen floor; the 10-30 confound (old 41-dim `ppo_d800_prox`) is gone.
+- Safety layer on `tegr_dagger_sg3`: no pedestrians 88.7% → **94.7%** (collisions 10–15% →
+  0.5–1.5%, timeouts 4–5%); encounter 68.8% → **73.3%**; overrides 6–10% of steps.
+- 4-pedestrian encounter test: `tegr_dagger_sg3` (trained with 1) 63.7% (62.5/61.0/67.5),
+  `downhill` 47.0%, avoider 87.5%.
+
+**Queue** `runs/queue_later.txt` (6 jobs, ~2 h, not started): `tegr_ppo_lane_w2_s0` (penalty 2.0),
+lane pinned left/center/right vs `tegr_ppo_lane_s0` and `downhill`, encounter test center lane vs
+`--decision-layer`. Seeds 1–2 only if it follows.
+
+**Open**
+- `queue_later.txt`: does `tegr_ppo_lane_w2_s0` follow lanes (`lane` toward ~0.15 m) while keeping
+  ~94% goal-reaching, and does the decision layer lift its encounter score well above center lane?
+- Decision layer: a "wait" option, lanes within the last 3 m, pedestrians from behind, LiDAR
+  pedestrian tracking for the robot.
+- `evaluate` metrics for side-keeping and off-lane distance near pedestrians.
+- Add the 10-30 models to `docs/MODELS.md`. Push `main` (8 commits ahead of origin).
+
+## 2026-10-30 (afternoon)
+
+**Subgoal lanes** (hierarchy step 3, Ashlyn; commit `134f9fb`). The motion agent should follow
+subgoals from the decision layer (e.g. steer right around a pedestrian even when the goal is
+ahead-left) and see the end goal only once it is within the 3 m lookahead.
+- `--subgoal-offset W` on `train`/`dagger`/`evaluate`/`view_env`: the 3 m subgoal sits in a lane up
+  to W m left/right of the corridor center. The center comes from the walls, so the lane doesn't
+  drift with the robot. The offset is cut back to keep 0.6 m (`SAFE_CLEARANCE`) from obstacles, so
+  the max is ~0.6 m in a 2.4 m corridor. It is redrawn every 2–6 s (30% center).
+  `reset(options={'lane_offset': x})` / `evaluate --lane-offset x` pin it; a decision layer sets
+  `env.lane_offset`.
+- Reward: `spec.subgoal_lane_penalty`, 0.5 per m beyond 0.1 m from the lane at the robot's own
+  position, per step. Waived in turns (>30°), junctions, open areas and the last 3 m. Measuring
+  1 m ahead instead penalized a robot correctly holding the outside of a left turn by ~18 return.
+- Following a lane away from the goal isn't penalized: progress telescopes, so a detour costs
+  only its extra time. Scripted lane follower, hallway, right vs left lane: door ahead-left 106.9
+  vs 103.2; left turn up the branch 125.1 vs 121.7; cutting across a right lane 53.7 / 70.7.
+  Pinned by `test_following_a_lane_away_from_the_goal_is_not_penalized`. TEGR, random lanes,
+  30 goals: follows 108, ignores 94, stops −121. Runs without lanes: reward unchanged.
+- `downhill`/`avoider` follow the lane, so DAgger could teach it too. Within 2 m of a pedestrian
+  the avoider may leave the lane, but an off-center lane sets its passing side (replaces
+  keep-right). Avoider passes on the lane's side 86–91% on TEGR (hallway 62–79%), 95% success with
+  random lanes (93% without).
+- Env with subgoals + lanes: 359 steps/s vs 593 without (TEGR) → ~2.2 h per 3M-step PPO run.
+- 6 new tests; 71 pass.
+
+**Decisions**
+- Motion agent trained with PPO and rewarded for following subgoals, not DAgger: PPO never beat
+  `downhill` on encounters, DAgger plateaus at 68.8% (teacher 89%), and the course needs an RL
+  stage. Phase 1: no pedestrians, random lanes so paths aren't straight. Phase 2: test with
+  pedestrians and a (rule-based) decision layer that moves the lane around them. Hybrid kept: the
+  motion agent may still avoid on its own when the lane is wrong, but takes its side from the lane.
+- Geometry limit: a 0.6 m lane doesn't clear a pedestrian walking down the middle of a 2.4 m
+  corridor (~0.35 m slack). The decision layer needs bigger offsets or a "wait" subgoal.
+
+**Queues** (`runs/queue_now.txt` started 13:03, ~3.8 h): `tegr_ppo_lane_s0` (TEGR, 3M steps,
+`--subgoal-lookahead 3 --subgoal-offset 0.6`) + lane pinned left/center/right evals
+(`runs/eval_tegr_ppo_lane_s0_{left,center,right}.txt`, `downhill` as reference); experiment A
+control `ppo_nosg_s0-2` → `runs/eval_tegr_zeroshot_nosg.txt` (vs `ppo_sg3` 72.5%); `--safety` on
+`tegr_dagger_sg3` → `runs/eval_tegr_{enc,p0}_dagger_sg3_safety.txt`; 4-pedestrian encounter
+baselines → `runs/eval_tegr_enc4_{dagger_sg3,scripted}.txt`. `runs/queue_later.txt` (~4.5 h):
+lane seeds 1–2 and the 3-seed lane evals. Removed: 4-pedestrian DAgger without lanes, the stale
+entropy-0.01 runs in `runs/queue.txt`.
+
+**Open**
+- Results of `queue_now.txt`: does `tegr_ppo_lane_s0` reach goals (vs `tegr_ppo` 84.3%) and follow
+  lanes (`lane` column vs `downhill`)? Then `queue_later.txt`.
+- Rule-based decision layer (lane away from an oncoming pedestrian, back to center after), then
+  the phase-2 pedestrian test. On the robot it needs pedestrian detection from LiDAR.
+- Within 3 m of the goal the lane is off, so the decision layer can't steer there.
+- `evaluate` metrics for side-keeping and off-lane distance near pedestrians.
+- Add the 10-30 models to `docs/MODELS.md`. Push `main` (5 commits ahead of origin).
+
+## 2026-10-29
+
+**Merged `pedestrians-no-yield` into `main`** (Ashlyn). Committed the map-generic TEGR code
+(`14b094d`: `--map`, keepout zones, per-map pedestrian axes, limited Dijkstra), then merged the
+branch. `main` now has non-yielding pedestrians, the lane penalty, `--encounter-prob`, the
+privileged `avoider`, `dagger` and TEGR training. 63 tests pass. No new training or results.
+Pushed `main` to GitHub (`95f607b..8cee225`); deleted the merged local branches
+`pedestrians-no-yield` (never pushed) and `pedestrians-scan-stack`.
+
+**Open:** unchanged from 10-23 (DAgger seeds/rounds, TEGR wall collisions, `--init-from`,
+subgoal agent).
+
+## 2026-10-30
+
+**Planner subgoals** (hierarchy step 1, Ashlyn). `HallwayRaycastEnv(subgoal_lookahead=M)` /
+`--subgoal-lookahead M` on `train`, `dagger`, `evaluate`, `view_env`: the observed goal is the
+point M m ahead on the geodesic route (`route(max_length=)`), the real goal once closer. Only
+the observation changes. `evaluate`/`view_env` default to the model's training setting. 2 new
+tests; 65 pass. No training run.
+
+Existing models, TEGR, 200 held-out goals, no subgoal / 3 m / 5 m (files
+`runs/eval_tegr_subgoal*.txt`, `runs/eval_tegr_zeroshot_subgoal*.txt`):
+
+| Model | Test | none | 3 m | 5 m |
+|---|---|---|---|---|
+| `tegr_ppo` final | no pedestrians | 86.5% | 85.5% | 85.0% |
+| `tegr_dagger_p1` | encounter, 1 ped | 61.5% | 55.5% | 61.5% |
+| `tegr_ppo` final | encounter, 1 ped | 42.0% | 43.0% | 43.0% |
+| `ppo_d800_prox` final (hallway, zero-shot) | no pedestrians | 60.0% (34% timeout) | 64.0% (30.5%) | 63.5% (30.5%) |
+
+- No real change for models trained without subgoals: TEGR models barely time out (0–2%), so
+  their failures are collisions, which subgoals don't touch.
+- The hallway model's zero-shot timeouts barely move (34% → 30.5%), so they are not mainly
+  the straight-line goal; cause still unknown (it reverses on ~18% of steps).
+- The real test is a model *trained* with subgoals: hallway-trained → TEGR zero-shot (unseen map)
+  and TEGR DAgger with subgoals.
+
+**Decisions**
+- Hierarchy: the decision (subgoal) layer is the geodesic planner (`route()`), not a learned model.
+  It uses only the map and the robot's pose, which the real robot will have (SLAM map + Nav2
+  localization). Report it as a deliberate change from the proposal's learned subgoal agent.
+  The planner ignores pedestrians; a decision layer that picks a side (or waits) for an oncoming
+  pedestrian is the extension if experiment B shows the motion model still can't commit to a
+  side. Rule-based first, learned if time allows; a fully learned subgoal agent is future work.
+- Warm starts vs. training from scratch: keep scratch runs for every comparison in the report
+  (equal footing, ±3% seed noise). Warm-start only to build the final model, as a recorded
+  curriculum: DAgger student → PPO fine-tune (1 pedestrian) → 4 pedestrians. Train from scratch
+  after reward/obs changes (stale value function, old habits: `ppo_peds` fell 90.5% → 36% when
+  pedestrians stopped yielding).
+
+**Overnight queue** (`runs/queue_subgoal.txt`, all 14 jobs OK, 00:36–08:26; hallway PPO with
+subgoals took 40–44 min per 1.5M steps (route tracing; `ppo_d800_prox` took 11), DAgger 20 rounds
+48–63 min)
+- A, unseen map: `ppo_sg3_s0/1/2`, hallway PPO with `--subgoal-lookahead 3` (`ppo_d800_prox`
+  settings, 1.5M steps), then zero-shot on TEGR → `runs/eval_tegr_zeroshot_sg3.txt`. Compare with
+  `ppo_d800_prox`'s 60% (34% timeouts).
+- B, pedestrians on TEGR: DAgger 20 rounds, 1 pedestrian, seeds 0–2, with 3 m subgoals
+  (`tegr_dagger_sg3_s*`) and without (`tegr_dagger_r20_s*`, also the seed/plateau check of 61.5%).
+  Encounter test and no-pedestrian test → `runs/eval_tegr_{enc,p0}_dagger_{sg3,r20}.txt`.
+
+**Results** (200 held-out goals per model, 3 seeds each, final models)
+
+B, TEGR DAgger (clean comparison: identical except subgoals):
+
+| Test | `tegr_dagger_sg3` (3 m) | `tegr_dagger_r20` (none) | `downhill` | avoider |
+|---|---|---|---|---|
+| Encounter, 1 ped | **68.8%** (66.5/69.0/71.0) | 64.8% (63.0/65.0/66.5) | 50.5% | 89.0% |
+| No pedestrians | 88.7% (88.5/88.0/89.5) | 87.2% (84.5/88.0/89.0) | 100% | — |
+
+- Subgoals +4 points on the encounter test; every seed beats its no-subgoal partner (+2.5 to +4.5).
+  No difference without pedestrians; failures there are all wall collisions (10.5–15.5%).
+- The 10-23 `tegr_dagger_p1` (61.5%) holds up: 3-seed mean at 20 rounds 64.8%.
+- All 6 DAgger models beat `downhill` by 14–20 points.
+- DAgger has plateaued: per-round eval (100 eps) rises to ~round 10, then wanders 57–70% with no
+  trend; MSE ~0.10. More rounds won't close the gap to the teacher.
+
+A, unseen map (hallway-trained, TEGR zero-shot):
+
+| Model | Hallway | TEGR zero-shot | TEGR timeouts |
+|---|---|---|---|
+| `ppo_sg3` (3 m, 3 seeds) | 93.0% (95.5/88.0/95.5) | **72.5%** (73.0/65.0/79.5) | 16.5% |
+| `ppo_d800_prox` (1 seed, 10-15 code) | 96.5% | 60.0% | 34.0% |
+
+- Subgoal models generalize better (+12.5 points, timeouts halved) with no loss on the hallway.
+- **Confounded:** `ppo_d800_prox` predates scan stacking (41-dim obs, 1 scan) and its seeds 1/2 are
+  only in the GitHub release. Needs a same-code control without subgoals before claiming it.
+
+**Open**
+- Control for A (3 seeds, ~40 min each; not started). Write `runs/queue_control.txt` with
+  `runs/train_eval.sh ppo_nosg_s{0,1,2} --goal-distance-range 1 25 --junction-prob 0.3 --timesteps
+  1500000 --seed {0,1,2}` (one line per seed) plus
+  `OMP_NUM_THREADS=1 ros2 run cash_rl evaluate runs/ppo_nosg_s{0,1,2}/final_model.zip --map cbu_floor2
+  --random 200 > runs/eval_tegr_zeroshot_nosg.txt 2>&1`, then
+  `tmux new -d -s queue "QUEUE=runs/queue_control.txt ~/ros2_ws/runs/queue.sh"`. Compare with 72.5%.
+- Add these models to `docs/MODELS.md`.
+- Gap to the teacher (68.8% vs 89%) won't close with more DAgger rounds: discrete 54-action
+  student, and/or a side-choosing decision layer; check the `sg3` students' hard-swerve rate.
+- `--init-from` (PPO fine-tune from `tegr_dagger_sg3`) for the final model.
+- TEGR wall collisions: `evaluate --safety` on the TEGR models; longer training.
+- Why hallway models time out on TEGR (34%; reverse ~18% of steps) — not the straight-line goal.
+- Then 4 pedestrians. Carried over: keep-right teacher at 4 peds (78%), `demo` hallway doors,
+  stale `runs/queue.txt`, `elevator_2` goal position (check on site).
+
+## 2026-10-23
+
+**Training on the real TEGR 2nd floor** (`cbu_floor2`, Ashlyn; schedule weeks 8–9). Branch
+`pedestrians-no-yield`; the map-generic code below is **uncommitted** (last commit `eead4e9`).
+- `--map cbu_floor2` (name in `maps/` or a path) on `train`, `dagger`, `evaluate`, `view_env`;
+  `train`/`dagger` record `map_yaml` in `config.json`, and `evaluate`/`view_env` default to the
+  model's map (warning on a mismatch). Hallway-only: door evals (`env.door_goals` is empty
+  elsewhere, so `evaluate` needs `--random N`) and `--junction-prob` (raises on other maps).
+- `<map>_keepout.yaml` keeps spawns, goals and pedestrians out of Stair 1 and the learning zones
+  (the robot can still drive in: nothing penalizes it there).
+- Pedestrians walk along the longer open stretch through their cell, majority-voted over 1.5 m
+  (before: y if y ≥ 1.5 m, so every TEGR pedestrian walked north–south). The hallway keeps its old
+  rule: hallway seeded rollouts verified bit-identical before/after.
+- Spawn-side distance field stops at the goal range (`distance_field(limit=)`): TEGR reset
+  213 → 111 ms. `view_env` labels the layout's room goals (`landmarks_for`) and fits the map.
+- Room-goal check: `trace_floorplan --overlay` + a labelled render; all 26 look right, except
+  `elevator_2` (43.0, 57.4) may sit ~2 m east of the elevator door (check on site).
+- 7 new tests; 63 pass.
+
+**Overnight queue** (`runs/queue_tegr.txt`, all 10 jobs OK, 01:52–10:56). 200 held-out goals
+(1–15 m) on TEGR; files `runs/eval_tegr_*.txt`.
+
+| Encounter test, 1 pedestrian | Success | Collision | Reversing |
+|---|---|---|---|
+| avoider (keep-right teacher) | 89.0% | 10.5% | 5.2% |
+| **`tegr_dagger_p1`** | **61.5%** | 38.5% | 6.1% |
+| `tegr_ppo_p1` (enc 0.7, no lane, ent 0.001) | 52.0% | 45.5% | 21.4% |
+| `downhill` | 50.5% | 49.5% | 0% |
+| `tegr_ppo` (no pedestrians) | 42.0% | 56.5% | 13.1% |
+
+- First learned model clearly above `downhill` (+11 points, one seed). DAgger per-round eval was
+  still rising at round 10 (44% → 57% → 61% at rounds 5, 8, 10); imitation MSE 0.115.
+- No pedestrians: `tegr_ppo` seeds 0/1/2 final 86.5/79.5/87.0% (mean 84.3%), best checkpoints
+  87.0/89.5/89.0% (mean 88.5%); `downhill` 100%. Failures are mostly wall collisions (10–14%),
+  vs 96.5% for `ppo_d800_prox` on the hallway. Hallway models zero-shot on TEGR: 57–60% (~35%
+  timeouts).
+- 4 random pedestrians: `tegr_ppo_p4` 78.0%, `tegr_dagger_p1` 76.5%, `downhill` 91.5%, avoider
+  96.0%. Random pedestrians rarely meet the robot here, so this gap is the wall-collision weakness.
+- The student still almost never swerves hard near a pedestrian: 5% of steps vs the teacher's 43%
+  (hallway student before keep-right: 13%). Its gain did not come from fixing the left/right
+  averaging.
+- Reports: progress update https://claude.ai/artifact/BiPTYtyuFbgmBCrZxjjmK3 and results-with-charts
+  doc https://claude.ai/artifact/VsfudV5hPgKR2pYEggH6VL (both private until shared). Representative
+  demo: `view_env --pedestrians 1 --encounter-prob 1 --seed 1100000 --episodes 10` for `downhill`
+  (`--map cbu_floor2`), `tegr_ppo_p1`, `tegr_dagger_p1` (4/6/7 of 10).
+
+**Open**
+- Commit the map-generic code.
+- DAgger: 2 more seeds and more rounds (`--rounds 20` or `--steps-per-round 120000`) to confirm
+  61.5% and find the plateau.
+- `--init-from` warm start for `train`/`dagger` (postponed): PPO fine-tune from the student.
+- Student that picks among the teacher's 54 discrete actions, if averaging stays the limit.
+- TEGR wall collisions: longer training and/or `evaluate --safety`.
+- Keep-right teacher with 4 pedestrians drops to 78% on the hallway (84.5% without the rule).
+- Long routes on TEGR need subgoals (goal obs is straight-line): the planned subgoal agent.
+- Hallway `dagger_p1_kr` rerun never done (superseded by TEGR). `demo` still assumes hallway doors.
+- `runs/queue.txt` still lists 4 stale ent-0.01 runs.
+
+## 2026-10-22
+
+**Encounters, privileged avoider, teacher-student training** (hallway, 1 pedestrian, Ashlyn).
+- `HallwayRaycastEnv(encounter_prob)` / `--encounter-prob`: the first pedestrian starts 4–10 m
+  ahead on the robot's route walking at it. The *encounter test* (`--encounter-prob 1`) separates
+  avoidance far better than random starts.
+- `scripted.avoider`: privileged upper bound (true future pedestrian positions). Limited to
+  pedestrians visible in the 36 beams it scores the same, so the observation is sufficient; the
+  problem is learning. Fixed a bug where it froze at rest facing its goal (3/7 doors → 7/7;
+  encounter test 84.5% → 88.5%). Added keep-right (`side_weight`, judged in the pedestrian's
+  walking frame): keeps right on 72% of close passes (was 53%), encounter 86.5%, 4 peds 78.0%.
+- `train --ent-coef`: 0.01 blew the action std up to 4.6; 0.001 is stable but changed nothing.
+- Sweep (1 ped, standard test): lane penalty + encounters 60.0% / 22.8% reversing; lane penalty off
+  73–79.5% / ~11%; `downhill` 85%, avoider 94%. Encounter test: PPO 35.5–41%, `downhill` 43.5%.
+- `dagger` (new console script, `eead4e9`): DAgger with the avoider as teacher, student = PPO
+  MlpPolicy, saves PPO zips. `dagger_p1`: 44.5% on the encounter test (`downhill` 43.5%);
+  behavior cloning alone 8.5%. Near a pedestrian the teacher swerves hard on 43% of steps split
+  left/right; the student averages them to straight (13%).
+
+## 2026-10-21
+
+**Pedestrians that don't yield; lane penalty** (`HallwayRaycastEnv`, Ashlyn; schedule week 8). Branch
+`pedestrians-no-yield`, not merged yet.
+- `ppo_peds` had learned to rely on pedestrians stepping around it: against pedestrians that walk
+  straight on, its success fell from 90.5% to 36% (100 held-out goals, 4 pedestrians).
+- Pedestrians now ignore the robot and walk into it if it stays in their path; the old behavior is
+  `pedestrians_yield=True` / `--yielding-pedestrians` (`train`, `evaluate`, `view_env`, `demo`),
+  to reproduce runs from before today. Speed lowered from 0.8–1.4 to 0.5–0.9 m/s.
+- Waiting is free: stopped (< 0.05 m/s) with a pedestrian within 0.8 m, the robot pays no time or
+  pedestrian proximity penalty (`spec.waiting_for_pedestrian`). Being walked into still costs −40.
+- Lane penalty (`PEDESTRIAN_LANE_*`, `spec.pedestrian_lane_penalty`): up to −0.3 per pedestrian per
+  step while the footprint is in a pedestrian's lane and they would reach it within 3 s at their
+  closing speed, waiting or not. Reason: the 0.8 m proximity penalty starts only 0.6–0.8 s before
+  contact, too late for a diff-drive robot to turn and get clear. Costs ~10% env speed.
+- `demo --pedestrians N` (new pedestrians placed at the start of each leg).
+
+**Results** (200 held-out goals, 4 pedestrians, one seed each)
+
+| Model | Success | Collision | Timeout | Reversing |
+|---|---|---|---|---|
+| `ppo_peds_noyield` (3M) | 48.0% | 50.0% | 2.0% | 14.5% |
+| `ppo_peds_lane` final (6M, lane penalty) | 28.5% | 61.0% | 10.5% | 28.1% |
+| `ppo_peds_lane` best_model | 51.5% | 48.0% | 0.5% | 14.1% |
+
+- Neither model avoids pedestrians: `downhill`, which ignores them entirely, gets 57% success / 43%
+  pedestrian collisions on the same episodes. Most collisions are the robot driving into a
+  pedestrian walking toward it (front or side), mid-episode; few happen while it is stopped.
+- The lane penalty taught backing away (reverse doubled; 0.15 m/s reverse can't outrun a
+  pedestrian) instead of stepping aside.
+- On the TEGR map (`CASH_MAP_YAML=maps/cbu_floor2.yaml`) `ppo_peds_noyield` reached 6/30 random
+  goals, mostly timing out. `view_env`/`demo` still draw the hallway's door labels there (they sit
+  outside the building), and pedestrians assume the hallway's corridor directions.
+
+**Open (pedestrians)**
+- Find out whether avoidance is possible at all here (36-beam view sees a pedestrian reliably only
+  within ~2.9 m; getting clear takes ~2.5–3 s) or PPO just doesn't find it (`ent_coef` is 0):
+  1. curriculum: `train --pedestrians 1 ...` — does it beat `downhill` with 1 pedestrian?
+  2. a scripted avoider that knows the pedestrians' positions, as an upper bound.
+- Then revert or rework the lane penalty, or try an entropy bonus — one change at a time.
+- Seed-1 repeat of `ppo_peds_noyield` was queued but never started.
+
 ## 2026-10-16
+
+**Moving pedestrians and scan stacking** (`HallwayRaycastEnv`, Ashlyn; schedule week 8)
+- `HallwayRaycastEnv(n_pedestrians=N)`, default 0 so existing runs are unchanged: 0.25 m discs
+  walking the corridor axis at 0.8–1.4 m/s, turning back only at walls. They block beams (exact
+  ray/disc intersection, so the safety layer sees them too) and count as collisions. 2D only;
+  Gazebo has no pedestrians yet.
+- Pedestrians never turn back for the robot: with it ahead inside a 0.8 m gap they slow to 30%; if
+  it is in their path they sidestep away at 0.5 m/s (stopping inside 0.3 m until clear), then keep
+  walking the same way. A parked robot is never hit (0 hits, 100 episodes × 6 pedestrians).
+- Reward: up to −0.3 per pedestrian per step inside the 0.8 m gap, ramping to contact; hitting a
+  pedestrian costs −40 instead of a wall's −20. Step info adds `hit_pedestrian`,
+  `min_pedestrian_gap`.
+- Observation stacks the last 3 scans (41 → 113 values) so the policy can see motion; `HallwayEnv`
+  builds the same stack. 41-value models (all models so far, incl. `ppo_d800_prox`) still load:
+  `train.load_model` feeds them the newest scan only.
+- `train --pedestrians N` (training *and* periodic eval, so compare runs at equal counts),
+  `evaluate --pedestrians N`, `view_env --pedestrians N` (purple discs).
+- `downhill`, which ignores pedestrians, with 4 of them: 82/100 goals, 18 pedestrian hits.
+  Training speed with 4 pedestrians: 790 vs 855 steps/s without (~63 min per 3M steps measured
+  today, slower than the ~38 min seen 10-14).
+- Merged with this day's `main` (STL-27L LiDAR, wall proximity penalty, safety layer): pedestrian
+  and wall penalties apply side by side; `evaluate --pedestrians N --safety` works.
+
+**Open (pedestrians)**
+- Train a model on the new pedestrian env, e.g. `train --pedestrians 4 --goal-distance-range 1 25
+  --junction-prob 0.3 --timesteps 3000000 --name ppo_peds`, and compare against the 41-value
+  baselines with `evaluate --random 200 --pedestrians 4`.
+- Later: add a constant student following the robot, to model the user being escorted (keep them
+  within following distance; penalize losing them).
 
 **Real floor plan → sim world** (TEGR 2nd floor, from a phone photo of the printed plan, `docs/cbu_floorplan.jpg`)
 - `src/cash_sim/tools/trace_floorplan.py`: perspective-corrects the photo from the building's 4 outer

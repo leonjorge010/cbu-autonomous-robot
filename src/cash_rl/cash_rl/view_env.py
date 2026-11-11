@@ -4,25 +4,27 @@
     ros2 run cash_rl view_env --policy random --goal door_201
     ros2 run cash_rl view_env --goal all --save doors.gif
     ros2 run cash_rl view_env --policy ~/ros2_ws/runs/<run>/best_model.zip --goal all
-    ros2 run cash_rl view_env --map ~/ros2_ws/maps/cbu_floor2.yaml --lookahead 10 \
-        --goal tegr_221
+    ros2 run cash_rl view_env --pedestrians 4
+    ros2 run cash_rl view_env --policy runs/<run>/final_model.zip --lane-offset -0.5 \
+        --held-out 8 42
 
-Shows the map to scale (keep-out zones shaded red) with the robot footprint
-(collision margin included), the 36 observed lidar beams, the goal tolerance
-circle, the lookahead waypoint, the path so far, and episode step/return/outcome.
-The map and lookahead default to the --policy model's training run. Episodes are
-simulated up front (the 2D env is fast), then played back at real time × --speed.
+Shows the SLAM map to scale with the robot footprint (collision margin
+included), the 36 observed lidar beams, the goal tolerance circle, the path so
+far, any pedestrians (purple discs), and episode step/return/outcome.
+Episodes are simulated up front (the 2D env is fast), then played back at real
+time × --speed.
 """
 import argparse
 
 from cash_rl import spec
 from cash_rl.raycast_env import HallwayRaycastEnv
-from cash_rl.scripted import downhill
+from cash_rl.scripted import avoider, downhill
 import numpy as np
 
 HOLD_FRAMES = 15  # Pause on each episode's last frame.
 POLICIES = {
     'downhill': downhill,
+    'avoider': avoider,
     'random': lambda env: env.action_space.sample(),
 }
 
@@ -33,37 +35,43 @@ def load_trained_policy(path):
     model = load_model(path)
 
     def policy(env):
-        obs = spec.build_observation(env._ranges, env.pose, env.observed_goal,
-                                     env._prev_action)
-        return model.predict(obs, deterministic=True)[0]
+        return model.predict(env.observation(), deterministic=True)[0]
     return policy
 
 
-def run_episodes(env, policy, goals, seed):
-    """Simulate episodes; return a list of per-step snapshots for playback."""
+def run_episodes(env, policy, goals, seed, stepper=None, options=None, seeds=None):
+    """Simulate episodes; return a list of per-step snapshots for playback.
+
+    stepper (default env) is what reset/step are called on, e.g. a wrapper; the
+    snapshots read the unwrapped env. options are added to every reset (e.g.
+    lane_offset); seeds, if given, replaces seed + i per episode.
+    """
+    stepper = stepper or env
     frames = []
     for i, (goal_name, goal) in enumerate(goals):
-        options = {'spawn': env.map.spawn, 'goal': goal} if goal is not None else None
-        _, info = env.reset(seed=seed + i, options=options)
+        reset_options = dict(options or {})
+        if goal is not None:
+            reset_options.update(spawn=env.spawn_pose, goal=goal)
+        _, info = stepper.reset(seed=seeds[i] if seeds else seed + i,
+                                options=reset_options or None)
         goal_name = goal_name or f'random ({info["goal"][0]:.1f}, {info["goal"][1]:.1f})'
         trail, total, step, outcome = [env.pose[:2].copy()], 0.0, 0, ''
         while True:
             frames.append({
                 'pose': env.pose.copy(), 'ranges': env._ranges.copy(),
-                'goal': env.goal.copy(), 'waypoint': env.observed_goal.copy(),
-                'trail': np.array(trail), 'text': (
+                'pedestrians': env.pedestrians.copy(), 'subgoal': env.subgoal.copy(),
+                'goal': env.goal.copy(), 'trail': np.array(trail), 'text': (
                     f'episode {i + 1}/{len(goals)}   goal: {goal_name}   '
                     f'step {step}/{env._max_steps}   return {total:+.1f}   {outcome}')})
             if outcome:
                 frames.extend([frames[-1]] * HOLD_FRAMES)
                 break
-            _, reward, terminated, truncated, info = env.step(policy(env))
+            _, reward, terminated, truncated, info = stepper.step(policy(env))
             total += reward
             step += 1
             trail.append(env.pose[:2].copy())
             if terminated or truncated:
                 outcome = ('REACHED GOAL' if info['is_success']
-                           else 'KEEP-OUT ZONE' if info.get('keepout')
                            else 'COLLISION' if info['collided'] else 'TIMED OUT')
     return frames
 
@@ -77,29 +85,30 @@ def footprint_corners(pose):
 
 
 class Scene:
-    """Matplotlib drawing of the map, goals, robot, beams, goal and trail on `ax`.
+    """Matplotlib drawing of the map, doors, robot, beams, goal and trail on `ax`.
 
-    door_labels maps goal name -> label text (default: the name). draw() with
-    pose None hides the robot and beams; goal None hides the goal; waypoint None
-    (or equal to the goal) hides the lookahead waypoint.
+    door_labels maps door name -> label text (default: the name). draw() with
+    pose None hides the robot and beams; goal None hides the goal; pedestrians is
+    an (n, 2) array of disc centers, or None for none; subgoal (an orange x) is
+    drawn only when given and away from the goal.
     """
 
     def __init__(self, ax, env, door_labels=None):
-        from matplotlib.collections import LineCollection
+        from cash_rl.raycast_env import PEDESTRIAN_RADIUS
+        from matplotlib.collections import EllipseCollection, LineCollection
         from matplotlib.patches import Circle, Polygon
         m = env.map
         ax.imshow(m.pixels, cmap='gray', origin='lower', vmin=0, vmax=255, extent=[
             m.origin[0], m.origin[0] + m.width * m.resolution,
             m.origin[1], m.origin[1] + m.height * m.resolution])
-        extent = [m.origin[0], m.origin[0] + m.width * m.resolution,
-                  m.origin[1], m.origin[1] + m.height * m.resolution]
-        if m.keepout.any():
-            ax.imshow(np.ma.masked_where(~m.keepout, m.keepout), cmap='Reds', vmin=0, vmax=3,
-                      alpha=0.5, origin='lower', extent=extent)
-        for name, (gx, gy) in m.goals.items():
+        from cash_rl.occupancy_map import landmarks_for
+        for name, (gx, gy) in landmarks_for(m.yaml_path).items():
             ax.plot(gx, gy, '+', color='0.6', ms=6)
             ax.annotate((door_labels or {}).get(name, name), (gx, gy), xytext=(3, 4),
                         textcoords='offset points', fontsize=7, color='0.45')
+        ax.set_xlim(m.origin[0], m.origin[0] + m.width * m.resolution)
+        ax.set_ylim(m.origin[1], m.origin[1] + m.height * m.resolution)
+        ax.set_autoscale_on(False)
         ax.set_xlabel('x (m)')
         ax.set_ylabel('y (m)')
         self.beams = ax.add_collection(
@@ -110,10 +119,17 @@ class Scene:
         self.heading, = ax.plot([], [], color='white', lw=2)
         self.goal = ax.add_patch(Circle((0, 0), spec.GOAL_TOLERANCE, fc='orange',
                                         ec='darkorange', alpha=0.7))
-        self.waypoint, = ax.plot([], [], 'x', color='darkorange', ms=8, mew=2)
+        self.subgoal, = ax.plot([], [], 'x', color='darkorange', ms=9, mew=2)
+        size = 2 * PEDESTRIAN_RADIUS
+        self.pedestrians = ax.add_collection(EllipseCollection(
+            size, size, 0.0, units='xy', offsets=np.zeros((0, 2)),
+            offset_transform=ax.transData, facecolors='tab:purple', edgecolors='indigo',
+            alpha=0.8))
         self.title = ax.set_title('', fontsize=11, family='monospace')
 
-    def draw(self, pose, ranges, goal, trail, text, waypoint=None):
+    def draw(self, pose, ranges, goal, trail, text, pedestrians=None, subgoal=None):
+        self.pedestrians.set_offsets(np.zeros((0, 2)) if pedestrians is None
+                                     else np.asarray(pedestrians).reshape(-1, 2))
         self.robot.set_visible(pose is not None)
         self.heading.set_visible(pose is not None)
         self.beams.set_visible(pose is not None and ranges is not None)
@@ -131,32 +147,15 @@ class Scene:
         self.goal.set_visible(goal is not None)
         if goal is not None:
             self.goal.center = goal
-        show_waypoint = waypoint is not None and (goal is None or not np.allclose(waypoint, goal))
-        self.waypoint.set_visible(show_waypoint)
-        if show_waypoint:
-            self.waypoint.set_data([waypoint[0]], [waypoint[1]])
+        if subgoal is not None and (goal is None or not np.allclose(subgoal, goal)):
+            self.subgoal.set_data([subgoal[0]], [subgoal[1]])
+        else:
+            self.subgoal.set_data([], [])
         trail = np.zeros((0, 2)) if trail is None or len(trail) == 0 else np.asarray(trail)
         self.trail.set_data(trail[:, 0], trail[:, 1])
         self.title.set_text(text)
-        return (self.beams, self.trail, self.robot, self.heading, self.goal, self.waypoint,
-                self.title)
-
-
-def map_and_lookahead(args):
-    """--map/--lookahead, defaulting to the --policy model's training run."""
-    trained = {}
-    if args.policy and args.policy.endswith('.zip'):
-        from cash_rl.train import run_config
-        trained = run_config(args.policy)['args']
-    lookahead = args.lookahead if args.lookahead is not None else trained.get('lookahead')
-    return args.map or trained.get('map'), lookahead
-
-
-def figure_size(env, width=14.0, max_height=9.0):
-    """Figure (w, h) in inches fitting the map's aspect ratio."""
-    aspect = env.map.height / env.map.width
-    return (width, min(max_height, width * aspect + 1.0)) if aspect < 0.6 \
-        else (max_height / aspect + 1.5, max_height)
+        return (self.beams, self.trail, self.robot, self.heading, self.goal, self.subgoal,
+                self.pedestrians, self.title)
 
 
 def main():
@@ -164,28 +163,83 @@ def main():
     parser.add_argument('--policy', default='downhill',
                         help=f"{' or '.join(sorted(POLICIES))}, or a trained model .zip")
     parser.add_argument('--goal', default='random',
-                        help="'random', 'all' (every named goal from the spawn), or a goal "
-                             "name from the map's goals file")
+                        help="'random', or on the hallway map 'all' (every door from spawn) "
+                             'or a door name: ' + ', '.join(sorted(spec.DOOR_GOALS)))
+    parser.add_argument('--map', help="map name in maps/ (e.g. 'cbu_floor2') or .yaml path "
+                        "(default: the --policy zip's training map, else $CASH_MAP_YAML / "
+                        'hallway)')
     parser.add_argument('--episodes', type=int, default=3,
                         help='number of episodes with --goal random')
+    parser.add_argument('--pedestrians', type=int, default=0,
+                        help='number of moving pedestrians in the hallway')
+    parser.add_argument('--yielding-pedestrians', action='store_true',
+                        help='pedestrians step around the robot instead of walking into it')
+    parser.add_argument('--encounter-prob', type=float, default=0.0,
+                        help="share of episodes whose first pedestrian starts on the robot's "
+                             'route, walking toward it')
+    parser.add_argument('--subgoal-lookahead', type=float, default=None, metavar='M',
+                        help='policy observes a subgoal M m ahead on the route (orange x; '
+                             "default: the policy's training setting; 0 = off)")
+    parser.add_argument('--subgoal-offset', type=float, default=None, metavar='W',
+                        help='subgoal in a random lane up to W m left/right of the corridor '
+                             "center (default: the policy's training setting; 0 = off)")
+    parser.add_argument('--lane-hold', type=float, nargs=2, default=None, metavar=('MIN', 'MAX'),
+                        help="seconds each random lane is held (default: the policy's setting)")
+    parser.add_argument('--decision-layer', action='store_true',
+                        help='steer the subgoal lane around pedestrians (cash_rl.decision; '
+                             'needs a subgoal lookahead)')
+    parser.add_argument('--subgoal-agent', metavar='ZIP',
+                        help='a train_subgoal model sets the lane and when to wait instead')
+    parser.add_argument('--lane-offset', type=float, default=None, metavar='X',
+                        help='pin the subgoal lane X m left of center (as evaluate --lane-offset)')
+    parser.add_argument('--held-out', type=int, nargs='+', metavar='I',
+                        help="play evaluate --random's held-out episodes random_I (same seeds, "
+                             'so the same spawn/goal/outcome as the eval)')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--speed', type=float, default=2.0, help='playback speed multiplier')
     parser.add_argument('--save', metavar='PATH.gif', help='write a GIF instead of a window')
-    parser.add_argument('--map', help='occupancy map .yaml')
-    parser.add_argument('--lookahead', type=float, help='waypoint lookahead (m)')
     args = parser.parse_args()
 
-    map_yaml, lookahead = map_and_lookahead(args)
-    env = HallwayRaycastEnv(map_yaml=map_yaml, lookahead=lookahead)
-    if args.goal == 'random':
+    from cash_rl.occupancy_map import use_map
+    if args.map:
+        use_map(args.map)
+    elif args.policy not in POLICIES:
+        from cash_rl.train import (model_lane_hold, model_map_yaml, model_subgoal_lookahead,
+                                   model_subgoal_offset)
+        if model_map_yaml(args.policy):
+            use_map(model_map_yaml(args.policy))
+        if args.subgoal_lookahead is None:
+            args.subgoal_lookahead = model_subgoal_lookahead(args.policy)
+        if args.subgoal_offset is None:
+            args.subgoal_offset = model_subgoal_offset(args.policy)
+        if args.lane_hold is None:
+            args.lane_hold = model_lane_hold(args.policy)
+    if args.lane_offset is not None:
+        if args.decision_layer or args.subgoal_agent:
+            parser.error('--decision-layer/--subgoal-agent set the lane; drop --lane-offset')
+        if not args.subgoal_lookahead:
+            parser.error('--lane-offset needs a subgoal lookahead')
+        args.subgoal_offset = 0.0  # pinned instead of drawn, as in evaluate
+    env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
+                            pedestrians_yield=args.yielding_pedestrians,
+                            encounter_prob=args.encounter_prob,
+                            subgoal_lookahead=args.subgoal_lookahead,
+                            subgoal_offset=args.subgoal_offset or 0.0,
+                            **({'lane_hold': tuple(args.lane_hold)} if args.lane_hold else {}))
+    seeds = None
+    if args.held_out:
+        from cash_rl.evaluate import HELD_OUT_SEED_BASE
+        goals = [(f'random_{i}', None) for i in args.held_out]
+        seeds = [HELD_OUT_SEED_BASE + i for i in args.held_out]
+    elif args.goal == 'random':
         goals = [(None, None)] * args.episodes
-    elif args.goal == 'all':
-        goals = sorted(env.map.goals.items())
-    elif args.goal in env.map.goals:
-        goals = [(args.goal, env.map.goals[args.goal])]
+    elif args.goal == 'all' and env.door_goals:
+        goals = sorted(env.door_goals.items())
+    elif args.goal in env.door_goals:
+        goals = [(args.goal, env.door_goals[args.goal])]
     else:
-        parser.error(f'unknown goal {args.goal!r}; {env.map.name} has: '
-                     + ', '.join(sorted(env.map.goals)))
+        parser.error(f'unknown goal {args.goal!r} on this map'
+                     + ('' if env.door_goals else ' (door goals are hallway only; use random)'))
 
     import matplotlib
     if args.save:
@@ -194,15 +248,24 @@ def main():
     import matplotlib.pyplot as plt
 
     policy = POLICIES.get(args.policy) or load_trained_policy(args.policy)
-    frames = run_episodes(env, policy, goals, args.seed)
+    stepper = None
+    if args.subgoal_agent:
+        from cash_rl.subgoal_agent import SubgoalLayer
+        stepper = SubgoalLayer(env, args.subgoal_agent)
+    elif args.decision_layer:
+        from cash_rl.decision import DecisionLayer
+        stepper = DecisionLayer(env)
+    frames = run_episodes(env, policy, goals, args.seed, stepper,
+                          {'lane_offset': args.lane_offset}
+                          if args.lane_offset is not None else None, seeds)
 
-    fig, ax = plt.subplots(figsize=figure_size(env))
+    fig, ax = plt.subplots(figsize=(14, 6.4) if env.is_hallway else (11, 11))
     fig.subplots_adjust(left=0.04, right=0.99, top=0.93, bottom=0.07)
     scene = Scene(ax, env)
 
     def draw(frame):
         return scene.draw(frame['pose'], frame['ranges'], frame['goal'], frame['trail'],
-                          frame['text'], frame['waypoint'])
+                          frame['text'], frame['pedestrians'], frame['subgoal'])
 
     interval_ms = 1000 * spec.CONTROL_PERIOD / args.speed
     anim = FuncAnimation(fig, draw, frames=frames, interval=interval_ms, blit=False,
