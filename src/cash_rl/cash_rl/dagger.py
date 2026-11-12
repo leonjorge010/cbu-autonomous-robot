@@ -39,6 +39,7 @@ import numpy as np
 # Collection seeds: (seed * 1000 + round) * 100 + worker, below EVAL_SEED_BASE.
 _worker_env = None
 _teacher_name = 'avoider'
+_blind = False
 
 
 def actor_weights(policy):
@@ -58,9 +59,36 @@ def actor_action(weights, observation):
     return np.clip(w @ h + b, -1.0, 1.0)
 
 
-def _init_worker(env_kwargs, decision_layer=False, teacher='avoider', wait=False):
-    global _worker_env, _teacher_name
+def _center_observation(env):
+    """Observation with the passing lane hidden: center subgoal, no urgent pull-in.
+
+    Restores the lane the teacher follows. The scan stack is left as it was.
+    """
+    base = env.unwrapped
+    saved_offset = base.lane_offset
+    saved_pass = getattr(base, 'pass_lookahead', None)
+    saved_to_goal = getattr(base, 'lane_to_goal', False)
+    saved_lane, saved_near, saved_robot = base.lane, base.near_lane, base.robot_lane
+    saved_subgoal = None if base.subgoal is None else base.subgoal.copy()
+    base.lane_offset = 0.0
+    if hasattr(base, 'pass_lookahead'):
+        base.pass_lookahead = None
+        base.lane_to_goal = False
+    obs = base.observation()
+    base.lane_offset = saved_offset
+    if hasattr(base, 'pass_lookahead'):
+        base.pass_lookahead = saved_pass
+        base.lane_to_goal = saved_to_goal
+    base.lane, base.near_lane, base.robot_lane = saved_lane, saved_near, saved_robot
+    if saved_subgoal is not None:
+        base.subgoal = saved_subgoal
+    return obs
+
+
+def _init_worker(env_kwargs, decision_layer=False, teacher='avoider', wait=False, blind=False):
+    global _worker_env, _teacher_name, _blind
     _teacher_name = teacher
+    _blind = blind
     env = HallwayRaycastEnv(**env_kwargs)
     if decision_layer:
         from cash_rl.decision import DecisionLayer
@@ -90,11 +118,12 @@ def collect(task):
     obs, _ = env.reset(seed=seed)
     for i in range(n_steps):
         teacher = _teacher(base)
-        observations[i], labels[i] = obs, teacher
+        seen = _center_observation(env) if _blind else obs
+        observations[i], labels[i] = seen, teacher
         if weights is None or rng.random() < beta:
             action = teacher
         else:
-            action = actor_action(weights, obs)
+            action = actor_action(weights, seen)
         obs, _, terminated, truncated, info = env.step(action)
         if terminated or truncated:
             outcomes.append((bool(info['is_success']), bool(info['collided'])))
@@ -190,6 +219,10 @@ def main():
     parser.add_argument('--wait', action='store_true',
                         help='with --decision-layer, hold still while the chosen lane still '
                              'leaves a person inside the robot')
+    parser.add_argument('--blind', action='store_true',
+                        help='the decision layer still drives the teacher, but the student '
+                             'sees the center subgoal only, and the per-round eval does not '
+                             'use the layer. The pass has to come from the scan')
     parser.add_argument('--init', metavar='ZIP',
                         help='start the actor from this train.py model instead of a '
                              'random policy')
@@ -202,6 +235,8 @@ def main():
         parser.error('--decision-layer needs --subgoal-lookahead')
     if args.wait and not args.decision_layer:
         parser.error('--wait is part of --decision-layer')
+    if args.blind and not args.decision_layer:
+        parser.error('--blind needs --decision-layer so the teacher can still pass')
 
     import torch
     from stable_baselines3 import PPO
@@ -247,7 +282,7 @@ def main():
                                  subgoal_lookahead=args.subgoal_lookahead,
                                  subgoal_offset=args.subgoal_offset,
                                  lane_hold=tuple(args.lane_hold))
-    if args.decision_layer:
+    if args.decision_layer and not args.blind:
         from cash_rl.decision import DecisionLayer
         eval_env = DecisionLayer(eval_env, wait=args.wait)
     eval_episodes = [(f'encounter_{i}', EVAL_SEED_BASE + i, None)
@@ -265,6 +300,7 @@ def main():
           + (f', lanes +-{args.subgoal_offset:g} m' if args.subgoal_offset else '')
           + f', teacher {args.teacher}'
           + (', decision layer' if args.decision_layer else '')
+          + (', blind student' if args.blind else '')
           + (', wait' if args.wait else '')
           + (f', yield {args.yield_prob:g}' if args.yield_prob else '')
           + (f', cross {args.cross_prob:g}' if args.cross_prob else '')
@@ -275,7 +311,7 @@ def main():
     context = multiprocessing.get_context('spawn')
     with context.Pool(workers, initializer=_init_worker,
                       initargs=(env_kwargs, args.decision_layer, args.teacher,
-                                args.wait)) as pool:
+                                args.wait, args.blind)) as pool:
         for round_ in range(args.rounds + 1):
             beta = args.beta_decay ** round_
             weights = None if round_ == 0 else actor_weights(policy)

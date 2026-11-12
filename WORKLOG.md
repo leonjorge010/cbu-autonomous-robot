@@ -3,6 +3,35 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-11-12 (blind student)
+
+Job **217** `tegr-dagger-blind` (COMPLETED, 21 min 44 s, exit 0) trained `tegr_dagger_blind_s0` on the lab. The teacher was downhill under the held-side rule. The student saw a center subgoal only (`dagger --blind`), starting from `tegr_dagger_dh_s0`, map `cbu_floor2`, 1 pedestrian, encounter 0.7, yield 0.5, cross 0.34, lookahead 1.5 m, 16 rounds × 60k steps, lr 1e-4, 8 workers, seed 0. Held-out evals used no decision layer. In-training encounter eval (100 episodes, yield and cross on) peaked at 69% and finished at 66%.
+
+200 held-out goals, rule off. `final_model.zip` beat `best_model.zip` on every shared row.
+
+| Test | final success / hit / timeout / time | best |
+|---|---|---|
+| Empty | 99.0% / 1.0% / 0% / 17.7 s | 98.5% / 1.5% / 0% / 18.0 s |
+| 1 head-on | 51.5% / 48.5% / 0% / 14.7 s | 48.5% / 51.5% / 0% / 14.3 s |
+| 1 mix | 71.5% / 28.5% / 0% / 16.7 s | 70.0% / 29.5% / 0.5% / 16.9 s |
+| 4 head-on | 47.5% / 52.5% / 0% / 14.2 s | |
+| 4 mix | 57.5% / 42.5% / 0% / 16.3 s | |
+
+Same-job downhill with the rule reprinted job 215: 1 head-on 86.5% / 13.5% / 0% / 18.4 s, 1 mix 80% / 12% / 8% / 18.0 s. The scan-only student is about 10 points above the old rule-off net (40.5% head-on) and well short of the rule (83% / 81% / 75.5% / 65%). Empty floor held. `tegr_dagger_dh_s0` stays the default. Weights are on the lab only.
+
+## 2026-11-12 (crashes)
+
+Sorted the lane follower's crashes on the same 200 held-out goals (`tools/crash_causes.py`). The scores match job 215, so it is the same test. On every setting the largest pile is `lane_clear`: the lane line is a full pass away from the person, and the robot's body is still against them (edge gap about 0.05 m, person alongside).
+
+| Test | success | collision | timeout | lane_clear share of crashes |
+|---|---|---|---|---|
+| 1 person, head-on | 86.5% | 13.5% | 0% | 15 / 27 |
+| 1 person, mix | 80.0% | 12.0% | 8% | 18 / 24 |
+| 4 people, head-on | 77.0% | 23.0% | 0% | 22 / 46 |
+| 4 people, mix | 69.0% | 20.0% | 11% | 28 / 40 |
+
+Treating that gap as blocked and yawing with no forward speed moved the head-on collisions to 16.0%. Creeping toward the passing side instead moved them to 15.5%. Neither fell, so `decision.py` is unchanged.
+
 ## 2026-11-12 (compare)
 
 Job **216** `tegr-compare` scored `tegr_ppo_la15_s0` (Ashlyn) and `tegr_dagger_dh_s0` (Jorge) on the same 200 held-out TEGR goals. Same 1.5 m subgoal, center lane unless the held-side rule moves it, same wait. No training.
