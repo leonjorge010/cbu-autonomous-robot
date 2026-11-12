@@ -10,18 +10,23 @@ The driver is two pieces. A passing rule picks a lane around a person. A small n
 the LiDAR scan and that lane into a speed command. The current network is `tegr_dagger_dh_s0`.
 Its weights are not in git.
 
-## Jorge and Ashlyn
+## Jorge, Ashlyn, and scan-only
 
-Same 200 goals on the TEGR floor, 12 Nov. Subgoal 1.5 m ahead, passing rule on, side held
-for the whole pass. Ashlyn's model is `tegr_ppo_la15_s0`. Jorge's is `tegr_dagger_dh_s0`.
+Same 200 goals on the TEGR floor, 12 Nov. Subgoal 1.5 m ahead. Ashlyn's model is
+`tegr_ppo_la15_s0` and Jorge's is `tegr_dagger_dh_s0`. Both use the passing rule, with the
+side held for the whole pass. Scan-only is `tegr_dagger_blind_s0`: the same kind of driver,
+trained to pass from the laser and a center subgoal, and scored with the rule turned off.
 
-![Jorge and Ashlyn on the same 200 goals](docs/jorge_ashlyn.png)
+![Jorge, Ashlyn, and the scan-only student on the same 200 goals](docs/jorge_ashlyn.png)
 
-Jorge is ahead on an empty corridor and crashes less when one person mixes yielding and
-crossing. One person walking straight at the robot, and a crowd of four, are ties. Ashlyn
-finishes the successful trips about 4 seconds faster. With the rule turned off both reach
-the goal about 41% of the time. The scripted lane follower, which reads the map, still leads
-the head-on case at 86.5%. Full times are in `WORKLOG.md`. Older models are in `docs/MODELS.md`.
+Jorge is ahead of Ashlyn on an empty corridor and crashes less when one person mixes
+yielding and crossing. One person walking straight at the robot, and a crowd of four, are
+ties between those two. Ashlyn finishes the successful trips about 4 seconds faster.
+Scan-only reaches 99% of empty-hall goals. With one person walking straight at the robot it
+reaches 52%, about 10 points above either network with the rule turned off (about 41%), and
+short of Jorge's 83% with the rule on. The scripted lane follower, which reads the map,
+still leads that case at 86.5%. Full times are in `WORKLOG.md`. Older models are in
+`docs/MODELS.md`.
 
 ## Where things are
 
