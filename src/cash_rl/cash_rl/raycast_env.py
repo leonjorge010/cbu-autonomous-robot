@@ -18,8 +18,10 @@ with the robot ahead and within spec.PEDESTRIAN_COMFORT_DISTANCE one slows down,
 and if the robot is in its path it also sidesteps away from it (or waits, inside
 PEDESTRIAN_STOP_DISTANCE, until it has), then walks on in the same direction.
 They ignore each other. They block beams and count for collisions, and the robot
-is penalized for coming close (spec.step_outcome). They exist only here, not in
-Gazebo.
+is penalized for coming close (spec.step_outcome). yield_prob gives each one
+that chance of stepping aside; cross_prob instead sends them across the corridor
+at a normal walking speed. Both default to 0, which keeps the old discs. They
+exist only here, not in Gazebo.
 """
 from cash_rl import spec
 from cash_rl.occupancy_map import is_hallway_map, keepout_yaml_for, load_free_mask
@@ -46,6 +48,9 @@ MAX_SAMPLE_TRIES = 1000
 # maps: whichever of x and y has the longer open stretch through the cell.
 PEDESTRIAN_RADIUS = 0.25
 PEDESTRIAN_SPEED_RANGE = (0.5, 0.9)
+# Someone crossing the corridor, rather than walking along it. A normal walking
+# pace, faster than the along-corridor discs above.
+CROSS_SPEED_RANGE = (1.0, 1.4)
 # Pedestrian centers keep at least this much map clearance (radius + a gap).
 PEDESTRIAN_WALL_CLEARANCE = PEDESTRIAN_RADIUS + 0.05
 # Pedestrians start at least this far from the robot's spawn.
@@ -73,13 +78,19 @@ ROUTE_STEP = 0.1  # m between traced route points
 # no wall in reach the route point stands in (that one moves with the robot).
 # The offset is cut back to keep LANE_MIN_CLEARANCE from any obstacle: the
 # clearance the geodesic route keeps, so the teachers' wall costs don't hold the
-# robot short of the lane. Random offsets are held for LANE_HOLD_RANGE seconds
+# robot short of the lane. The same clip is applied to the cross-sections over
+# the next LANE_AHEAD_DISTANCE of the route, and the tightest one wins, so a
+# wall that juts in ahead pulls the lane over before the robot reaches it.
+# Random offsets are held for LANE_HOLD_RANGE seconds
 # (the default of the env's lane_hold);
 # LANE_ZERO_PROB of draws are 0 (the corridor center).
 LANE_SCAN_DISTANCE = 2.5
 LANE_MAX_WIDTH = 4.0
 LANE_OPEN_HALF_WIDTH = 1.2
 LANE_MIN_CLEARANCE = spec.SAFE_CLEARANCE
+# How far (m) down the lane a wall must already be clear of. A jut that starts
+# inside this window shrinks the offset at the current cross-section.
+LANE_AHEAD_DISTANCE = 2.5
 LANE_HOLD_RANGE = (2.0, 6.0)
 LANE_ZERO_PROB = 0.3
 # The lane the robot is held to (near_lane: teachers, info['lane_error']) is
@@ -178,6 +189,7 @@ class HallwayRaycastEnv(gym.Env):
     def __init__(self, map_yaml=None, goal_distance_range=DEFAULT_GOAL_DISTANCE_RANGE,
                  range_noise=True, render_mode=None, junction_prob=0.0, n_pedestrians=0,
                  pedestrians_yield=False, lane_penalty=True, encounter_prob=0.0,
+                 yield_prob=0.0, cross_prob=0.0,
                  subgoal_lookahead=None, subgoal_offset=0.0, lane_hold=LANE_HOLD_RANGE):
         super().__init__()
         if render_mode not in (None, 'rgb_array'):
@@ -196,6 +208,8 @@ class HallwayRaycastEnv(gym.Env):
         self.render_mode = render_mode
         self.n_pedestrians = int(n_pedestrians)
         self.pedestrians_yield = pedestrians_yield
+        self.yield_prob = float(yield_prob)
+        self.cross_prob = float(cross_prob)
         self.lane_penalty = lane_penalty
         self.encounter_prob = encounter_prob
 
@@ -259,6 +273,11 @@ class HallwayRaycastEnv(gym.Env):
         self.lane = None
         self.near_lane = None
         self.robot_lane = None
+        # The decision layer sets these. pass_lookahead pulls the subgoal and the
+        # followed lane in while a person is close; lane_to_goal keeps a lane in
+        # the last metres, where the subgoal would otherwise become the goal.
+        self.pass_lookahead = None
+        self.lane_to_goal = False
         self._goal_field = None
         self._goal_distance = 0.0
         self._velocity = np.zeros(2)
@@ -267,6 +286,7 @@ class HallwayRaycastEnv(gym.Env):
         self._scan_stack = spec.new_scan_stack(self._ranges)
         self.pedestrians = np.zeros((0, 2))
         self._pedestrian_velocities = np.zeros((0, 2))
+        self._pedestrian_yields = np.zeros(0, dtype=bool)
         self._step_count = 0
         self._max_steps = 0
 
@@ -327,12 +347,13 @@ class HallwayRaycastEnv(gym.Env):
             return 0.0
         return float(np.min(self.map.clearance[row, col]))
 
-    def raycast(self, pose=None, angles=None):
+    def raycast(self, pose=None, angles=None, include_pedestrians=True):
         """Noise-free ranges (m) of the N_OBS_BEAMS observed beams (or `angles`) from `pose`.
 
         Mirrors gpu_lidar: no return within MAX_RANGE -> +inf; a hit closer than
-        MIN_RANGE -> -inf. Pedestrians block beams like walls. Pass through
-        spec.sanitize_ranges before use.
+        MIN_RANGE -> -inf. Pedestrians block beams like walls unless
+        include_pedestrians is false, which is the map-only range a tracker
+        compares against the real scan. Pass through spec.sanitize_ranges before use.
         """
         x, y, yaw = self.pose if pose is None else pose
         c, s = np.cos(yaw), np.sin(yaw)
@@ -349,7 +370,7 @@ class HallwayRaycastEnv(gym.Env):
         # Surface lies between the last free sample and the first blocked one.
         first = blocked.argmax(axis=1)
         ranges = np.where(hit, self._ray_ts[first] - self._ray_step / 2, np.inf)
-        if len(self.pedestrians):
+        if include_pedestrians and len(self.pedestrians):
             # Exact ray/disc intersection: nearest t >= 0 with |lidar + t*dir - c| = r.
             to_x = self.pedestrians[:, 0][None, :] - lidar_x
             to_y = self.pedestrians[:, 1][None, :] - lidar_y
@@ -441,6 +462,30 @@ class HallwayRaycastEnv(gym.Env):
             velocities.append(sign * speed * axis)
         self.pedestrians = np.array(positions).reshape(-1, 2)
         self._pedestrian_velocities = np.array(velocities).reshape(-1, 2)
+        self._assign_behaviors()
+
+    def _assign_behaviors(self):
+        """Mark who steps aside, and send crossers across the corridor.
+
+        Neither draw runs unless its probability is set, so yield_prob and
+        cross_prob at 0 leave a seeded episode identical to the old discs.
+        A crosser keeps their line (the robot waits); everyone else yields
+        with yield_prob. pedestrians_yield still means every person yields.
+        """
+        n = len(self.pedestrians)
+        yields = np.ones(n, dtype=bool) if self.pedestrians_yield else np.zeros(n, dtype=bool)
+        if n and not self.pedestrians_yield and (self.yield_prob > 0 or self.cross_prob > 0):
+            for i in range(n):
+                draw = float(self.np_random.random())
+                if draw < self.cross_prob:
+                    axis = self._walking_axis(self.pedestrians[i])
+                    cross = np.array([-axis[1], axis[0]])
+                    sign = 1.0 if self.np_random.random() < 0.5 else -1.0
+                    speed = float(self.np_random.uniform(*CROSS_SPEED_RANGE))
+                    self._pedestrian_velocities[i] = sign * speed * cross
+                elif draw < self.cross_prob + (1.0 - self.cross_prob) * self.yield_prob:
+                    yields[i] = True
+        self._pedestrian_yields = yields
 
     def route(self, max_length=None):
         """(n, 2) points every ROUTE_STEP m down the goal's geodesic field from the robot.
@@ -598,8 +643,12 @@ class HallwayRaycastEnv(gym.Env):
         if len(self.pedestrians) == 0:
             return
         speed_factor = np.ones(len(self.pedestrians))
-        if self.pedestrians_yield:
+        if len(self._pedestrian_yields) and np.any(self._pedestrian_yields):
             sidesteps, yielding, in_path = self._sidesteps(dt)
+            mask = self._pedestrian_yields
+            sidesteps = sidesteps * mask[:, None]
+            yielding = yielding & mask
+            in_path = in_path & mask
             self.pedestrians += sidesteps
             stop = in_path & (self.pedestrian_gaps() < PEDESTRIAN_STOP_DISTANCE)
             speed_factor = np.where(stop, 0.0, np.where(yielding, PEDESTRIAN_SLOW_FACTOR, 1.0))
@@ -630,24 +679,40 @@ class HallwayRaycastEnv(gym.Env):
                                       self._prev_action)
 
     def _find_subgoal(self):
-        """Return the point subgoal_lookahead m along route() (in its lane), else the goal."""
+        """Return the point subgoal_lookahead m along route() (in its lane), else the goal.
+
+        pass_lookahead, when set, uses the nearer of the two distances so a pass
+        can steer at a close subgoal. lane_to_goal keeps that lane when the goal
+        is already closer than the lookahead, instead of dropping it.
+        """
         self.lane = self.near_lane = self.robot_lane = None
         if not self.subgoal_lookahead:
             return self.goal.copy()
-        route = self.route(max_length=self.subgoal_lookahead)
-        if len(route) > int(round(self.subgoal_lookahead / ROUTE_STEP)):
-            if not self._lanes:
-                return route[-1].copy()
-            self.lane = self._lane_at(route, len(route) - 1)[0]
-            near = int(round(LANE_NEAR_DISTANCE / ROUTE_STEP))
-            self.near_lane = self._lane_at(route, near)[0]
-            # At the robot: route direction over its first 0.5 m.
-            robot_lane, bounded = self._lane_at(route, 0, ahead=5)
-            turn = float(robot_lane[1] @ self.near_lane[1])
-            if bounded and turn >= np.cos(LANE_TURN_ANGLE):
-                self.robot_lane = robot_lane
-            return self.lane[0].copy()
-        return self.goal.copy()
+        lookahead = self.subgoal_lookahead
+        near_distance = LANE_NEAR_DISTANCE
+        if self.pass_lookahead:
+            lookahead = min(lookahead, float(self.pass_lookahead))
+            near_distance = min(near_distance, lookahead)
+        # With lanes on, trace past the subgoal so a wall that juts in just
+        # beyond it can still pull the lane (see _yield_to_walls_ahead).
+        extra = LANE_AHEAD_DISTANCE if self._lanes else 0.0
+        route = self.route(max_length=lookahead + extra)
+        index = int(round(lookahead / ROUTE_STEP))
+        close_to_goal = len(route) <= index
+        if close_to_goal and not (self.lane_to_goal and self._lanes and len(route) >= 2):
+            return self.goal.copy()
+        if not self._lanes:
+            return route[min(index, len(route) - 1)].copy()
+        at = index if len(route) > index else len(route) - 1
+        self.lane = self._lane_at(route, at)[0]
+        near = min(int(round(near_distance / ROUTE_STEP)), len(route) - 1)
+        self.near_lane = self._lane_at(route, near)[0]
+        # At the robot: route direction over its first 0.5 m.
+        robot_lane, bounded = self._lane_at(route, 0, ahead=min(5, len(route) - 1))
+        turn = float(robot_lane[1] @ self.near_lane[1])
+        if bounded and turn >= np.cos(LANE_TURN_ANGLE):
+            self.robot_lane = robot_lane
+        return self.lane[0].copy()
 
     def _lane_at(self, route, i, ahead=0):
         """((point, direction, offset), bounded) of the lane across route[i] at lane_offset.
@@ -658,7 +723,38 @@ class HallwayRaycastEnv(gym.Env):
         direction = route[min(i + ahead, len(route) - 1)] - route[max(i + ahead - 5, 0)]
         direction /= max(np.linalg.norm(direction), 1e-9)
         point, offset, bounded = self._lane_point(route[i], direction, self.lane_offset)
+        if self.lane_offset != 0.0:
+            point, offset = self._yield_to_walls_ahead(route, i, ahead, direction, point, offset)
         return (point, direction, offset), bounded
+
+    def _yield_to_walls_ahead(self, route, i, ahead, direction, point, offset):
+        """Pull `offset` in until it is legal on the route for LANE_AHEAD_DISTANCE.
+
+        Each cross-section ahead is clipped on its own. The lane here then uses
+        the tightest of those, measured from this cross-section's center, so the
+        robot is already clear of a wall that juts in further along the route.
+        """
+        normal = np.array([-direction[1], direction[0]])
+        center = point - offset * normal
+        limit = offset
+        last = min(len(route) - 1, i + int(round(LANE_AHEAD_DISTANCE / ROUTE_STEP)))
+        stride = max(1, int(round(0.25 / ROUTE_STEP)))
+        for j in range(i + 1, last + 1, stride):
+            d = route[min(j + ahead, len(route) - 1)] - route[max(j + ahead - 5, 0)]
+            norm = np.linalg.norm(d)
+            if norm < 1e-9:
+                continue
+            _, ahead_offset, _ = self._lane_point(route[j], d / norm, self.lane_offset)
+            # Compare the clipped offsets, not world positions: on a route that
+            # is heading back to the corridor center, the same legal lane sits
+            # at a different place relative to this cross-section.
+            if self.lane_offset > 0.0:
+                limit = min(limit, max(ahead_offset, 0.0))
+            else:
+                limit = max(limit, min(ahead_offset, 0.0))
+        if limit == offset:
+            return point, offset
+        return center + limit * normal, float(limit)
 
     def _lane_point(self, point, direction, offset):
         """Return (lane point, offset used, bounded) across `direction` at `point`.
@@ -670,6 +766,7 @@ class HallwayRaycastEnv(gym.Env):
         than LANE_MAX_WIDTH, or `point` itself with no wall in reach; the offset
         is cut back until the point keeps LANE_MIN_CLEARANCE from everything.
         bounded is True when walls on both sides are within LANE_MAX_WIDTH.
+        Walls further along the route are handled by _yield_to_walls_ahead.
         """
         normal = np.array([-direction[1], direction[0]])
         ts = np.arange(1, int(LANE_SCAN_DISTANCE / self._ray_step) + 1) * self._ray_step

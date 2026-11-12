@@ -80,6 +80,12 @@ def main():
                         help='moving pedestrians per episode (2D only)')
     parser.add_argument('--yielding-pedestrians', action='store_true',
                         help='pedestrians step around the robot instead of walking into it')
+    parser.add_argument('--yield-prob', type=float, default=0.0,
+                        help='chance each pedestrian steps aside (the rest walk through the '
+                             'robot). 0 leaves the old behavior')
+    parser.add_argument('--cross-prob', type=float, default=0.0,
+                        help='chance each pedestrian crosses the corridor at 1.0-1.4 m/s '
+                             'instead of walking along it. 0 leaves the old behavior')
     parser.add_argument('--encounter-prob', type=float, default=0.0,
                         help="share of episodes whose first pedestrian starts on the robot's "
                              'route walking toward it; 1 = an avoidance test (2D only)')
@@ -104,6 +110,14 @@ def main():
                         help='steer the subgoal lane around pedestrians with the rule-based '
                              'decision layer (cash_rl.decision; 2D only; needs a subgoal '
                              'lookahead)')
+    parser.add_argument('--wait', action='store_true',
+                        help='with --decision-layer, hold still while the chosen lane still '
+                             'leaves a person inside the robot; creep aside or back up if '
+                             'they are not moving out of the way')
+    parser.add_argument('--scan-tracks', action='store_true',
+                        help='with --decision-layer, take pedestrian positions from a dense '
+                             'scan compared with the map (cash_rl.tracks) instead of the '
+                             "simulator's true positions")
     parser.add_argument('--subgoal-agent', metavar='ZIP',
                         help='a train_subgoal model that sets the lane and when to wait '
                              '(cash_rl.subgoal_agent; 2D only; needs a subgoal lookahead)')
@@ -127,6 +141,10 @@ def main():
     if args.lane_hold is None:
         args.lane_hold = model_lane_hold(next(p for p in args.models if p not in SCRIPTED)) \
             if trained_offset else None
+    if args.wait and not args.decision_layer:
+        parser.error('--wait is part of --decision-layer')
+    if args.scan_tracks and not args.decision_layer:
+        parser.error('--scan-tracks is how --decision-layer sees pedestrians')
     if args.decision_layer and args.subgoal_agent:
         parser.error('pick one of --decision-layer and --subgoal-agent')
     if args.subgoal_agent and args.subgoal_lookahead is None:
@@ -164,6 +182,8 @@ def main():
         from cash_rl.raycast_env import HallwayRaycastEnv
         env = HallwayRaycastEnv(n_pedestrians=args.pedestrians,
                                 pedestrians_yield=args.yielding_pedestrians,
+                                yield_prob=args.yield_prob,
+                                cross_prob=args.cross_prob,
                                 encounter_prob=args.encounter_prob,
                                 subgoal_lookahead=args.subgoal_lookahead,
                                 subgoal_offset=args.subgoal_offset,
@@ -172,8 +192,12 @@ def main():
         from cash_rl.subgoal_agent import SubgoalLayer
         env = SubgoalLayer(env, args.subgoal_agent)
     elif args.decision_layer:
-        from cash_rl.decision import DecisionLayer
-        env = DecisionLayer(env)
+        if args.scan_tracks:
+            from cash_rl.tracks import ScanDecisionLayer
+            env = ScanDecisionLayer(env, wait=args.wait)
+        else:
+            from cash_rl.decision import DecisionLayer
+            env = DecisionLayer(env, wait=args.wait)
     if args.safety:
         from cash_rl.safety import SafetyWrapper
         env = SafetyWrapper(env)
@@ -181,13 +205,17 @@ def main():
                        else f', {os.path.splitext(os.path.basename(map_yaml))[0]}') \
         + (f', {args.pedestrians} pedestrians' if args.pedestrians else '') \
         + (' (yielding)' if args.pedestrians and args.yielding_pedestrians else '') \
+        + (f', yield {args.yield_prob:g}' if args.pedestrians and args.yield_prob else '') \
+        + (f', cross {args.cross_prob:g}' if args.pedestrians and args.cross_prob else '') \
         + (f', encounters {args.encounter_prob:g}' if args.pedestrians and args.encounter_prob
            else '') \
         + (f', subgoals {args.subgoal_lookahead:g} m' if args.subgoal_lookahead else '') \
         + (f', lanes +-{args.subgoal_offset:g} m' if args.subgoal_offset else '') \
         + (f', lane {args.lane_offset:+g} m' if args.lane_offset is not None else '') \
         + (f', subgoal agent {args.subgoal_agent}' if args.subgoal_agent
+           else ', scan tracks' if args.scan_tracks
            else ', decision layer' if args.decision_layer else '') \
+        + (', wait' if args.wait else '') \
         + (', safety layer' if args.safety else '')
     door_goals = spec.DOOR_GOALS if args.env == 'gazebo' else env.unwrapped.door_goals
     doors = [(name, repeat, {'spawn': spec.SPAWN_POSE, 'goal': goal})

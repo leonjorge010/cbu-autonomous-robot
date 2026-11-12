@@ -38,6 +38,7 @@ import numpy as np
 
 # Collection seeds: (seed * 1000 + round) * 100 + worker, below EVAL_SEED_BASE.
 _worker_env = None
+_teacher_name = 'avoider'
 
 
 def actor_weights(policy):
@@ -57,9 +58,20 @@ def actor_action(weights, observation):
     return np.clip(w @ h + b, -1.0, 1.0)
 
 
-def _init_worker(env_kwargs):
-    global _worker_env
-    _worker_env = HallwayRaycastEnv(**env_kwargs)
+def _init_worker(env_kwargs, decision_layer=False, teacher='avoider', wait=False):
+    global _worker_env, _teacher_name
+    _teacher_name = teacher
+    env = HallwayRaycastEnv(**env_kwargs)
+    if decision_layer:
+        from cash_rl.decision import DecisionLayer
+        if not env_kwargs.get('subgoal_lookahead'):
+            raise ValueError('the decision layer needs subgoal_lookahead')
+        env = DecisionLayer(env, wait=wait)
+    _worker_env = env
+
+
+def _teacher(env):
+    return scripted.downhill(env) if _teacher_name == 'downhill' else scripted.avoider(env)
 
 
 def collect(task):
@@ -77,7 +89,7 @@ def collect(task):
     outcomes = []
     obs, _ = env.reset(seed=seed)
     for i in range(n_steps):
-        teacher = scripted.avoider(base)
+        teacher = _teacher(base)
         observations[i], labels[i] = obs, teacher
         if weights is None or rng.random() < beta:
             action = teacher
@@ -129,6 +141,12 @@ def main():
     parser.add_argument('--encounter-prob', type=float, default=0.7,
                         help='share of collection episodes whose first pedestrian starts on '
                              "the robot's route, walking toward it")
+    parser.add_argument('--yield-prob', type=float, default=0.0,
+                        help='chance each pedestrian steps aside instead of walking through '
+                             'the robot (0 = the old discs)')
+    parser.add_argument('--cross-prob', type=float, default=0.0,
+                        help='chance each pedestrian crosses the corridor at 1.0-1.4 m/s '
+                             '(0 = everyone walks along it)')
     parser.add_argument('--rounds', type=int, default=10,
                         help='DAgger rounds after the behavior-cloning round 0')
     parser.add_argument('--steps-per-round', type=int, default=60_000,
@@ -161,11 +179,29 @@ def main():
                         metavar=('MIN', 'MAX'),
                         help='seconds each random lane is held before a new one is drawn '
                              '(default %(default)s)')
+    parser.add_argument('--teacher', choices=('avoider', 'downhill'), default='avoider',
+                        help='who labels the actions. downhill follows the lane and does '
+                             'not read pedestrian positions, so with --decision-layer the '
+                             'pass side is in the subgoal the student can see. avoider '
+                             'reads the true pedestrian trajectories')
+    parser.add_argument('--decision-layer', action='store_true',
+                        help='the rule-based layer picks the lane during collection and '
+                             'the per-round eval (needs --subgoal-lookahead)')
+    parser.add_argument('--wait', action='store_true',
+                        help='with --decision-layer, hold still while the chosen lane still '
+                             'leaves a person inside the robot')
+    parser.add_argument('--init', metavar='ZIP',
+                        help='start the actor from this train.py model instead of a '
+                             'random policy')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--name', help='run name (default: dagger_<timestamp>)')
     args = parser.parse_args()
     if args.subgoal_offset and not args.subgoal_lookahead:
         parser.error('--subgoal-offset needs --subgoal-lookahead')
+    if args.decision_layer and not args.subgoal_lookahead:
+        parser.error('--decision-layer needs --subgoal-lookahead')
+    if args.wait and not args.decision_layer:
+        parser.error('--wait is part of --decision-layer')
 
     import torch
     from stable_baselines3 import PPO
@@ -177,6 +213,7 @@ def main():
     run_dir = os.path.join(runs_dir(), name)
     os.makedirs(os.path.join(run_dir, 'checkpoints'), exist_ok=False)
     env_kwargs = {'n_pedestrians': args.pedestrians, 'encounter_prob': args.encounter_prob,
+                  'yield_prob': args.yield_prob, 'cross_prob': args.cross_prob,
                   'subgoal_lookahead': args.subgoal_lookahead,
                   'subgoal_offset': args.subgoal_offset,
                   'lane_hold': tuple(args.lane_hold)}
@@ -184,7 +221,8 @@ def main():
     config_args = dict(vars(args), algo='ppo')
     kwargs = algo_kwargs('ppo', 12)
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
-        json.dump({'args': config_args, 'map_yaml': map_yaml, 'teacher': 'scripted.avoider',
+        json.dump({'args': config_args, 'map_yaml': map_yaml,
+                   'teacher': f'scripted.{args.teacher}',
                    'algo_kwargs': kwargs,
                    'spec': {k: v for k, v in vars(spec).items()
                             if k.isupper() and isinstance(v, (int, float, str, dict, tuple))}},
@@ -193,17 +231,25 @@ def main():
     model = PPO('MlpPolicy', HallwayRaycastEnv(**env_kwargs), seed=args.seed, verbose=0,
                 device='cpu', **kwargs)
     policy = model.policy
-    with torch.no_grad():
-        policy.log_std.fill_(args.log_std)
+    if args.init:
+        policy.load_state_dict(PPO.load(args.init, device='cpu').policy.state_dict())
+        print(f'Started the actor from {args.init}', flush=True)
+    else:
+        with torch.no_grad():
+            policy.log_std.fill_(args.log_std)
     actor_params = list(policy.mlp_extractor.policy_net.parameters()) \
         + list(policy.action_net.parameters())
     optimizer = torch.optim.Adam(actor_params, lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
 
     eval_env = HallwayRaycastEnv(n_pedestrians=args.pedestrians, encounter_prob=1.0,
+                                 yield_prob=args.yield_prob, cross_prob=args.cross_prob,
                                  subgoal_lookahead=args.subgoal_lookahead,
                                  subgoal_offset=args.subgoal_offset,
                                  lane_hold=tuple(args.lane_hold))
+    if args.decision_layer:
+        from cash_rl.decision import DecisionLayer
+        eval_env = DecisionLayer(eval_env, wait=args.wait)
     eval_episodes = [(f'encounter_{i}', EVAL_SEED_BASE + i, None)
                      for i in range(args.eval_episodes)]
     fields = ['round', 'beta', 'labels', 'mse', 'rollout_success', 'rollout_collision',
@@ -217,12 +263,19 @@ def main():
           'encounters '
           f'{args.encounter_prob:g}'
           + (f', lanes +-{args.subgoal_offset:g} m' if args.subgoal_offset else '')
+          + f', teacher {args.teacher}'
+          + (', decision layer' if args.decision_layer else '')
+          + (', wait' if args.wait else '')
+          + (f', yield {args.yield_prob:g}' if args.yield_prob else '')
+          + (f', cross {args.cross_prob:g}' if args.cross_prob else '')
           + f' -> {run_dir}', flush=True)
     observations, labels = [], []
     best = (-1.0, 0.0)
     start = time.time()
     context = multiprocessing.get_context('spawn')
-    with context.Pool(workers, initializer=_init_worker, initargs=(env_kwargs,)) as pool:
+    with context.Pool(workers, initializer=_init_worker,
+                      initargs=(env_kwargs, args.decision_layer, args.teacher,
+                                args.wait)) as pool:
         for round_ in range(args.rounds + 1):
             beta = args.beta_decay ** round_
             weights = None if round_ == 0 else actor_weights(policy)

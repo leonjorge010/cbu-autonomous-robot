@@ -5,7 +5,7 @@ from cash_rl.occupancy_map import default_map_yaml_in_workspace, keepout_yaml_fo
 from cash_rl.occupancy_map import load_free_mask
 from cash_rl.raycast_env import BRANCH_MIN_Y, ENCOUNTER_DISTANCE_RANGE, ENCOUNTER_LATERAL
 from cash_rl.raycast_env import HallwayRaycastEnv, LANE_HOLD_RANGE, ROUTE_STEP
-from cash_rl.raycast_env import PEDESTRIAN_RADIUS, PEDESTRIAN_SLOW_FACTOR
+from cash_rl.raycast_env import CROSS_SPEED_RANGE, PEDESTRIAN_RADIUS, PEDESTRIAN_SLOW_FACTOR
 from cash_rl.raycast_env import PEDESTRIAN_SPEED_RANGE, PEDESTRIAN_STOP_DISTANCE
 from cash_rl.raycast_env import PEDESTRIAN_WALL_CLEARANCE
 from cash_rl.scripted import avoider, downhill
@@ -584,6 +584,34 @@ def test_encounter_prob_zero_keeps_seeded_episodes():
                                       zero.reset(seed=seed)[1]['pedestrians'])
 
 
+def test_zero_behavior_probs_keep_seeded_pedestrians():
+    plain = HallwayRaycastEnv(n_pedestrians=1, encounter_prob=1.0, range_noise=False)
+    same = HallwayRaycastEnv(n_pedestrians=1, encounter_prob=1.0, range_noise=False,
+                             yield_prob=0.0, cross_prob=0.0)
+    for seed in range(5):
+        plain.reset(seed=seed)
+        same.reset(seed=seed)
+        np.testing.assert_allclose(plain.pedestrians, same.pedestrians)
+        np.testing.assert_allclose(plain._pedestrian_velocities, same._pedestrian_velocities)
+
+
+def test_a_crosser_walks_across_the_corridor_at_a_walking_speed():
+    env = HallwayRaycastEnv(n_pedestrians=4, cross_prob=1.0, range_noise=False)
+    env.reset(seed=2)
+    for xy, vel in zip(env.pedestrians, env._pedestrian_velocities):
+        axis = env._walking_axis(xy)
+        assert abs(float(vel @ axis)) < 1e-6
+        speed = float(np.linalg.norm(vel))
+        assert CROSS_SPEED_RANGE[0] <= speed <= CROSS_SPEED_RANGE[1]
+        assert not env._pedestrian_yields.any()
+
+
+def test_yield_prob_marks_that_share_of_pedestrians():
+    env = HallwayRaycastEnv(n_pedestrians=1, yield_prob=1.0, range_noise=False)
+    env.reset(seed=0)
+    assert env._pedestrian_yields.tolist() == [True]
+
+
 def test_gymnasium_api_with_pedestrians():
     check_env(HallwayRaycastEnv(n_pedestrians=3), skip_render_check=True)
 
@@ -611,6 +639,20 @@ def test_dagger_numpy_actor_matches_sb3_predict():
         expected, _ = model.predict(obs, deterministic=True)
         assert np.allclose(actor_action(weights, obs), expected, atol=1e-5)
         obs, *_ = env.step(expected)
+
+
+def test_dagger_downhill_teacher_labels_match_downhill():
+    from cash_rl import dagger
+    from cash_rl.scripted import downhill
+    dagger._init_worker({'n_pedestrians': 0, 'subgoal_lookahead': 1.5}, teacher='downhill')
+    _, labels, _ = dagger.collect((3, 15, 1.0, None))
+    env = HallwayRaycastEnv(n_pedestrians=0, subgoal_lookahead=1.5)
+    env.reset(seed=3)
+    for i in range(15):
+        assert np.allclose(downhill(env), labels[i])
+        _, _, terminated, truncated, _ = env.step(labels[i])
+        if terminated or truncated:
+            break
 
 
 def test_dagger_collect_labels_every_step_with_the_teacher():
@@ -758,12 +800,30 @@ def test_lane_subgoal_sits_offset_from_the_corridor_center_and_pays_for_followin
 
 
 def test_lane_offset_is_clipped_to_keep_clear_of_walls():
-    env = HallwayRaycastEnv(subgoal_lookahead=3.0)
+    # Subgoal at x≈9.5, and the 2.5 m beyond it, sit in the full-width stretch
+    # before the fountain and clear of the door frames near x=5–7.
+    env = HallwayRaycastEnv(subgoal_lookahead=1.5)
     for offset in (3.0, -3.0):
         _, info = env.reset(seed=0, options={'spawn': (8.0, 0.0, 0.0), 'goal': (20.0, 0.0),
                                              'lane_offset': offset})
         assert 0.45 < abs(info['lane_offset']) < 0.65
         assert env._clearance_at(*info['subgoal']) >= spec.SAFE_CLEARANCE - env.map.resolution
+
+
+def test_lane_backs_off_a_wall_that_juts_in_ahead():
+    # The fountain sits in from the south wall around x=14. Upstream of it the
+    # corridor is full width, so a right lane drawn from that cross-section alone
+    # would drive into the fountain. The lane at the robot has to yield first.
+    env = HallwayRaycastEnv(subgoal_lookahead=1.5, range_noise=False)
+    _, right = env.reset(seed=0, options={'spawn': (11.0, 0.0, 0.0), 'goal': (22.0, 0.0),
+                                          'lane_offset': -0.5})
+    assert env.robot_lane is not None and env.robot_lane[2] > -0.45
+    assert env._clearance_at(*env.robot_lane[0]) >= spec.SAFE_CLEARANCE - env.map.resolution
+    # The fountain is on the right; the left lane stays out.
+    _, left = env.reset(seed=0, options={'spawn': (11.0, 0.0, 0.0), 'goal': (22.0, 0.0),
+                                         'lane_offset': 0.5})
+    assert env.robot_lane[2] == pytest.approx(0.5, abs=0.05)
+    assert left['subgoal'][1] > 0.3
 
 
 def test_random_lane_offsets_are_bounded_held_and_seeded():
@@ -790,12 +850,12 @@ def test_downhill_follows_a_pinned_lane():
         env.reset(seed=0, options={'spawn': (8.0, 0.0, 0.0), 'goal': (20.0, 0.0),
                                    'lane_offset': offset})
         errors = []
-        for _ in range(90):  # to x ~ 12 m, before the junction moves the lane
+        for _ in range(55):  # settles before the lane yields to the fountain
             _, _, terminated, _, info = env.step(downhill(env))
             errors.append(info['lane_error'])
             assert not terminated
         errors = np.nan_to_num(errors)
-        assert np.max(np.abs(errors[60:])) < 0.1
+        assert np.max(np.abs(errors[35:])) < 0.1
         assert env.pose[1] == pytest.approx(offset, abs=0.1)
 
 

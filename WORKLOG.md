@@ -3,6 +3,81 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-11-12
+
+The mix-only crash jump arrived with the crossing-side update and stayed through the speed changes (jobs 211–213). Job **215** keeps the passing side for the whole pass (job 213's speeds, side chosen once). Same 200 goals. Keep: mix crashes fell 18% → 12% and timeouts stayed at 8%, under the 9% cap. Head-on did not move. No training.
+
+| | success | collision | timeout | time |
+|---|---|---|---|---|
+| downhill, head-on | 86.5% | 13.5% | 0% | 18.4 s |
+| dagger final, head-on | 83.0% | 16.5% | 0.5% | 19.0 s |
+| downhill, mix | 80.0% | 12.0% | 8.0% | 18.0 s |
+| dagger final, mix | 81.0% | 15.5% | 3.5% | 19.1 s |
+
+Job 213's mix was 18% collisions and 2% timeouts. Job 210's mix was 11% and 9%. The lab `decision.py` is this held-side file (`94c97516cadb76979babe0b95519e404`).
+
+`jorge/model` is pushed from the local commits (map goals and the merge). `origin/main` is still Ashlyn's `d19a6a1`. The uncommitted teacher code is not on either branch. Model training still starts from `tegr_dagger_dh_s0/final_model.zip`.
+
+## 2026-11-11 (drive)
+
+Job 210 left the mix timeouts at 9% and the crashes at 11%. The escape now drives a stopped person at full speed when one side has room, keeps backing up while neither side does (and holds if a wall is behind), and picks a crossing person's side again each step. Local decision tests passed (18). Job **211** finished in 7 minutes. Same four scores, job 210 in parentheses.
+
+| | old encounters | mix |
+|---|---|---|
+| `downhill` | 87.0% / 13.0% hit / 0% timeout / 18.6 s (86.0 / 13.5 / 0.5 / 18.5) | 80.5% / **17.5%** hit / **2.0%** timeout / 18.1 s (80.0 / 11.0 / 9.0 / 18.0) |
+| dagger final | 83.0% / 17.0% / 0% / 19.0 s (83.5 / 16.0 / 0.5 / 19.4) | 80.0% / 19.5% / 0.5% / 19.1 s (81.0 / 16.5 / 2.5 / 19.2) |
+
+Full speed cut the mix timeouts and turned them into crashes. Job **212** turns clear first, then drives. It did not help: mix `downhill` 80.0% / 18.0% hit / 2.0% timeout / 18.0 s, and the dagger final 80.0% / 20.0% / 0% / 19.0 s. Head-on stayed 86.5% / 13.5%. Job **213** passes a stopped person at 60% speed until they are 0.8 m to the side, and only then goes full speed. It finished identical to 212: mix `downhill` 80.0% / 18.0% hit / 2.0% timeout, dagger final 80.0% / 20.0% / 0%. Head-on stayed 86.5% / 13.5%. The speed tweaks are not the lever. The mix-only crash jump arrived with the crossing-side update and did not move after that. Stop. Job 210 (creep, side held) is the better teacher of the night: mix crashes 11% rather than 18%, timeouts 9%. The lab file is the job 213 rule. Do not train.
+
+## 2026-11-11 (teacher)
+
+The stop is not the missing piece (job 207), and another imitation of it gained about a point (job 208). Keep `tegr_dagger_dh_s0/final_model.zip`. The teacher now holds still for 0.3 s, keeps holding if the person is walking off the lane, otherwise creeps to the side that has room, and backs up for at most 2 s when the corridor has no such side. While someone is closing inside 3 m the subgoal and the followed lane pull in to 0.5 m, and a lane stays on through the last metres while someone is still ahead. Local tests passed (96). Lab copies of `decision.py` and the raycast hook compiled. Job **210** `tegr-teacher-eval` finished in 7 minutes (`COMPLETED`, exit 0). Same 200 goals as 207, decision layer and the new wait on. Job 207 in parentheses.
+
+| | old encounters | mix (yield 0.5, cross 0.34) |
+|---|---|---|
+| `downhill` | 86.0% / 13.5% hit / 0.5% timeout / 18.5 s (was 84.0 / 16.0 / 0 / 17.8) | 80.0% / 11.0% hit / 9.0% timeout / 18.0 s (was 81.0 / 11.0 / 8.0 / 18.0) |
+| dagger final, same weights | 83.5% / 16.0% hit / 0.5% timeout / 19.4 s (was 75.5 / 24.0 / 0.5 / 18.0) | 81.0% / 16.5% hit / 2.5% timeout / 19.2 s (was 76.0 / 23.5 / 0.5 / 18.3) |
+
+`downhill` did not beat job 207: head-on crashes fell 2.5 points and the mix was unchanged, timeouts included. The learned weights, with no new training, gained about 8 and 5 points because the nearer subgoal and the creep/backup now steer them. About a second slower. Do not start another imitation until the teacher itself beats 207.
+
+## 2026-11-11 (later)
+
+The 17.5% collisions left on `downhill` are the passing rule with no way to stop. Wait is a wrapper, so it can be scored on the existing dagger final without retraining: if the chosen lane still leaves a person inside the robot, the command is held at zero until they have passed or a lane opens (`DecisionLayer(wait=True)`, `evaluate --wait`). People are no longer one behavior. Each person is the old non-yielding walker, a yielder (`--yield-prob`), or a crosser at 1.0–1.4 m/s (`--cross-prob`); both probabilities default to 0 so old seeds stay the same.
+
+Lab jobs, not committed. **207** `tegr-wait-eval` finished. Same 200 held-out goals, decision layer, wait on. Previous numbers without the wait were downhill 82.5% / 17.5% hit / 17.5 s and the dagger final 79.0% / 21.0% / 18.2 s.
+
+| | old encounters + wait | mix + wait (yield 0.5, cross 0.34) |
+|---|---|---|
+| `downhill` | 84.0% / 16.0% hit / 0% timeout / 17.8 s | 81.0% / 11.0% hit / **8.0% timeout** / 18.0 s |
+| dagger final | 75.5% / 24.0% hit / 0.5% timeout / 18.0 s | 76.0% / 23.5% hit / 0.5% timeout / 18.3 s |
+
+The stop is a small gain for `downhill` on the old test (time barely moves) and a small loss for the student, inside the usual ±3% run variation. On the mix, `downhill` trades crashes for timeouts: people who also stop leave both sides waiting. **208** `tegr-dagger-mix` finished in about 40 minutes of training (24 rounds × 60k, lr 1e-4, init the dagger final, teacher `downhill`, wait on, the mix). In-loop 100-episode mix check sat at 81–84% (best round 84%). The 200-goal ranking, stop on:
+
+| | old encounters | mix |
+|---|---|---|
+| `tegr_dagger_mix_s0` final | 76.5% / 22.5% hit / 1.0% timeout / 17.3 s | 77.5% / 20.0% hit / 2.5% timeout / 17.5 s |
+| `tegr_dagger_mix_s0` best | 76.5% / 22.5% / 1.0% / 17.4 s | 77.0% / 20.5% / 2.5% / 17.5 s |
+| previous final (same run) | 75.5% / 24.0% / 0.5% / 18.0 s | 76.0% / 23.5% / 0.5% / 18.3 s |
+
+About a point better and slightly faster, inside the ±3% run variation. Keep the previous final. The next gain has to come from a better teacher.
+
+## 2026-11-11
+
+Gentle PPO fine-tunes of `tegr_ppo_la15_s0` did not move the actor. Job 187 (`tegr-ft1e4`, lr 1e-4, 750k) and job 188 (`tegr-ft5e5`, lr 5e-5, 1.5M) stayed on the frozen starting weights through the 200k value warmup (95% / 5% collisions / +54.3 on the 40-goal in-training eval) and after unfreeze sat at 88–92% success with 5–10% collisions. Their `best_model.zip` files are the original la15 policy. Stopped fine-tuning.
+
+Two gaps, handled separately. Motion: DAgger imitates `downhill` while the rule-based decision layer sets the lane, initialized from la15 (`--teacher downhill --decision-layer --init`). Decision: `cash_rl.tracks.ScanDecisionLayer` runs that same passing rule on tracks from a 1° scan compared with the map (`raycast(include_pedestrians=False)`), not on `env.pedestrians`. `evaluate --scan-tracks` selects it. Unit tests in `test/test_tracks.py`.
+
+Lab jobs (not committed): **197** `tegr-scan-eval` died on `decision.py` (`IndexError` when a pedestrian index outlived the list). The lane memory now drops indexes past the end of the list (`test_a_stale_lane_index_is_dropped_when_a_pedestrian_disappears`). **198** `tegr-dagger-dh` finished on `cbu-5090-right` (best in-loop round 87%). **200** `tegr-scan-eval` finished on `cbu-5090-left`. 200 held-out encounter goals, then empty floor:
+
+| | privileged | scan tracks | empty floor |
+|---|---|---|---|
+| `downhill` | 82.5% / 17.5% hit | 80.5% / 19.5% | — |
+| `tegr_dagger_dh_s0` final | **79.0%** / 21.0% | **78.5%** / 21.5% | **100%** / 0% |
+| `tegr_dagger_dh_s0` best | 76.5% / 23.5% | 76.0% / 24.0% | 99.0% / 1.0% |
+| la15 s0 | 67.5% / 32.5% | 65.0% / 35.0% | 98.0% / 2.0% |
+
+`final_model.zip` clears the keep bar (encounters above ~72.5%, empty floor near 96%). It closes most of the gap from la15 to `downhill`. Scan tracks cost `downhill` 2 points and the student half a point, so the 1° tracker is enough for this rule. Not committed.
+
 ## 2026-11-02
 
 Covers 11-01 (from 14:43) through 07:04 on 11-02: two queues, `queue_lane_retrain.txt` and

@@ -156,6 +156,42 @@ def evaluate(model, env, episodes):
     return results
 
 
+def set_actor_frozen(policy, frozen):
+    """Freeze or unfreeze the PPO actor. The value head keeps training either way."""
+    for module in (policy.mlp_extractor.policy_net, policy.action_net):
+        for parameter in module.parameters():
+            parameter.requires_grad = not frozen
+    policy.log_std.requires_grad = not frozen
+
+
+class ValueWarmupCallback(BaseCallback):
+    """Hold the actor fixed for the first `steps` so the value head fits a new reward.
+
+    A fine-tune that adds pedestrian penalties starts from a value head that has
+    never seen them. At the full learning rate the actor chases that error and
+    forgets the lane. Freezing it lets the value head catch up first.
+    """
+
+    def __init__(self, steps):
+        super().__init__()
+        self.steps = steps
+        self._frozen = False
+
+    def _on_training_start(self):
+        if self.steps > 0:
+            set_actor_frozen(self.model.policy, True)
+            self._frozen = True
+            print(f'Value warmup: actor frozen for {self.steps:,} steps', flush=True)
+
+    def _on_step(self):
+        if self._frozen and self.num_timesteps >= self.steps:
+            set_actor_frozen(self.model.policy, False)
+            self._frozen = False
+            print(f'Value warmup done at {self.num_timesteps:,} steps; actor training',
+                  flush=True)
+        return True
+
+
 class GoalEvalCallback(BaseCallback):
     """Periodic deterministic eval on door goals + fixed random pairs; keeps the best."""
 
@@ -274,6 +310,10 @@ def main():
     parser.add_argument('--learning-rate', type=float, default=None, metavar='LR',
                         help='initial learning rate (default 3e-4 from algo_kwargs; with --init, '
                              "the loaded model's unless this or --lr-schedule linear is given)")
+    parser.add_argument('--value-warmup-steps', type=int, default=0, metavar='N',
+                        help='PPO fine-tune: freeze the actor for the first N steps so the '
+                             'value head can fit new reward terms (pedestrian penalties) '
+                             'before the policy moves')
     parser.add_argument('--lr-schedule', choices=['constant', 'linear'], default='constant',
                         help='learning rate: constant, or linear decay to 0 over training')
     parser.add_argument('--ent-coef', type=float, default=None,
@@ -287,6 +327,8 @@ def main():
         parser.error('--subgoal-offset needs --subgoal-lookahead')
     if args.decision_layer_prob and not args.subgoal_lookahead:
         parser.error('--decision-layer-prob needs --subgoal-lookahead')
+    if args.value_warmup_steps and args.algo != 'ppo':
+        parser.error('--value-warmup-steps is PPO only')
 
     # Set before any env exists, so SubprocVecEnv workers load the same map.
     map_yaml = use_map(args.map) if args.map else os.path.abspath(default_map_yaml())
@@ -361,6 +403,8 @@ def main():
         CheckpointCallback(save_freq=max(1, args.checkpoint_freq // n_envs),
                            save_path=os.path.join(run_dir, 'checkpoints'), name_prefix='model'),
     ]
+    if args.value_warmup_steps:
+        callbacks.insert(0, ValueWarmupCallback(args.value_warmup_steps))
     print(f'Training {args.algo.upper()} for {args.timesteps:,} steps with {n_envs} envs '
           f'on {os.path.basename(map_yaml)} -> {run_dir}', flush=True)
     try:
@@ -369,8 +413,9 @@ def main():
     finally:
         model.save(os.path.join(run_dir, 'final_model'))
         train_env.close()
-    print(f'Done. Best eval: success {callbacks[0].best[0]:.0%}, return '
-          f'{callbacks[0].best[1]:+.1f} -> {run_dir}/best_model.zip')
+    eval_cb = next(cb for cb in callbacks if isinstance(cb, GoalEvalCallback))
+    print(f'Done. Best eval: success {eval_cb.best[0]:.0%}, return '
+          f'{eval_cb.best[1]:+.1f} -> {run_dir}/best_model.zip')
 
 
 if __name__ == '__main__':
