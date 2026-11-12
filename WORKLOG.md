@@ -3,6 +3,30 @@
 What was done on each work day, newest first. Add a new `## YYYY-MM-DD` section at the top
 for each session: what changed, results with numbers, and what's still open.
 
+## 2026-11-12 (compare)
+
+Job **216** `tegr-compare` scored `tegr_ppo_la15_s0` (Ashlyn) and `tegr_dagger_dh_s0` (Jorge) on the same 200 held-out TEGR goals. Same 1.5 m subgoal, center lane unless the held-side rule moves it, same wait. No training.
+
+| Test | la15 success / hit / timeout / time | dagger success / hit / timeout / time |
+|---|---|---|
+| Empty corridor | 85.5% / 14.5% / 0% / 14.2 s | 96.5% / 3.5% / 0% / 16.5 s |
+| 1 person, head-on, rule | 82.0% / 18.0% / 0% / 15.1 s | 83.0% / 16.5% / 0.5% / 19.0 s |
+| 1 person, mix, rule | 76.5% / 23.5% / 0% / 15.0 s | 81.0% / 15.5% / 3.5% / 19.1 s |
+| 4 people, head-on, rule | 75.5% / 24.0% / 0.5% / 15.6 s | 75.5% / 24.5% / 0% / 19.6 s |
+| 4 people, mix, rule | 65.0% / 35.0% / 0% / 14.8 s | 65.0% / 32.0% / 3.0% / 18.7 s |
+| 1 person, head-on, no rule | 42.0% / 58.0% / 0% / 9.5 s | 40.5% / 59.5% / 0% / 10.9 s |
+
+With the shared rule the two models tie once people are in the corridor, except the mixed single person, where dagger crashes less (15.5% vs 23.5%). Dagger is clearly ahead on an empty corridor. la15 is about 4 s faster on every test. Neither policy avoids a head-on person without the rule (~41%).
+
+`tools/crash_causes.py` replayed `downhill` on those same 200 goals. The success rates match job 215 on the one-person tests. Most crashes are `lane_clear`: the passing lane did not overlap the person, and the robot still hit them.
+
+| Test | success / hit / timeout | lane_clear share of crashes |
+|---|---|---|
+| 1 person, head-on | 86.5% / 13.5% / 0% | 15/27 |
+| 1 person, mix | 80.0% / 12.0% / 8% | 18/24 |
+| 4 people, head-on | 77.0% / 23.0% / 0% | 22/46 |
+| 4 people, mix | 69.0% / 20.0% / 11% | 28/40 |
+
 ## 2026-11-12
 
 The mix-only crash jump arrived with the crossing-side update and stayed through the speed changes (jobs 211–213). Job **215** keeps the passing side for the whole pass (job 213's speeds, side chosen once). Same 200 goals. Keep: mix crashes fell 18% → 12% and timeouts stayed at 8%, under the 9% cap. Head-on did not move. No training.
