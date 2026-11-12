@@ -10,20 +10,18 @@ The driver is two pieces. A passing rule picks a lane around a person. A small n
 the LiDAR scan and that lane into a speed command. The current network is `tegr_dagger_dh_s0`.
 Its weights are not in git.
 
-## Result
+## Jorge and Ashlyn
 
-200 held-out goals on the TEGR floor, 12 Nov. The subgoal is 1.5 m ahead. The passing side
-is held for the whole pass. Numbers are goals reached.
+Same 200 goals on the TEGR floor, 12 Nov. Subgoal 1.5 m ahead, passing rule on, side held
+for the whole pass. Ashlyn's model is `tegr_ppo_la15_s0`. Jorge's is `tegr_dagger_dh_s0`.
 
-| | Empty | One person, head-on | One person, mixed | Four people, head-on | Four people, mixed |
-|---|---|---|---|---|---|
-| `tegr_ppo_la15_s0` | 85.5% | 82% | 76.5% | 75.5% | 65% |
-| `tegr_dagger_dh_s0` | **96.5%** | **83%** | **81%** | 75.5% | 65% |
-| Scripted lane follower | — | **86.5%** | 80% | 77% | 69% |
+![Jorge and Ashlyn on the same 200 goals](docs/jorge_ashlyn.png)
 
-The empty-corridor column keeps the lane in the center. With the rule turned off, both
-learned models reach the goal about 41% of the time. The rule does the passing. Collision
-and time numbers are in `WORKLOG.md`. Older models are in `docs/MODELS.md`.
+Jorge is ahead on an empty corridor and crashes less when one person mixes yielding and
+crossing. One person walking straight at the robot, and a crowd of four, are ties. Ashlyn
+finishes the successful trips about 4 seconds faster. With the rule turned off both reach
+the goal about 41% of the time. The scripted lane follower, which reads the map, still leads
+the head-on case at 86.5%. Full times are in `WORKLOG.md`. Older models are in `docs/MODELS.md`.
 
 ## Where things are
 
