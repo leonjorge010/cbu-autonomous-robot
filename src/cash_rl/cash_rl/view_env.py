@@ -203,10 +203,10 @@ def main():
     from cash_rl.occupancy_map import use_map
     if args.map:
         use_map(args.map)
-    elif args.policy not in POLICIES:
+    if args.policy not in POLICIES:
         from cash_rl.train import (model_lane_hold, model_map_yaml, model_subgoal_lookahead,
                                    model_subgoal_offset)
-        if model_map_yaml(args.policy):
+        if not args.map and model_map_yaml(args.policy):
             use_map(model_map_yaml(args.policy))
         if args.subgoal_lookahead is None:
             args.subgoal_lookahead = model_subgoal_lookahead(args.policy)
